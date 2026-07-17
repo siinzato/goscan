@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Conferência de Estoque · Outlet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="stamp-bg" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">OUT</span>
+      <div class="brand-text">
+        <h1>Conferência de Estoque</h1>
+        <p>Outlet · leitura de prints, conferência de SKU</p>
+      </div>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab-btn active" data-tab="conferencia">Nova Conferência</button>
+      <button class="tab-btn" data-tab="catalogo">Catálogo (SKU)</button>
+      <button class="tab-btn" data-tab="historico">Histórico</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- TAB: NOVA CONFERENCIA -->
+    <section class="tab-panel active" id="tab-conferencia">
+      <div class="panel-grid">
+        <div class="card">
+          <h2>1. Envie os prints ou cole o texto</h2>
+          <div class="input-mode-switch">
+            <button class="mode-btn active" data-mode="imagens">📷 Prints (imagens)</button>
+            <button class="mode-btn" data-mode="texto">✍️ Colar texto</button>
+          </div>
+
+          <div class="mode-panel active" id="mode-imagens">
+            <label class="dropzone" id="dropzone">
+              <input type="file" id="fileInput" accept="image/*" multiple hidden />
+              <span class="dz-icon">＋</span>
+              <span>Clique ou arraste os prints aqui</span>
+              <span class="dz-hint">Vários arquivos de uma vez são aceitos</span>
+            </label>
+            <div id="imagePreviewList" class="image-preview-list"></div>
+            <div id="apiKeyWarning" class="warning-box">
+              🔎 Leitura via OCR local no navegador (gratuita, sem chave de API). A precisão pode ser menor que a de uma IA — revise os itens na tabela antes de exportar.
+            </div>
+            <button class="btn-primary" id="btnParseImages">Ler prints e gerar itens</button>
+          </div>
+
+          <div class="mode-panel" id="mode-texto">
+            <p class="hint-text">Um item por linha, no formato <code>Modelo - Cor - Quantidade</code> (a quantidade é opcional, assume 1 se faltar).</p>
+            <textarea id="textInput" rows="10" placeholder="Tote Mini - Preto - 3&#10;Joy Pro - Marrom - 1&#10;Necessarie Puffer M - Rosa - 2"></textarea>
+            <button class="btn-primary" id="btnParseText">Gerar itens do texto</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>2. Revise e confirme</h2>
+          <p class="hint-text">Corrija modelo/cor/quantidade se precisar. Itens não encontrados no catálogo ficam marcados — escolha o SKU manualmente para ensinar o sistema.</p>
+          <div class="table-wrap">
+            <table id="reviewTable">
+              <thead>
+                <tr>
+                  <th>Modelo (lido)</th>
+                  <th>Cor (lida)</th>
+                  <th>Qtd</th>
+                  <th>SKU encontrado</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="reviewTableBody"></tbody>
+            </table>
+          </div>
+          <div class="review-actions">
+            <button class="btn-secondary" id="btnAddRow">+ Adicionar linha manual</button>
+            <button class="btn-primary" id="btnExport">Exportar Excel (.xlsx)</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB: CATALOGO -->
+    <section class="tab-panel" id="tab-catalogo">
+      <div class="card">
+        <h2>Catálogo de SKUs</h2>
+        <p class="hint-text">Suba a planilha exportada do seu sistema (.xlsx/.csv) para atualizar o catálogo usado na conferência.</p>
+        <label class="dropzone small">
+          <input type="file" id="catalogFileInput" accept=".xlsx,.xls,.csv" hidden />
+          <span class="dz-icon">⇧</span>
+          <span>Clique para subir a planilha de SKUs</span>
+        </label>
+        <div id="catalogImportStatus"></div>
+        <div class="search-row">
+          <input type="text" id="catalogSearch" placeholder="Buscar por produto ou SKU..." />
+        </div>
+        <div class="table-wrap">
+          <table id="catalogTable">
+            <thead><tr><th>Produto</th><th>Cor</th><th>SKU</th></tr></thead>
+            <tbody id="catalogTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB: HISTORICO -->
+    <section class="tab-panel" id="tab-historico">
+      <div class="card">
+        <h2>Histórico de conferências</h2>
+        <div class="table-wrap">
+          <table id="historyTable">
+            <thead><tr><th>Data</th><th>Nome</th><th>Itens</th><th></th></tr></thead>
+            <tbody id="historyTableBody"></tbody>
+          </table>
+        </div>
+        <div id="historyDetail"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.local
+outlet-app/.env
+outlet-app/data.db
+outlet-app/server.log
+*.log
+.DS_Store

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "outlet-app",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["outlet-app/run-local.mjs"],
+      "port": 8787
+    }
+  ]
+}

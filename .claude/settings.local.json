@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"import\\('./server.ts'\\).then\\(m=>console.log\\(typeof m.default.fetch\\)\\).catch\\(e=>console.error\\('ERR',e\\)\\)\")",
+      "Bash(node --experimental-specifier-resolution=node -e \"import\\('./server.ts'\\).then\\(m=>console.log\\(typeof m.default.fetch\\)\\).catch\\(e=>console.error\\('ERR',e.message\\)\\)\")",
+      "Bash(node -e ' *)",
+      "Read(//c/Users/victo/Downloads/**)",
+      "Bash(unzip -l outlet-app-codigo.zip)",
+      "Bash(npm --version)",
+      "Bash(npm config *)"
+    ]
+  }
+}
