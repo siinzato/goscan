@@ -1,5 +1,5 @@
 {
-  "name": "outlet-app",
+  "name": "goscan",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -15,7 +15,8 @@
     "generate-seed-sql": "node scripts/generate-seed-sql.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.4"
+    "@supabase/supabase-js": "^2.45.4",
+    "lucide-static": "^1.25.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",

@@ -1,8 +1,10 @@
-# Conferência de Estoque · Outlet
+# GoScan
 
-App mobile-first para conferência de estoque do Outlet a partir de prints (OCR local), texto colado ou planilha, com catálogo de SKUs, matching por apelidos de modelo/cor, exportação para Excel, histórico e agora **autenticação + banco Supabase + PWA instalável**.
+**Conferência Inteligente de Produtos de Outlet** — uma ferramenta GoGroup.
 
-Este README cobre a **Fase 1** (migração para Supabase, autenticação, mobile-first, PWA, conferências persistentes). Assume Windows + PowerShell.
+App mobile-first para conferência de estoque a partir de prints (OCR local), texto colado ou planilha, com catálogo de SKUs, matching por apelidos de modelo/cor, exportação para Excel, histórico, autenticação, banco Supabase e PWA instalável.
+
+Este README cobre a **Fase 1** (migração para Supabase, autenticação, mobile-first, PWA, conferências persistentes) e a identidade visual GoScan/GoGroup. Assume Windows + PowerShell.
 
 ## Sumário
 
@@ -213,13 +215,13 @@ Sem `ANTHROPIC_API_KEY` configurada (ou sem créditos na conta Anthropic), o app
 **Erro ao rodar `npm run generate-seed-sql`**
 Precisa ser rodado de dentro da pasta `outlet-app/` (onde está o `package.json`), com Node 22+.
 
-**Ícones do PWA parecem "genéricos"**
-São placeholders gerados por `scripts/generate-pwa-icons.mjs` — substitua os arquivos em `public/icons/` por uma arte definitiva quando tiver.
+**Ícones do PWA**
+São gerados por `scripts/generate-app-icons.mjs` a partir do símbolo "g" oficial em `public/brand/goscan-symbol-source.png` (recolorido mecanicamente, sem redesenho — ver comentários no script). Se a logo oficial mudar, rode `node scripts/generate-app-icons.mjs` de novo dentro de `outlet-app/`.
 
 ## 14. Limitações conhecidas desta fase
 
 - Sem projeto Supabase real conectado durante o desenvolvimento, os fluxos de login, RLS e persistência de conferências foram implementados e revisados com cuidado, mas **não têm teste de execução real** — siga os passos 3–6 acima e teste na prática antes de considerar Fase 1 encerrada.
-- Ícones do PWA são placeholders simples (gerados por código), não uma arte definitiva.
+- O arquivo de símbolo oficial (`goscan-symbol-source.png`) veio sem transparência real (fundo magenta sólido) e com azul sobre magenta em vez de branco sobre azul institucional — os ícones do PWA foram gerados recolorindo mecanicamente esse arquivo (troca de paleta 1:1, preservando o desenho exato); não é uma arte oficial entregue já pronta para ícone.
 - `data.db` (SQLite local) não é mais usado pelo app — pode ser apagado manualmente; foi deixado no repositório só por precaução.
 - Sem testes automatizados de RLS (exigiriam um projeto Supabase real ou `supabase start` local com Docker, fora do escopo desta sessão).
 - Não há tela de cadastro público (por design — cadastro é feito pelo painel do Supabase, ver passo 6).

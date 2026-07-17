@@ -1,28 +1,29 @@
 import { signIn, sendPasswordReset, updatePassword } from "../../auth.ts";
 import { escapeHtml } from "../../utils.ts";
+import { APP_NAME, APP_DESCRIPTION, APP_COMPANY } from "../../brand.ts";
 
 function isRecoveryLink(): boolean {
   return window.location.hash.includes("type=recovery") || window.location.search.includes("type=recovery");
 }
 
-export function renderLogin(root: HTMLElement): void {
+export function renderLogin(root: HTMLElement, authError = ""): void {
   if (isRecoveryLink()) {
     renderRecoveryForm(root);
     return;
   }
-  renderLoginForm(root);
+  renderLoginForm(root, "login", "", authError);
 }
 
-function renderLoginForm(root: HTMLElement, mode: "login" | "forgot" = "login", notice = ""): void {
+function renderLoginForm(root: HTMLElement, mode: "login" | "forgot" = "login", notice = "", authError = ""): void {
   root.innerHTML = `
     <div class="auth-screen">
       <div class="auth-card">
-        <span class="brand-mark">OUT</span>
-        <h1>Conferência de Estoque</h1>
-        <p class="hint-text">Outlet · leitura de prints, conferência de SKU</p>
+        <img class="auth-logo" src="/brand/goscan-wordmark.png" alt="${APP_NAME}" />
+        <p class="auth-tagline">${escapeHtml(APP_DESCRIPTION)}</p>
+        <p class="auth-subtagline">Uma ferramenta ${escapeHtml(APP_COMPANY)}</p>
 
         ${notice ? `<div class="notice-box">${escapeHtml(notice)}</div>` : ""}
-        <div id="auth-error" class="error-box" hidden></div>
+        <div id="auth-error" class="error-box" ${authError ? "" : "hidden"}>${escapeHtml(authError)}</div>
 
         ${
           mode === "login"
@@ -97,8 +98,8 @@ function renderRecoveryForm(root: HTMLElement): void {
   root.innerHTML = `
     <div class="auth-screen">
       <div class="auth-card">
-        <span class="brand-mark">OUT</span>
-        <h1>Nova senha</h1>
+        <img class="auth-logo" src="/brand/goscan-wordmark.png" alt="${APP_NAME}" />
+        <p class="auth-tagline">Nova senha</p>
         <p class="hint-text">Defina uma nova senha para sua conta.</p>
         <div id="auth-error" class="error-box" hidden></div>
         <form id="recovery-form" novalidate>

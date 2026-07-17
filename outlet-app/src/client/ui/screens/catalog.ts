@@ -2,6 +2,8 @@ import { searchCatalog, type CatalogRow } from "../../catalogApi.ts";
 import { importCatalog } from "../../importer.ts";
 import { getAuthState, isManagerOrAdmin } from "../../auth.ts";
 import { escapeHtml, debounce } from "../../utils.ts";
+import { Icon } from "../icons.ts";
+import { showToast } from "../toast.ts";
 
 declare const XLSX: {
   read(data: ArrayBuffer): { SheetNames: string[]; Sheets: Record<string, unknown> };
@@ -27,7 +29,7 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
               <p class="hint-text">Planilha .xlsx/.csv com colunas Produto, SKU/Código, GTIN/EAN, Cor e/ou Modelo. Produtos ausentes da planilha NÃO são apagados.</p>
               <label class="dropzone small">
                 <input type="file" id="catalogFileInput" accept=".xlsx,.xls,.csv" hidden />
-                <span class="dz-icon">⇧</span>
+                <span class="dz-icon">${Icon.upload}</span>
                 <span>Toque para subir a planilha</span>
               </label>
               <div id="catalogImportStatus" role="status" aria-live="polite"></div>
@@ -39,13 +41,13 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
         <h2>Catálogo de SKUs</h2>
         <div class="search-row">
           <label for="catalogSearch" class="sr-only">Buscar produto ou SKU</label>
-          <input type="text" id="catalogSearch" placeholder="Buscar por produto ou SKU…" />
+          <input type="text" id="catalogSearch" placeholder="Buscar por produto, SKU ou EAN…" />
         </div>
-        <div class="table-wrap" id="catalogTableWrap"><p class="hint-text">Carregando…</p></div>
+        <div id="catalogResultsWrap"><p class="hint-text">Carregando…</p></div>
         <div class="pagination">
-          <button class="btn-secondary" id="btnPrevPage" disabled>‹ Anterior</button>
+          <button class="icon-btn" id="btnPrevPage" disabled aria-label="Página anterior">${Icon.chevronLeft}</button>
           <span id="pageInfo" class="hint-text"></span>
-          <button class="btn-secondary" id="btnNextPage" disabled>Próxima ›</button>
+          <button class="icon-btn" id="btnNextPage" disabled aria-label="Próxima página">${Icon.chevronRight}</button>
         </div>
       </div>
     </section>`;
@@ -85,13 +87,16 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
         const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
         statusEl.textContent = "Importando…";
         const summary = await importCatalog(file.name, rows);
-        statusEl.textContent = `✓ ${summary.inserted_rows} inseridos, ${summary.updated_rows} atualizados, ${summary.rejected_rows} rejeitados (de ${summary.total_rows} linhas).`;
+        statusEl.textContent = `${summary.inserted_rows} inseridos, ${summary.updated_rows} atualizados, ${summary.rejected_rows} rejeitados (de ${summary.total_rows} linhas).`;
+        showToast("Catálogo importado com sucesso.", "success");
         page = 0;
         query = "";
         (root.querySelector("#catalogSearch") as HTMLInputElement).value = "";
         await loadPage(root);
       } catch (err) {
-        statusEl.textContent = `Erro na importação: ${err instanceof Error ? err.message : String(err)}`;
+        const message = err instanceof Error ? err.message : String(err);
+        statusEl.textContent = `Erro na importação: ${message}`;
+        showToast("Erro na importação do catálogo.", "error");
       } finally {
         fileInput.value = "";
       }
@@ -100,10 +105,10 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
 }
 
 async function loadPage(root: HTMLElement): Promise<void> {
-  const wrap = root.querySelector("#catalogTableWrap")!;
+  const wrap = root.querySelector("#catalogResultsWrap")!;
   try {
     const result = await searchCatalog(query, page, PAGE_SIZE);
-    renderTable(wrap, result.rows);
+    renderResults(wrap, result.rows);
     const pageInfo = root.querySelector("#pageInfo")!;
     const totalPages = Math.max(1, Math.ceil(result.total / PAGE_SIZE));
     pageInfo.textContent = `Página ${page + 1} de ${totalPages} (${result.total} SKUs)`;
@@ -114,20 +119,43 @@ async function loadPage(root: HTMLElement): Promise<void> {
   }
 }
 
-function renderTable(wrap: Element, rows: CatalogRow[]): void {
+function renderResults(wrap: Element, rows: CatalogRow[]): void {
   if (rows.length === 0) {
-    wrap.innerHTML = `<p class="hint-text">Nenhum produto encontrado.</p>`;
+    wrap.innerHTML = `<div class="empty-state">${Icon.searchX}<p>Nenhum produto encontrado.</p></div>`;
     return;
   }
+
+  const cards = rows
+    .map(
+      (r) => `
+      <div class="product-card">
+        <div class="product-card-top">
+          <p class="product-card-name">${escapeHtml(r.produto)}</p>
+        </div>
+        <div class="product-card-meta">
+          <span class="sku-code">${escapeHtml(r.sku_code)}</span>
+          ${r.gtin ? `<span class="sku-code">EAN ${escapeHtml(r.gtin)}</span>` : ""}
+          <span>${escapeHtml(r.cor || "-")}</span>
+        </div>
+      </div>`
+    )
+    .join("");
+
+  const rowsHtml = rows
+    .map(
+      (r) =>
+        `<tr><td>${escapeHtml(r.produto)}</td><td>${escapeHtml(r.cor || "")}</td><td class="sku-code">${escapeHtml(
+          r.sku_code
+        )}</td><td class="sku-code">${escapeHtml(r.gtin || "-")}</td></tr>`
+    )
+    .join("");
+
   wrap.innerHTML = `
-    <table>
-      <thead><tr><th>Produto</th><th>Cor</th><th>SKU</th></tr></thead>
-      <tbody>
-        ${rows
-          .map(
-            (r) => `<tr><td>${escapeHtml(r.produto)}</td><td>${escapeHtml(r.cor || "")}</td><td class="sku-code">${escapeHtml(r.sku_code)}</td></tr>`
-          )
-          .join("")}
-      </tbody>
-    </table>`;
+    <div class="product-card-list mobile-only">${cards}</div>
+    <div class="table-wrap desktop-only">
+      <table>
+        <thead><tr><th>Produto</th><th>Cor</th><th>SKU</th><th>GTIN/EAN</th></tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>`;
 }

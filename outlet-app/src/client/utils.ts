@@ -41,6 +41,14 @@ export function formatDateTime(iso: string | null | undefined): string {
 
 export class ValidationError extends Error {}
 
+/** Iniciais para o avatar do operador (ex.: "Ana Souza" -> "AS"). */
+export function initials(name: string | null | undefined): string {
+  const parts = (name || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
 /** Gera um id local temporário para itens ainda não persistidos no servidor. */
 export function localId(): string {
   return `local-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;

@@ -6,36 +6,53 @@ import {
   startOrResumeConference,
   addItem,
   removeItem,
+  updateItemQuantity,
   finalize,
   subscribeSession,
   type Session,
+  type SessionItem,
 } from "../../conferenceSession.ts";
 import { exportItemsToXlsx } from "../../exporter.ts";
+import { Icon } from "../icons.ts";
+import { showToast } from "../toast.ts";
+import { confirmAction } from "../confirmModal.ts";
 
 let pendingImages: { data: string; media_type: string; name: string }[] = [];
 let candidates: MatchResult[] = [];
 let unsubscribeSession: (() => void) | null = null;
 
+const MATCH_BADGE: Record<string, { cls: string; icon: string; label: string }> = {
+  matched: { cls: "success", icon: Icon.checkCircle, label: "OK" },
+  matched_parcial: { cls: "warning", icon: Icon.alertTriangle, label: "Parcial" },
+  modelo_nao_encontrado: { cls: "error", icon: Icon.xCircle, label: "Modelo?" },
+  cor_nao_encontrada: { cls: "warning", icon: Icon.alertTriangle, label: "Cor?" },
+  sku_nao_cadastrado: { cls: "error", icon: Icon.xCircle, label: "Sem SKU" },
+  manual: { cls: "info", icon: Icon.pencil, label: "Manual" },
+};
+
+const SYNC_BADGE: Record<string, { cls: string; icon: string; label: string }> = {
+  saving: { cls: "info", icon: Icon.loader, label: "Salvando…" },
+  saved: { cls: "success", icon: Icon.checkCircle, label: "Salvo" },
+  error: { cls: "error", icon: Icon.alertTriangle, label: "Erro ao salvar" },
+  pending_offline: { cls: "warning", icon: Icon.wifiOff, label: "Pendente (offline)" },
+};
+
+const SOURCE_LABEL: Record<string, string> = {
+  manual: "Manual",
+  text: "Texto",
+  screenshot: "Print",
+  import: "Importação",
+};
+
 function statusStamp(status: string): string {
-  const map: Record<string, string> = {
-    matched: `<span class="stamp ok">OK</span>`,
-    matched_parcial: `<span class="stamp warn">Parcial</span>`,
-    modelo_nao_encontrado: `<span class="stamp err">Modelo?</span>`,
-    cor_nao_encontrada: `<span class="stamp warn">Cor?</span>`,
-    sku_nao_cadastrado: `<span class="stamp err">Sem SKU</span>`,
-    manual: `<span class="stamp warn">Manual</span>`,
-  };
-  return map[status] || `<span class="stamp warn">Revisar</span>`;
+  const m = MATCH_BADGE[status] || { cls: "warning", icon: Icon.alertTriangle, label: "Revisar" };
+  return `<span class="status-badge ${m.cls}">${m.icon}${m.label}</span>`;
 }
 
 function syncStamp(state: string): string {
-  const map: Record<string, string> = {
-    saving: `<span class="stamp warn">Salvando…</span>`,
-    saved: `<span class="stamp ok">Salvo</span>`,
-    error: `<span class="stamp err">Erro ao salvar</span>`,
-    pending_offline: `<span class="stamp warn">Pendente (offline)</span>`,
-  };
-  return map[state] || "";
+  const m = SYNC_BADGE[state];
+  if (!m) return "";
+  return `<span class="status-badge ${m.cls}">${m.icon}${m.label}</span>`;
 }
 
 export async function renderConference(root: HTMLElement): Promise<void> {
@@ -57,19 +74,19 @@ export async function renderConference(root: HTMLElement): Promise<void> {
       <div class="card">
         <h2>1. Envie os prints ou cole o texto</h2>
         <div class="input-mode-switch">
-          <button class="mode-btn active" data-mode="imagens">📷 Prints (imagens)</button>
-          <button class="mode-btn" data-mode="texto">✍️ Colar texto</button>
+          <button class="mode-btn active" data-mode="imagens">${Icon.camera}Prints (imagens)</button>
+          <button class="mode-btn" data-mode="texto">${Icon.type}Colar texto</button>
         </div>
 
         <div class="mode-panel active" id="mode-imagens">
           <label class="dropzone" id="dropzone">
             <input type="file" id="fileInput" accept="image/*" multiple hidden />
-            <span class="dz-icon">＋</span>
+            <span class="dz-icon">${Icon.imagePlus}</span>
             <span>Toque para escolher os prints</span>
             <span class="dz-hint">Vários arquivos de uma vez são aceitos</span>
           </label>
           <div id="imagePreviewList" class="image-preview-list"></div>
-          <div class="warning-box">🔎 Leitura via OCR local no navegador (gratuita). Revise os itens antes de confirmar.</div>
+          <div class="warning-box">${Icon.info} Leitura via OCR local no navegador (gratuita). Revise os itens antes de confirmar.</div>
           <button class="btn-primary btn-block" id="btnParseImages">Ler prints e gerar itens</button>
         </div>
 
@@ -83,9 +100,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
 
       <div class="card">
         <h2>2. Revise antes de adicionar</h2>
-        <div class="table-wrap" id="candidatesWrap">
-          <p class="hint-text">Nenhum item gerado ainda.</p>
-        </div>
+        <div id="candidatesWrap"><p class="hint-text">Nenhum item gerado ainda.</p></div>
         <div class="review-actions">
           <button class="btn-secondary" id="btnAddManualRow">+ Linha manual</button>
           <button class="btn-primary" id="btnConfirmAll" disabled>Adicionar tudo à conferência</button>
@@ -93,11 +108,14 @@ export async function renderConference(root: HTMLElement): Promise<void> {
       </div>
 
       <div class="card">
-        <h2>3. Itens da conferência</h2>
-        <div class="table-wrap" id="sessionWrap"></div>
+        <div class="product-card-top">
+          <h2 style="margin:0">3. Itens da conferência</h2>
+          <span id="syncSummary"></span>
+        </div>
+        <div id="sessionWrap"></div>
         <div class="review-actions">
-          <button class="btn-secondary" id="btnExport">Exportar Excel (.xlsx)</button>
-          <button class="btn-primary" id="btnFinalize">Finalizar conferência</button>
+          <button class="btn-secondary" id="btnExport">${Icon.fileSpreadsheet}Exportar Excel</button>
+          <button class="btn-accent" id="btnFinalize">Finalizar conferência</button>
         </div>
       </div>
     </section>`;
@@ -110,13 +128,26 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   document.getElementById("btnExport")!.addEventListener("click", () => {
     const current = sessionSnapshot();
     if (!current || current.items.length === 0) {
-      alert("Não há itens para exportar.");
+      showToast("Não há itens para exportar.", "error");
       return;
     }
     exportItemsToXlsx(current.items);
+    showToast("Planilha exportada.", "success");
   });
 
   document.getElementById("btnFinalize")!.addEventListener("click", async () => {
+    const current = sessionSnapshot();
+    if (!current || current.items.length === 0) {
+      showToast("Adicione ao menos um item antes de finalizar.", "error");
+      return;
+    }
+    const confirmed = await confirmAction({
+      title: "Finalizar conferência?",
+      message: `${current.items.length} item(ns) serão consolidados. Depois de finalizada, um operador não pode mais editar esta conferência.`,
+      confirmLabel: "Finalizar",
+    });
+    if (!confirmed) return;
+
     const btn = document.getElementById("btnFinalize") as HTMLButtonElement;
     btn.disabled = true;
     btn.textContent = "Finalizando…";
@@ -124,17 +155,17 @@ export async function renderConference(root: HTMLElement): Promise<void> {
     btn.disabled = false;
     btn.textContent = "Finalizar conferência";
     if (!outcome.ok) {
-      alert(outcome.reason || "Não foi possível finalizar.");
+      showToast(outcome.reason || "Não foi possível finalizar.", "error");
       return;
     }
-    alert(`Conferência finalizada: ${outcome.totals?.total_skus} SKUs, ${outcome.totals?.total_units} unidades.`);
+    showToast(`Conferência finalizada: ${outcome.totals?.total_skus} SKUs, ${outcome.totals?.total_units} unidades.`, "success");
     window.location.hash = "/historico";
   });
 
   let currentSession: Session | null = session;
   unsubscribeSession = subscribeSession((s) => {
     currentSession = s;
-    if (s) renderSessionTable(root, s);
+    if (s) renderSessionItems(root, s);
   });
 
   function sessionSnapshot(): Session | null {
@@ -184,7 +215,7 @@ function wireImageInput(root: HTMLElement): void {
 
   root.querySelector("#btnParseImages")!.addEventListener("click", async () => {
     if (pendingImages.length === 0) {
-      alert("Selecione ao menos um print.");
+      showToast("Selecione ao menos um print.", "error");
       return;
     }
     const btn = root.querySelector("#btnParseImages") as HTMLButtonElement;
@@ -194,13 +225,13 @@ function wireImageInput(root: HTMLElement): void {
         btn.textContent = `Lendo print ${i + 1}/${total}…`;
       });
       if (items.length === 0) {
-        alert('Não consegui identificar itens nos prints. Tente a opção "Colar texto".');
+        showToast('Não consegui identificar itens nos prints. Tente a opção "Colar texto".', "error");
         return;
       }
       candidates = await matchItems(items);
-      renderCandidatesTable(root);
+      renderCandidates(root);
     } catch (err) {
-      alert("Erro ao ler prints: " + (err instanceof Error ? err.message : String(err)));
+      showToast("Erro ao ler prints: " + (err instanceof Error ? err.message : String(err)), "error");
     } finally {
       btn.textContent = "Ler prints e gerar itens";
       btn.disabled = false;
@@ -235,11 +266,11 @@ function wireTextInput(root: HTMLElement): void {
       return { modelo, cor, quantidade };
     });
     candidates = await matchItems(items);
-    renderCandidatesTable(root);
+    renderCandidates(root);
   });
 }
 
-function renderCandidatesTable(root: HTMLElement): void {
+function renderCandidates(root: HTMLElement): void {
   const wrap = root.querySelector("#candidatesWrap")!;
   const confirmBtn = root.querySelector("#btnConfirmAll") as HTMLButtonElement;
   confirmBtn.disabled = candidates.length === 0;
@@ -250,31 +281,32 @@ function renderCandidatesTable(root: HTMLElement): void {
   }
 
   wrap.innerHTML = `
-    <table>
-      <thead>
-        <tr><th>Modelo</th><th>Cor</th><th>Qtd</th><th>SKU</th><th>Status</th><th></th></tr>
-      </thead>
-      <tbody>
-        ${candidates
-          .map(
-            (c, idx) => `
-          <tr>
-            <td><input type="text" aria-label="Modelo" value="${escapeHtml(c.modelo_bruto)}" data-field="modelo" data-idx="${idx}" /></td>
-            <td><input type="text" aria-label="Cor" value="${escapeHtml(c.cor_bruta)}" data-field="cor" data-idx="${idx}" /></td>
-            <td><input type="number" aria-label="Quantidade" min="1" value="${c.qtd}" data-field="qtd" data-idx="${idx}" style="width:60px" /></td>
-            <td>
-              <div class="sku-picker" data-idx="${idx}">
-                <input type="text" class="sku-picker-input" aria-label="Buscar SKU" placeholder="buscar SKU…" value="${escapeHtml(c.sku_code || "")}" data-idx="${idx}" />
-                <div class="sku-picker-results" hidden></div>
-              </div>
-            </td>
-            <td>${statusStamp(c.status)}</td>
-            <td><button class="row-remove" data-idx="${idx}" title="Remover" aria-label="Remover linha">✕</button></td>
-          </tr>`
-          )
-          .join("")}
-      </tbody>
-    </table>`;
+    <div class="product-card-list">
+      ${candidates
+        .map(
+          (c, idx) => `
+        <div class="product-card">
+          <div class="product-card-top">
+            <input type="text" aria-label="Modelo" value="${escapeHtml(c.modelo_bruto)}" data-field="modelo" data-idx="${idx}" style="margin-bottom:0;font-weight:600" />
+            <button class="icon-btn danger" data-remove-idx="${idx}" aria-label="Remover linha">${Icon.trash}</button>
+          </div>
+          <input type="text" aria-label="Cor" value="${escapeHtml(c.cor_bruta)}" data-field="cor" data-idx="${idx}" placeholder="Cor" />
+          <div class="sku-picker" data-idx="${idx}">
+            <input type="text" class="sku-picker-input" aria-label="Buscar SKU" placeholder="Buscar SKU…" value="${escapeHtml(c.sku_code || "")}" data-idx="${idx}" />
+            <div class="sku-picker-results" hidden></div>
+          </div>
+          <div class="product-card-bottom">
+            <div class="qty-stepper">
+              <button type="button" data-qty-dec="${idx}" aria-label="Diminuir quantidade">${Icon.minus}</button>
+              <input type="number" min="1" aria-label="Quantidade" value="${c.qtd}" data-field="qtd" data-idx="${idx}" />
+              <button type="button" data-qty-inc="${idx}" aria-label="Aumentar quantidade">${Icon.plus}</button>
+            </div>
+            ${statusStamp(c.status)}
+          </div>
+        </div>`
+        )
+        .join("")}
+    </div>`;
 
   wrap.querySelectorAll<HTMLInputElement>('input[data-field="modelo"], input[data-field="cor"]').forEach((el) => {
     el.addEventListener("change", async (e) => {
@@ -285,21 +317,37 @@ function renderCandidatesTable(root: HTMLElement): void {
       const modelo = field === "modelo" ? value : c.modelo_bruto;
       const cor = field === "cor" ? value : c.cor_bruta;
       candidates[idx] = (await matchItems([{ modelo, cor, quantidade: c.qtd }]))[0];
-      renderCandidatesTable(root);
+      renderCandidates(root);
     });
   });
 
   wrap.querySelectorAll<HTMLInputElement>('input[data-field="qtd"]').forEach((el) => {
     el.addEventListener("change", (e) => {
       const idx = Number((e.target as HTMLElement).dataset.idx);
-      candidates[idx].qtd = Number((e.target as HTMLInputElement).value) || 1;
+      candidates[idx].qtd = Math.max(1, Number((e.target as HTMLInputElement).value) || 1);
+      renderCandidates(root);
     });
   });
 
-  wrap.querySelectorAll<HTMLButtonElement>(".row-remove").forEach((btn) => {
+  wrap.querySelectorAll<HTMLButtonElement>("[data-qty-dec]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      candidates.splice(Number(btn.dataset.idx), 1);
-      renderCandidatesTable(root);
+      const idx = Number(btn.dataset.qtyDec);
+      candidates[idx].qtd = Math.max(1, candidates[idx].qtd - 1);
+      renderCandidates(root);
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-qty-inc]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.qtyInc);
+      candidates[idx].qtd = candidates[idx].qtd + 1;
+      renderCandidates(root);
+    });
+  });
+
+  wrap.querySelectorAll<HTMLButtonElement>("[data-remove-idx]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      candidates.splice(Number(btn.dataset.removeIdx), 1);
+      renderCandidates(root);
     });
   });
 
@@ -353,7 +401,7 @@ function wireSkuPickers(wrap: Element): void {
             status: "matched",
           };
           const wrapEl = resultsBox.closest("#candidatesWrap")!;
-          renderCandidatesTable(wrapEl.parentElement as HTMLElement);
+          renderCandidates(wrapEl.parentElement as HTMLElement);
         });
       });
     }
@@ -373,13 +421,13 @@ function wireCandidateActions(root: HTMLElement): void {
       sku_code: null,
       status: "modelo_nao_encontrado",
     });
-    renderCandidatesTable(root);
+    renderCandidates(root);
   });
 
   root.querySelector("#btnConfirmAll")!.addEventListener("click", async () => {
     const toAdd = [...candidates];
     candidates = [];
-    renderCandidatesTable(root);
+    renderCandidates(root);
     const previewList = root.querySelector("#imagePreviewList")!;
     previewList.innerHTML = "";
     pendingImages = [];
@@ -394,39 +442,101 @@ function wireCandidateActions(root: HTMLElement): void {
         source: "text",
       });
     }
+    showToast(`${toAdd.length} item(ns) adicionado(s) à conferência.`, "success");
   });
 }
 
-function renderSessionTable(root: HTMLElement, session: Session): void {
+function renderSessionItemCard(it: SessionItem): string {
+  return `
+    <div class="product-card">
+      <div class="product-card-top">
+        <p class="product-card-name">${escapeHtml(it.raw_model || "(sem modelo)")}</p>
+        ${syncStamp(it.syncState)}
+      </div>
+      <div class="product-card-meta">
+        <span>${escapeHtml(it.raw_color || "-")}</span>
+        <span class="sku-code">${escapeHtml(it.sku_code || "-")}</span>
+        <span>${escapeHtml(SOURCE_LABEL[it.source] || it.source)}</span>
+      </div>
+      <div class="product-card-bottom">
+        <div class="qty-stepper">
+          <button type="button" data-qty-dec="${it.uiId}" aria-label="Diminuir quantidade">${Icon.minus}</button>
+          <input type="text" inputmode="numeric" aria-label="Quantidade" value="${it.quantity}" readonly />
+          <button type="button" data-qty-inc="${it.uiId}" aria-label="Aumentar quantidade">${Icon.plus}</button>
+        </div>
+        <div class="product-card-actions">
+          <button class="icon-btn danger" data-remove-id="${it.uiId}" aria-label="Remover item">${Icon.trash}</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderSessionItemRow(it: SessionItem): string {
+  return `
+    <tr>
+      <td>${escapeHtml(it.raw_model)}</td>
+      <td>${escapeHtml(it.raw_color)}</td>
+      <td>
+        <div class="qty-stepper">
+          <button type="button" data-qty-dec="${it.uiId}" aria-label="Diminuir quantidade">${Icon.minus}</button>
+          <input type="text" inputmode="numeric" aria-label="Quantidade" value="${it.quantity}" readonly />
+          <button type="button" data-qty-inc="${it.uiId}" aria-label="Aumentar quantidade">${Icon.plus}</button>
+        </div>
+      </td>
+      <td class="sku-code">${escapeHtml(it.sku_code || "-")}</td>
+      <td>${syncStamp(it.syncState)}</td>
+      <td><button class="row-remove" data-remove-id="${it.uiId}" title="Remover" aria-label="Remover item">${Icon.trash}</button></td>
+    </tr>`;
+}
+
+function renderSessionItems(root: HTMLElement, session: Session): void {
   const wrap = root.querySelector("#sessionWrap");
+  const summary = root.querySelector("#syncSummary");
   if (!wrap) return;
+
+  const pending = session.items.filter((it) => it.syncState !== "saved").length;
+  if (summary) {
+    summary.innerHTML = pending > 0 ? `<span class="status-badge warning">${Icon.loader}${pending} pendente(s)</span>` : "";
+  }
+
   if (session.items.length === 0) {
-    wrap.innerHTML = `<p class="hint-text">Nenhum item adicionado ainda.</p>`;
+    wrap.innerHTML = `<div class="empty-state">${Icon.package}<p>Nenhum item adicionado ainda.</p></div>`;
     return;
   }
-  wrap.innerHTML = `
-    <table>
-      <thead><tr><th>Modelo</th><th>Cor</th><th>Qtd</th><th>SKU</th><th>Status</th><th></th></tr></thead>
-      <tbody>
-        ${session.items
-          .map(
-            (it) => `
-          <tr>
-            <td>${escapeHtml(it.raw_model)}</td>
-            <td>${escapeHtml(it.raw_color)}</td>
-            <td>${it.quantity}</td>
-            <td class="sku-code">${escapeHtml(it.sku_code || "-")}</td>
-            <td>${syncStamp(it.syncState)}</td>
-            <td><button class="row-remove" data-ui-id="${it.uiId}" title="Remover" aria-label="Remover item">✕</button></td>
-          </tr>`
-          )
-          .join("")}
-      </tbody>
-    </table>`;
 
-  wrap.querySelectorAll<HTMLButtonElement>(".row-remove").forEach((btn) => {
+  wrap.innerHTML = `
+    <div class="product-card-list mobile-only">
+      ${session.items.map(renderSessionItemCard).join("")}
+    </div>
+    <div class="table-wrap desktop-only">
+      <table>
+        <thead><tr><th>Modelo</th><th>Cor</th><th>Qtd</th><th>SKU</th><th>Status</th><th></th></tr></thead>
+        <tbody>${session.items.map(renderSessionItemRow).join("")}</tbody>
+      </table>
+    </div>`;
+
+  wrap.querySelectorAll<HTMLButtonElement>("[data-remove-id]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const confirmed = await confirmAction({
+        title: "Remover item?",
+        message: "Este item será removido da conferência.",
+        confirmLabel: "Remover",
+        danger: true,
+      });
+      if (confirmed) void removeItem(btn.dataset.removeId!);
+    });
+  });
+
+  wrap.querySelectorAll<HTMLButtonElement>("[data-qty-dec]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      void removeItem(btn.dataset.uiId!);
+      const it = session.items.find((i) => i.uiId === btn.dataset.qtyDec);
+      if (it) void updateItemQuantity(it.uiId, Math.max(1, it.quantity - 1));
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-qty-inc]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const it = session.items.find((i) => i.uiId === btn.dataset.qtyInc);
+      if (it) void updateItemQuantity(it.uiId, it.quantity + 1);
     });
   });
 }

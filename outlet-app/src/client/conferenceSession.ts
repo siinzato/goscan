@@ -185,6 +185,49 @@ async function trySaveOp(conferenceId: string, tempId: string): Promise<void> {
   }
 }
 
+/** Ajusta a quantidade de um item já na conferência (stepper +/- no card mobile). */
+export async function updateItemQuantity(uiId: string, quantity: number): Promise<void> {
+  if (!session || quantity < 1) return;
+  const item = session.items.find((it) => it.uiId === uiId);
+  if (!item) return;
+  const conferenceId = session.conference.id;
+
+  session = {
+    ...session,
+    items: session.items.map((it) => (it.uiId === uiId ? { ...it, quantity, syncState: "saving" } : it)),
+  };
+  emit();
+
+  if (!item.serverId) {
+    // ainda nem foi confirmado salvo: só atualiza o payload da operação de create pendente.
+    const queue = offline.loadQueue(conferenceId);
+    const op = queue.find((o) => o.tempId === uiId);
+    if (op && op.payload) {
+      offline.removeFromQueue(conferenceId, uiId);
+      offline.enqueue(conferenceId, { ...op, payload: { ...op.payload, quantity } });
+    }
+    if (session) {
+      session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "pending_offline" } : it)) };
+      emit();
+    }
+    return;
+  }
+
+  try {
+    await api.updateItem(item.serverId, { quantity });
+    if (session) {
+      session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "saved", errorMessage: null } : it)) };
+      emit();
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (session) {
+      session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "error", errorMessage: message } : it)) };
+      emit();
+    }
+  }
+}
+
 export async function removeItem(uiId: string): Promise<void> {
   if (!session) return;
   const item = session.items.find((it) => it.uiId === uiId);

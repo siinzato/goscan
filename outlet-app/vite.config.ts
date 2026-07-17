@@ -21,16 +21,17 @@ export default defineConfig({
     VitePWA({
       registerType: "autoUpdate",
       injectRegister: "auto",
-      includeAssets: ["icons/icon-192.png", "icons/icon-512.png"],
+      // Nome/ícones espelham src/client/brand.ts — JSON do manifest não pode importar TS.
+      includeAssets: ["icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon-180.png", "icons/favicon-32.png"],
       manifest: {
-        name: "Conferência de Estoque · Outlet",
-        short_name: "Outlet Conf.",
-        description: "Conferência de estoque do Outlet a partir de prints, texto ou planilha.",
+        name: "GoScan — Conferência Inteligente de Outlet",
+        short_name: "GoScan",
+        description: "Conferência Inteligente de Produtos de Outlet — uma ferramenta GoGroup.",
         start_url: "/",
         scope: "/",
         display: "standalone",
-        background_color: "#F3EEE4",
-        theme_color: "#B8501C",
+        background_color: "#FFFFFF",
+        theme_color: "#123F78",
         icons: [
           { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
           { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png" },

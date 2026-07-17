@@ -102,15 +102,29 @@ export async function getMyActiveConference(): Promise<Conference | null> {
   return (data as Conference) || null;
 }
 
-export async function listRecentConferences(limit = 10): Promise<Conference[]> {
+export interface ConferenceWithOperator extends Conference {
+  operator_name: string | null;
+}
+
+interface OperatorJoin {
+  full_name: string | null;
+}
+
+export async function listRecentConferences(limit = 10): Promise<ConferenceWithOperator[]> {
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from("conferences")
-    .select("*")
+    .select("*, profiles(full_name)")
     .order("created_at", { ascending: false })
     .limit(limit);
   if (error) throw error;
-  return (data as Conference[]) || [];
+
+  return ((data as unknown as (Conference & { profiles: OperatorJoin | OperatorJoin[] | null })[]) || []).map(
+    ({ profiles, ...conference }) => {
+      const operator = Array.isArray(profiles) ? profiles[0] : profiles;
+      return { ...conference, operator_name: operator?.full_name ?? null };
+    }
+  );
 }
 
 export async function markInProgress(conferenceId: string): Promise<void> {

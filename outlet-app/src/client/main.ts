@@ -28,7 +28,7 @@ async function boot() {
   subscribeAuth((state) => {
     if (state.status === "loading") return; // já mostrado acima
     if (state.status === "signed_out") {
-      renderLogin(root);
+      renderLogin(root, state.error || "");
       return;
     }
     if (state.status === "inactive") {

@@ -1,5 +1,7 @@
 import { getAuthState } from "../auth.ts";
 import { escapeHtml } from "../utils.ts";
+import { APP_NAME } from "../brand.ts";
+import { Icon } from "./icons.ts";
 import { renderHome } from "./screens/home.ts";
 import { renderConference } from "./screens/conference.ts";
 import { renderCatalog } from "./screens/catalog.ts";
@@ -9,11 +11,11 @@ import { renderProfile } from "./screens/profile.ts";
 type Route = "inicio" | "conferir" | "catalogo" | "historico" | "perfil";
 
 const TABS: { route: Route; label: string; icon: string }[] = [
-  { route: "inicio", label: "Início", icon: "🏠" },
-  { route: "conferir", label: "Conferir", icon: "📷" },
-  { route: "catalogo", label: "Catálogo", icon: "📦" },
-  { route: "historico", label: "Histórico", icon: "🕘" },
-  { route: "perfil", label: "Perfil", icon: "👤" },
+  { route: "inicio", label: "Início", icon: Icon.home },
+  { route: "conferir", label: "Conferir", icon: Icon.camera },
+  { route: "catalogo", label: "Catálogo", icon: Icon.package },
+  { route: "historico", label: "Histórico", icon: Icon.history },
+  { route: "perfil", label: "Perfil", icon: Icon.user },
 ];
 
 function currentRoute(): Route {
@@ -29,9 +31,8 @@ export function mountShell(root: HTMLElement): void {
     root.innerHTML = `
       <div class="app-shell">
         <header class="app-header">
-          <span class="brand-mark">OUT</span>
+          <img class="app-header-logo" src="/brand/goscan-wordmark.png" alt="${APP_NAME}" />
           <div class="app-header-text">
-            <strong>Conferência de Estoque</strong>
             <span class="app-header-sub">${escapeHtml(profile?.full_name || "")} · ${escapeHtml(profile?.role || "")}</span>
           </div>
         </header>
@@ -41,7 +42,7 @@ export function mountShell(root: HTMLElement): void {
             (t) => `
             <button class="bottom-nav-btn" data-route="${t.route}" aria-label="${t.label}">
               <span class="bottom-nav-icon" aria-hidden="true">${t.icon}</span>
-              <span class="bottom-nav-label">${t.label}</span>
+              <span class="bottom-nav-label">${escapeHtml(t.label)}</span>
             </button>`
           ).join("")}
         </nav>
