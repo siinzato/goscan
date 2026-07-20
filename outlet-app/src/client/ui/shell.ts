@@ -4,15 +4,17 @@ import { APP_NAME } from "../brand.ts";
 import { Icon } from "./icons.ts";
 import { renderHome } from "./screens/home.ts";
 import { renderConference } from "./screens/conference.ts";
+import { renderScan, teardownScan } from "./screens/scan.ts";
 import { renderCatalog } from "./screens/catalog.ts";
 import { renderHistory } from "./screens/history.ts";
 import { renderProfile } from "./screens/profile.ts";
 
-type Route = "inicio" | "conferir" | "catalogo" | "historico" | "perfil";
+type Route = "inicio" | "conferir" | "escanear" | "catalogo" | "historico" | "perfil";
 
 const TABS: { route: Route; label: string; icon: string }[] = [
   { route: "inicio", label: "Início", icon: Icon.home },
   { route: "conferir", label: "Conferir", icon: Icon.camera },
+  { route: "escanear", label: "Escanear", icon: Icon.scan },
   { route: "catalogo", label: "Catálogo", icon: Icon.package },
   { route: "historico", label: "Histórico", icon: Icon.history },
   { route: "perfil", label: "Perfil", icon: Icon.user },
@@ -60,10 +62,17 @@ export function mountShell(root: HTMLElement): void {
   renderCurrentScreen();
 }
 
+let previousRoute: Route | null = null;
+
 function renderCurrentScreen(): void {
   const content = document.getElementById("screen-content");
   if (!content) return;
   const route = currentRoute();
+
+  // Sair da tela de câmera precisa sempre encerrar as tracks — nunca deixar
+  // a câmera aberta em segundo plano enquanto o usuário navega para outra aba.
+  if (previousRoute === "escanear" && route !== "escanear") teardownScan();
+  previousRoute = route;
 
   document.querySelectorAll<HTMLButtonElement>(".bottom-nav-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.route === route);
@@ -77,6 +86,9 @@ function renderCurrentScreen(): void {
     case "conferir":
       void renderConference(content);
       break;
+    case "escanear":
+      void renderScan(content);
+      break;
     case "catalogo":
       void renderCatalog(content);
       break;
@@ -88,3 +100,7 @@ function renderCurrentScreen(): void {
       break;
   }
 }
+
+window.addEventListener("beforeunload", () => {
+  if (previousRoute === "escanear") teardownScan();
+});

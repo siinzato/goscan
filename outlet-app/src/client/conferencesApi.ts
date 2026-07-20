@@ -2,7 +2,7 @@ import { getSupabase } from "./supabaseClient.ts";
 import { getAuthState } from "./auth.ts";
 
 export type ConferenceStatus = "draft" | "in_progress" | "completed" | "cancelled";
-export type ItemSource = "manual" | "text" | "screenshot" | "import";
+export type ItemSource = "manual" | "text" | "screenshot" | "import" | "camera_scan";
 export type ItemMatchStatus = "matched" | "partial" | "manual" | "unresolved";
 
 export interface Conference {
@@ -27,7 +27,9 @@ export interface ConferenceItem {
   raw_color: string | null;
   quantity: number;
   match_status: ItemMatchStatus;
+  match_confidence: number | null;
   source: ItemSource;
+  recognition_id: string | null;
   created_by: string | null;
   created_at: string;
   updated_at: string;
@@ -145,6 +147,8 @@ export interface NewItemInput {
   quantity: number;
   match_status: ItemMatchStatus;
   source: ItemSource;
+  match_confidence?: number | null;
+  recognition_id?: string | null;
 }
 
 export async function addItem(input: NewItemInput): Promise<ConferenceItem> {

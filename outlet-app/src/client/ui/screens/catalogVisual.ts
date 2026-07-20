@@ -623,7 +623,7 @@ async function runBatchLoop(body: HTMLElement, importId: string): Promise<void> 
     } catch (err) {
       progressWrap.innerHTML += `<div class="error-box">Erro no processamento em lote: ${escapeHtml(
         err instanceof Error ? err.message : String(err)
-      )} — se o backend não tiver SUPABASE_SERVICE_ROLE_KEY configurada, os produtos já foram criados, só as imagens não puderam ser baixadas.</div>`;
+      )} — os produtos já criados e as imagens já processadas foram salvos; use "Continuar" na lista de importações para retomar de onde parou.</div>`;
       break;
     }
   }

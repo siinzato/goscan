@@ -10,7 +10,7 @@ export class ImageValidationError extends Error {}
 const MAX_OUTPUT_DIMENSION = 2048;
 const MIN_USABLE_DIMENSION = 150; // abaixo disso, só sinaliza para revisão — não rejeita
 
-function sniffMime(buf: Buffer): string | null {
+export function sniffMime(buf: Buffer): string | null {
   if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
   if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
   if (buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "image/webp";

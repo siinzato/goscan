@@ -22,6 +22,13 @@ export interface PendingOp {
     quantity: number;
     match_status: ItemMatchStatus;
     source: ItemSource;
+    // Dicas só para exibição imediata (o servidor deriva o real via join com
+    // product_variant_id) — não fazem parte das colunas de conference_items.
+    sku_code?: string | null;
+    produto?: string | null;
+    // Colunas reais (Modo Scan) — seguem para o servidor sem tradução.
+    match_confidence?: number | null;
+    recognition_id?: string | null;
   } | null;
   clientTimestamp: number;
   attempts: number;

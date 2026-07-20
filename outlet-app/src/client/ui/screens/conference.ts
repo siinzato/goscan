@@ -1,5 +1,5 @@
 import { escapeHtml, debounce } from "../../utils.ts";
-import { matchItems, type MatchResult } from "../../matching.ts";
+import { matchItems, matchItem, type MatchResult } from "../../matching.ts";
 import { parseImagesLocally } from "../../ocr.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
 import {
@@ -7,6 +7,7 @@ import {
   addItem,
   removeItem,
   updateItemQuantity,
+  updateItemMatch,
   finalize,
   subscribeSession,
   type Session,
@@ -19,6 +20,11 @@ import { confirmAction } from "../confirmModal.ts";
 
 let pendingImages: { data: string; media_type: string; name: string }[] = [];
 let candidates: MatchResult[] = [];
+// idx dos candidatos com SKU de origem "manual" (digitado/escolhido pelo operador) —
+// esses nunca são sobrescritos automaticamente quando Produto/Cor mudam (ver
+// wireCandidateModeloEditing). Reconstruído a cada render a partir de MatchResult
+// não é suficiente porque "manual" não é um MatchStatus — por isso o Set separado.
+const manualOverrides = new Set<number>();
 let unsubscribeSession: (() => void) | null = null;
 
 const MATCH_BADGE: Record<string, { cls: string; icon: string; label: string }> = {
@@ -27,8 +33,23 @@ const MATCH_BADGE: Record<string, { cls: string; icon: string; label: string }> 
   modelo_nao_encontrado: { cls: "error", icon: Icon.xCircle, label: "Modelo?" },
   cor_nao_encontrada: { cls: "warning", icon: Icon.alertTriangle, label: "Cor?" },
   sku_nao_cadastrado: { cls: "error", icon: Icon.xCircle, label: "Sem SKU" },
+  ambiguous: { cls: "warning", icon: Icon.alertTriangle, label: "Escolher produto" },
   manual: { cls: "info", icon: Icon.pencil, label: "Manual" },
 };
+
+/** Mensagem por status, conforme o comportamento esperado pelo operador (ver spec). */
+function statusMessage(c: MatchResult, isManual: boolean): string {
+  if (isManual) return "SKU informado manualmente";
+  switch (c.status) {
+    case "matched":
+    case "matched_parcial":
+      return "SKU reconhecido automaticamente";
+    case "ambiguous":
+      return "Mais de um produto corresponde — escolha uma opção abaixo.";
+    default:
+      return "Produto não reconhecido — informe o SKU manualmente ou selecione um produto.";
+  }
+}
 
 const SYNC_BADGE: Record<string, { cls: string; icon: string; label: string }> = {
   saving: { cls: "info", icon: Icon.loader, label: "Salvando…" },
@@ -42,6 +63,7 @@ const SOURCE_LABEL: Record<string, string> = {
   text: "Texto",
   screenshot: "Print",
   import: "Importação",
+  camera_scan: "Câmera",
 };
 
 function statusStamp(status: string): string {
@@ -114,6 +136,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
         </div>
         <div id="sessionWrap"></div>
         <div class="review-actions">
+          <button class="btn-secondary" id="btnReprocessEmpty">${Icon.refresh}Reprocessar SKUs vazios</button>
           <button class="btn-secondary" id="btnExport">${Icon.fileSpreadsheet}Exportar Excel</button>
           <button class="btn-accent" id="btnFinalize">Finalizar conferência</button>
         </div>
@@ -124,6 +147,41 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   wireImageInput(root);
   wireTextInput(root);
   wireCandidateActions(root);
+
+  document.getElementById("btnReprocessEmpty")!.addEventListener("click", async () => {
+    const current = sessionSnapshot();
+    if (!current) return;
+    const pending = current.items.filter((it) => !it.product_variant_id);
+    if (pending.length === 0) {
+      showToast("Nenhum item sem SKU para reprocessar.", "success");
+      return;
+    }
+    const btn = document.getElementById("btnReprocessEmpty") as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = "Reprocessando…";
+    let filled = 0;
+    let stillPending = 0;
+    for (const it of pending) {
+      const result = await matchItem(it.raw_model, it.raw_color, it.quantity);
+      if (result.variant_id && (result.status === "matched" || result.status === "matched_parcial")) {
+        await updateItemMatch(it.uiId, {
+          product_variant_id: result.variant_id,
+          sku_code: result.sku_code,
+          produto: result.product_name,
+          match_status: "matched",
+        });
+        filled++;
+      } else {
+        stillPending++;
+      }
+    }
+    btn.disabled = false;
+    btn.innerHTML = `${Icon.refresh}Reprocessar SKUs vazios`;
+    showToast(
+      `${filled} SKU(s) preenchido(s) automaticamente. ${stillPending} continuam sem correspondência segura (ambíguos ou não reconhecidos) — use "Alterar produto" no item.`,
+      filled > 0 ? "success" : "error"
+    );
+  });
 
   document.getElementById("btnExport")!.addEventListener("click", () => {
     const current = sessionSnapshot();
@@ -283,8 +341,9 @@ function renderCandidates(root: HTMLElement): void {
   wrap.innerHTML = `
     <div class="product-card-list">
       ${candidates
-        .map(
-          (c, idx) => `
+        .map((c, idx) => {
+          const isManual = manualOverrides.has(idx);
+          return `
         <div class="product-card">
           <div class="product-card-top">
             <input type="text" aria-label="Modelo" value="${escapeHtml(c.modelo_bruto)}" data-field="modelo" data-idx="${idx}" style="margin-bottom:0;font-weight:600" />
@@ -292,19 +351,42 @@ function renderCandidates(root: HTMLElement): void {
           </div>
           <input type="text" aria-label="Cor" value="${escapeHtml(c.cor_bruta)}" data-field="cor" data-idx="${idx}" placeholder="Cor" />
           <div class="sku-picker" data-idx="${idx}">
-            <input type="text" class="sku-picker-input" aria-label="Buscar SKU" placeholder="Buscar SKU…" value="${escapeHtml(c.sku_code || "")}" data-idx="${idx}" />
+            <input type="text" class="sku-picker-input" aria-label="SKU (buscar por SKU ou nome)" placeholder="Buscar/digitar SKU…" value="${escapeHtml(c.sku_code || "")}" data-idx="${idx}" />
             <div class="sku-picker-results" hidden></div>
           </div>
+          <p class="hint-text" data-match-message="${idx}">${escapeHtml(statusMessage(c, isManual))}</p>
+          ${
+            c.product_name
+              ? `<p class="hint-text"><strong>${escapeHtml(c.product_name)}</strong>${c.color_matched ? " — " + escapeHtml(c.color_matched) : ""}</p>`
+              : ""
+          }
+          ${
+            c.status === "ambiguous" && c.candidates
+              ? `<div class="ambiguous-suggestions" data-idx="${idx}">
+                  ${c.candidates
+                    .map(
+                      (cand) =>
+                        `<button type="button" class="btn-secondary" data-suggestion-idx="${idx}" data-variant="${cand.variant_id}" data-sku="${escapeHtml(
+                          cand.sku_code
+                        )}" data-produto="${escapeHtml(cand.product_name)}">${escapeHtml(cand.product_name)} — ${escapeHtml(
+                          cand.color || ""
+                        )} <span class="sku-code">${escapeHtml(cand.sku_code)}</span></button>`
+                    )
+                    .join("")}
+                </div>`
+              : ""
+          }
+          ${isManual ? `<button type="button" class="btn-secondary" data-recalc-idx="${idx}">${Icon.refresh}Recalcular associação</button>` : ""}
           <div class="product-card-bottom">
             <div class="qty-stepper">
               <button type="button" data-qty-dec="${idx}" aria-label="Diminuir quantidade">${Icon.minus}</button>
               <input type="number" min="1" aria-label="Quantidade" value="${c.qtd}" data-field="qtd" data-idx="${idx}" />
               <button type="button" data-qty-inc="${idx}" aria-label="Aumentar quantidade">${Icon.plus}</button>
             </div>
-            ${statusStamp(c.status)}
+            ${statusStamp(isManual ? "manual" : c.status)}
           </div>
-        </div>`
-        )
+        </div>`;
+        })
         .join("")}
     </div>`;
 
@@ -316,7 +398,41 @@ function renderCandidates(root: HTMLElement): void {
       const c = candidates[idx];
       const modelo = field === "modelo" ? value : c.modelo_bruto;
       const cor = field === "cor" ? value : c.cor_bruta;
+
+      if (manualOverrides.has(idx)) {
+        // Nunca sobrescreve um SKU manual automaticamente — só atualiza o
+        // texto bruto e deixa o botão "Recalcular associação" visível.
+        candidates[idx] = { ...c, modelo_bruto: modelo, cor_bruta: cor };
+        renderCandidates(root);
+        return;
+      }
       candidates[idx] = (await matchItems([{ modelo, cor, quantidade: c.qtd }]))[0];
+      renderCandidates(root);
+    });
+  });
+
+  wrap.querySelectorAll<HTMLButtonElement>("[data-recalc-idx]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const idx = Number(btn.dataset.recalcIdx);
+      const c = candidates[idx];
+      manualOverrides.delete(idx);
+      candidates[idx] = await matchItem(c.modelo_bruto, c.cor_bruta, c.qtd);
+      renderCandidates(root);
+    });
+  });
+
+  wrap.querySelectorAll<HTMLButtonElement>("[data-suggestion-idx]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.suggestionIdx);
+      candidates[idx] = {
+        ...candidates[idx],
+        variant_id: btn.dataset.variant!,
+        sku_code: btn.dataset.sku!,
+        product_name: btn.dataset.produto!,
+        status: "matched",
+        candidates: undefined,
+      };
+      manualOverrides.add(idx);
       renderCandidates(root);
     });
   });
@@ -346,12 +462,25 @@ function renderCandidates(root: HTMLElement): void {
 
   wrap.querySelectorAll<HTMLButtonElement>("[data-remove-idx]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      candidates.splice(Number(btn.dataset.removeIdx), 1);
+      const removedIdx = Number(btn.dataset.removeIdx);
+      candidates.splice(removedIdx, 1);
+      reindexManualOverrides(removedIdx);
       renderCandidates(root);
     });
   });
 
   wireSkuPickers(wrap);
+}
+
+/** Ajusta os índices de manualOverrides após remover a linha `removedIdx` de `candidates`. */
+function reindexManualOverrides(removedIdx: number): void {
+  const next = new Set<number>();
+  manualOverrides.forEach((i) => {
+    if (i < removedIdx) next.add(i);
+    else if (i > removedIdx) next.add(i - 1);
+  });
+  manualOverrides.clear();
+  next.forEach((i) => manualOverrides.add(i));
 }
 
 function wireSkuPickers(wrap: Element): void {
@@ -399,7 +528,11 @@ function wireSkuPickers(wrap: Element): void {
             sku_code: item.dataset.sku!,
             product_name: item.dataset.produto!,
             status: "matched",
+            candidates: undefined,
           };
+          // Escolha manual do operador tem prioridade máxima — nunca é
+          // sobrescrita silenciosamente por um recálculo automático depois.
+          manualOverrides.add(idx);
           const wrapEl = resultsBox.closest("#candidatesWrap")!;
           renderCandidates(wrapEl.parentElement as HTMLElement);
         });
@@ -425,21 +558,31 @@ function wireCandidateActions(root: HTMLElement): void {
   });
 
   root.querySelector("#btnConfirmAll")!.addEventListener("click", async () => {
-    const toAdd = [...candidates];
+    const toAdd = candidates.map((c, idx) => ({ c, isManual: manualOverrides.has(idx) }));
     candidates = [];
+    manualOverrides.clear();
     renderCandidates(root);
     const previewList = root.querySelector("#imagePreviewList")!;
     previewList.innerHTML = "";
     pendingImages = [];
 
-    for (const c of toAdd) {
+    for (const { c, isManual } of toAdd) {
+      const matchStatus = isManual
+        ? "manual"
+        : c.status === "matched"
+          ? "matched"
+          : c.status === "matched_parcial"
+            ? "partial"
+            : "unresolved";
       await addItem({
         product_variant_id: c.variant_id,
         raw_model: c.modelo_bruto,
         raw_color: c.cor_bruta,
         quantity: c.qtd,
-        match_status: c.status === "matched" || c.status === "matched_parcial" ? "matched" : c.variant_id ? "partial" : "unresolved",
+        match_status: matchStatus,
         source: "text",
+        sku_code: c.sku_code,
+        produto: c.product_name,
       });
     }
     showToast(`${toAdd.length} item(ns) adicionado(s) à conferência.`, "success");
@@ -457,6 +600,10 @@ function renderSessionItemCard(it: SessionItem): string {
         <span>${escapeHtml(it.raw_color || "-")}</span>
         <span class="sku-code">${escapeHtml(it.sku_code || "-")}</span>
         <span>${escapeHtml(SOURCE_LABEL[it.source] || it.source)}</span>
+      </div>
+      <div class="item-sku-fix" data-item-fix="${it.uiId}">
+        <input type="text" class="sku-picker-input" aria-label="Alterar produto/SKU" placeholder="Buscar SKU ou nome…" data-item-fix-input="${it.uiId}" />
+        <div class="sku-picker-results" hidden></div>
       </div>
       <div class="product-card-bottom">
         <div class="qty-stepper">
@@ -483,10 +630,66 @@ function renderSessionItemRow(it: SessionItem): string {
           <button type="button" data-qty-inc="${it.uiId}" aria-label="Aumentar quantidade">${Icon.plus}</button>
         </div>
       </td>
-      <td class="sku-code">${escapeHtml(it.sku_code || "-")}</td>
+      <td class="sku-code">
+        ${escapeHtml(it.sku_code || "-")}
+        <div class="item-sku-fix" data-item-fix="${it.uiId}">
+          <input type="text" class="sku-picker-input" aria-label="Alterar produto/SKU" placeholder="Alterar produto…" data-item-fix-input="${it.uiId}" />
+          <div class="sku-picker-results" hidden></div>
+        </div>
+      </td>
       <td>${syncStamp(it.syncState)}</td>
       <td><button class="row-remove" data-remove-id="${it.uiId}" title="Remover" aria-label="Remover item">${Icon.trash}</button></td>
     </tr>`;
+}
+
+function wireItemSkuFix(wrap: Element): void {
+  wrap.querySelectorAll<HTMLInputElement>("[data-item-fix-input]").forEach((input) => {
+    const uiId = input.dataset.itemFixInput!;
+    const resultsBox = input.parentElement!.querySelector<HTMLDivElement>(".sku-picker-results")!;
+
+    const search = debounce(async (query: string) => {
+      if (!query.trim()) {
+        resultsBox.hidden = true;
+        return;
+      }
+      const rows = await searchSkuForPicker(query, 15);
+      renderResults(rows);
+    }, 300);
+
+    input.addEventListener("input", () => search(input.value));
+
+    function renderResults(rows: CatalogRow[]) {
+      if (rows.length === 0) {
+        resultsBox.innerHTML = `<div class="sku-picker-empty">Nenhum SKU encontrado.</div>`;
+        resultsBox.hidden = false;
+        return;
+      }
+      resultsBox.innerHTML = rows
+        .map(
+          (r) =>
+            `<button type="button" class="sku-picker-item" data-variant="${r.variant_id}" data-sku="${escapeHtml(
+              r.sku_code
+            )}" data-produto="${escapeHtml(r.produto)}">${escapeHtml(r.produto)} — ${escapeHtml(r.cor || "")} <span class="sku-code">${escapeHtml(
+              r.sku_code
+            )}</span></button>`
+        )
+        .join("");
+      resultsBox.hidden = false;
+      resultsBox.querySelectorAll<HTMLButtonElement>(".sku-picker-item").forEach((item) => {
+        item.addEventListener("click", async () => {
+          await updateItemMatch(uiId, {
+            product_variant_id: item.dataset.variant!,
+            sku_code: item.dataset.sku!,
+            produto: item.dataset.produto!,
+            match_status: "manual",
+          });
+          resultsBox.hidden = true;
+          input.value = "";
+          showToast("Produto/SKU atualizado.", "success");
+        });
+      });
+    }
+  });
 }
 
 function renderSessionItems(root: HTMLElement, session: Session): void {
@@ -539,4 +742,6 @@ function renderSessionItems(root: HTMLElement, session: Session): void {
       if (it) void updateItemQuantity(it.uiId, it.quantity + 1);
     });
   });
+
+  wireItemSkuFix(wrap);
 }

@@ -34,6 +34,13 @@ import iconFileUp from "lucide-static/icons/file-up.svg?raw";
 import iconArchive from "lucide-static/icons/archive.svg?raw";
 import iconImageOff from "lucide-static/icons/image-off.svg?raw";
 import iconClock from "lucide-static/icons/clock.svg?raw";
+import iconScan from "lucide-static/icons/scan.svg?raw";
+import iconLayers from "lucide-static/icons/layers.svg?raw";
+import iconTarget from "lucide-static/icons/target.svg?raw";
+import iconFlashlight from "lucide-static/icons/flashlight.svg?raw";
+import iconFlashlightOff from "lucide-static/icons/flashlight-off.svg?raw";
+import iconSwitchCamera from "lucide-static/icons/switch-camera.svg?raw";
+import iconCameraOff from "lucide-static/icons/camera-off.svg?raw";
 
 export const Icon = {
   camera: iconCamera,
@@ -70,6 +77,13 @@ export const Icon = {
   archive: iconArchive,
   imageOff: iconImageOff,
   clock: iconClock,
+  scan: iconScan,
+  layers: iconLayers,
+  target: iconTarget,
+  flashlight: iconFlashlight,
+  flashlightOff: iconFlashlightOff,
+  switchCamera: iconSwitchCamera,
+  cameraOff: iconCameraOff,
 } as const;
 
 export type IconName = keyof typeof Icon;

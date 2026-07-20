@@ -18,7 +18,9 @@ export interface SessionItem {
   raw_color: string;
   quantity: number;
   match_status: ItemMatchStatus;
+  match_confidence: number | null;
   source: ItemSource;
+  recognition_id: string | null;
   syncState: SyncState;
   errorMessage: string | null;
 }
@@ -55,13 +57,15 @@ function applyPendingQueueOnTop(conferenceId: string, items: SessionItem[]): Ses
         uiId: op.tempId,
         serverId: null,
         product_variant_id: op.payload.product_variant_id,
-        sku_code: null,
-        produto: null,
+        sku_code: op.payload.sku_code ?? null,
+        produto: op.payload.produto ?? null,
         raw_model: op.payload.raw_model,
         raw_color: op.payload.raw_color,
         quantity: op.payload.quantity,
         match_status: op.payload.match_status,
+        match_confidence: op.payload.match_confidence ?? null,
         source: op.payload.source,
+        recognition_id: op.payload.recognition_id ?? null,
         syncState: op.lastError ? "error" : "pending_offline",
         errorMessage: op.lastError,
       });
@@ -85,13 +89,18 @@ export async function startOrResumeConference(): Promise<Session> {
     uiId: it.id,
     serverId: it.id,
     product_variant_id: it.product_variant_id,
-    sku_code: null,
-    produto: null,
+    // it.sku_code / it.produto vêm do join com product_variants/products feito
+    // em getConference() — preservar aqui é o que garante que a associação
+    // sobrevive a um reload da página.
+    sku_code: it.sku_code,
+    produto: it.produto,
     raw_model: it.raw_model || "",
     raw_color: it.raw_color || "",
     quantity: it.quantity,
     match_status: it.match_status,
+    match_confidence: it.match_confidence,
     source: it.source,
+    recognition_id: it.recognition_id,
     syncState: "saved",
     errorMessage: null,
   }));
@@ -109,17 +118,26 @@ export async function addItem(input: {
   quantity: number;
   match_status: ItemMatchStatus;
   source: ItemSource;
+  /** Dicas de exibição vindas do matcher/picker — não são colunas da tabela. */
+  sku_code?: string | null;
+  produto?: string | null;
+  /** Colunas reais — usadas pelo Modo Scan (câmera); nulas para os outros sources. */
+  match_confidence?: number | null;
+  recognition_id?: string | null;
 }): Promise<void> {
   if (!session) throw new Error("Nenhuma conferência ativa.");
   const conferenceId = session.conference.id;
   const tempId = localId();
+  const { sku_code = null, produto = null, match_confidence = null, recognition_id = null, ...serverInput } = input;
 
   const uiItem: SessionItem = {
     uiId: tempId,
     serverId: null,
-    ...input,
-    sku_code: null,
-    produto: null,
+    ...serverInput,
+    sku_code,
+    produto,
+    match_confidence,
+    recognition_id,
     syncState: "saving",
     errorMessage: null,
   };
@@ -130,7 +148,7 @@ export async function addItem(input: {
     tempId,
     op: "create",
     targetId: null,
-    payload: input,
+    payload: { ...serverInput, sku_code, produto, match_confidence, recognition_id },
     clientTimestamp: Date.now(),
   });
 
@@ -153,7 +171,11 @@ async function trySaveOp(conferenceId: string, tempId: string): Promise<void> {
 
   try {
     if (op.op === "create" && op.payload) {
-      const saved = await api.addItem({ conference_id: conferenceId, ...op.payload });
+      // sku_code/produto são só dicas de exibição — não existem como colunas
+      // em conference_items (o valor real vem sempre do join com product_variant_id).
+      // match_confidence/recognition_id JÁ são colunas reais — seguem no payload.
+      const { sku_code: _skuHint, produto: _produtoHint, ...dbPayload } = op.payload;
+      const saved = await api.addItem({ conference_id: conferenceId, ...dbPayload });
       offline.removeFromQueue(conferenceId, tempId);
       if (session) {
         session = {
@@ -215,6 +237,68 @@ export async function updateItemQuantity(uiId: string, quantity: number): Promis
 
   try {
     await api.updateItem(item.serverId, { quantity });
+    if (session) {
+      session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "saved", errorMessage: null } : it)) };
+      emit();
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (session) {
+      session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "error", errorMessage: message } : it)) };
+      emit();
+    }
+  }
+}
+
+/**
+ * Corrige a associação de produto/SKU de um item já existente na conferência
+ * (usado por "Alterar produto" e por "Reprocessar SKUs vazios"). Sempre grava
+ * product_variant_id + match_status no servidor; sku_code/produto são só a
+ * dica de exibição imediata (o valor persistido de verdade vem do join).
+ */
+export async function updateItemMatch(
+  uiId: string,
+  patch: { product_variant_id: string | null; sku_code: string | null; produto: string | null; match_status: ItemMatchStatus }
+): Promise<void> {
+  if (!session) return;
+  const item = session.items.find((it) => it.uiId === uiId);
+  if (!item) return;
+  const conferenceId = session.conference.id;
+
+  session = {
+    ...session,
+    items: session.items.map((it) => (it.uiId === uiId ? { ...it, ...patch, syncState: "saving" } : it)),
+  };
+  emit();
+
+  if (!item.serverId) {
+    const queue = offline.loadQueue(conferenceId);
+    const op = queue.find((o) => o.tempId === uiId);
+    if (op && op.payload) {
+      offline.removeFromQueue(conferenceId, uiId);
+      offline.enqueue(conferenceId, {
+        ...op,
+        payload: {
+          ...op.payload,
+          product_variant_id: patch.product_variant_id,
+          match_status: patch.match_status,
+          sku_code: patch.sku_code,
+          produto: patch.produto,
+        },
+      });
+    }
+    if (session) {
+      session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "pending_offline" } : it)) };
+      emit();
+    }
+    return;
+  }
+
+  try {
+    await api.updateItem(item.serverId, {
+      product_variant_id: patch.product_variant_id,
+      match_status: patch.match_status,
+    });
     if (session) {
       session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "saved", errorMessage: null } : it)) };
       emit();

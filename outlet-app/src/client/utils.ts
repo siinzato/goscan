@@ -1,12 +1,17 @@
 export function normalize(s: string | null | undefined): string {
   return (s || "")
     .toString()
+    // "1.180" -> "1180" antes da limpeza geral, senão o "." vira espaço e a
+    // separação de milhar sobra como "1 180" (não bate com "1180ml" digitado sem separador).
+    .replace(/(\d)[.,](\d{3})(?!\d)/g, "$1$2")
     .normalize("NFD")
     .replace(/[̀-ͯ]/g, "")
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
-    .trim();
+    .trim()
+    // "880 ml" e "880ml" devem comparar iguais — mesmo ajuste para outras unidades comuns.
+    .replace(/(\d+)\s+(ml|l|kg|g|cm|mm)\b/g, "$1$2");
 }
 
 export function escapeHtml(str: unknown): string {

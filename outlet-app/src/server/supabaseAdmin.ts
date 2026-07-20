@@ -33,13 +33,11 @@ export interface CallerProfile {
 export type AuthCheckResult = { ok: true; profile: CallerProfile } | { ok: false; status: number; error: string };
 
 /**
- * Valida o Bearer token do chamador contra o Supabase Auth e exige que o
- * perfil correspondente seja manager/admin e esteja ativo. Toda rota
- * privilegiada do Catálogo Visual passa por aqui antes de tocar em Storage
- * ou nas tabelas — o service_role nunca age "às cegas" a partir de uma
- * requisição não verificada.
+ * Valida o Bearer token do chamador contra o Supabase Auth e carrega o
+ * perfil correspondente (sem checar role ainda) — base comum de
+ * requireManagerOrAdmin e requireActiveUser.
  */
-export async function requireManagerOrAdmin(request: Request, env: AdminEnv): Promise<AuthCheckResult> {
+async function requireAuthenticatedProfile(request: Request, env: AdminEnv): Promise<AuthCheckResult> {
   const authHeader = request.headers.get("authorization") || "";
   const token = authHeader.replace(/^Bearer\s+/i, "").trim();
   if (!token) return { ok: false, status: 401, error: "Token de autenticação ausente." };
@@ -58,9 +56,30 @@ export async function requireManagerOrAdmin(request: Request, env: AdminEnv): Pr
 
   if (profileError || !profile) return { ok: false, status: 403, error: "Perfil não encontrado." };
   if (!profile.active) return { ok: false, status: 403, error: "Usuário inativo." };
-  if (profile.role !== "admin" && profile.role !== "manager") {
-    return { ok: false, status: 403, error: "Ação restrita a manager ou admin." };
-  }
 
   return { ok: true, profile: profile as CallerProfile };
+}
+
+/**
+ * Exige manager/admin ativo. Toda rota privilegiada do Catálogo Visual e do
+ * Modo Scan (preparo/administração) passa por aqui antes de tocar em
+ * Storage ou nas tabelas — o service_role nunca age "às cegas" a partir de
+ * uma requisição não verificada.
+ */
+export async function requireManagerOrAdmin(request: Request, env: AdminEnv): Promise<AuthCheckResult> {
+  const result = await requireAuthenticatedProfile(request, env);
+  if (!result.ok) return result;
+  if (result.profile.role !== "admin" && result.profile.role !== "manager") {
+    return { ok: false, status: 403, error: "Ação restrita a manager ou admin." };
+  }
+  return result;
+}
+
+/**
+ * Exige qualquer usuário ativo (operator/manager/admin) — usado pelo Modo
+ * Scan em tempo de conferência, já que quem aponta a câmera é normalmente o
+ * operador, não um manager/admin.
+ */
+export async function requireActiveUser(request: Request, env: AdminEnv): Promise<AuthCheckResult> {
+  return requireAuthenticatedProfile(request, env);
 }
