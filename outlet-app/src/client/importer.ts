@@ -64,7 +64,7 @@ interface NormalizedRow {
   model_code: string;
 }
 
-function deriveModelCode(skuCode: string, explicitModelo?: string): string {
+export function deriveModelCode(skuCode: string, explicitModelo?: string): string {
   if (explicitModelo && explicitModelo.trim()) return explicitModelo.trim().toUpperCase();
   let code = skuCode.trim();
   if (code.toUpperCase().startsWith("OUT-")) code = code.slice(4);
@@ -107,6 +107,84 @@ function chunk<T>(items: T[], size: number): T[][] {
   return out;
 }
 
+export interface UpsertVariantRow {
+  sku_code: string;
+  base: string;
+  cor: string;
+  gtin: string;
+  model_code: string;
+}
+
+export interface UpsertVariantsResult {
+  variantIdBySku: Map<string, string>;
+  insertedSkus: Set<string>;
+  updatedSkus: Set<string>;
+}
+
+/**
+ * Upsert compartilhado de products (por model_code) + product_variants (por
+ * sku_code). Usado pelo importador de catálogo (SKU/cor/GTIN) e também pelo
+ * importador do Catálogo Visual (SKU Outlet/nome/GTIN + imagens) — evita
+ * duplicar a lógica de upsert em dois lugares.
+ */
+export async function upsertProductsAndVariants(rows: UpsertVariantRow[]): Promise<UpsertVariantsResult> {
+  const supabase = getSupabase();
+
+  const productsByCode = new Map<string, { name: string; normalized_name: string; model_code: string }>();
+  for (const row of rows) {
+    if (!productsByCode.has(row.model_code)) {
+      productsByCode.set(row.model_code, { name: row.base, normalized_name: normalize(row.base), model_code: row.model_code });
+    }
+  }
+
+  const productIdByCode = new Map<string, string>();
+  for (const batch of chunk(Array.from(productsByCode.values()), 500)) {
+    const { data, error } = await supabase.from("products").upsert(batch, { onConflict: "model_code" }).select("id, model_code");
+    if (error) throw error;
+    for (const row of data as { id: string; model_code: string }[]) {
+      productIdByCode.set(row.model_code, row.id);
+    }
+  }
+
+  const allSkus = rows.map((r) => r.sku_code);
+  const existingSkus = new Set<string>();
+  for (const batch of chunk(allSkus, 500)) {
+    const { data, error } = await supabase.from("product_variants").select("sku_code").in("sku_code", batch);
+    if (error) throw error;
+    for (const row of data as { sku_code: string }[]) existingSkus.add(row.sku_code);
+  }
+
+  const variantRows = rows
+    .map((row) => {
+      const productId = productIdByCode.get(row.model_code);
+      if (!productId) return null;
+      return {
+        product_id: productId,
+        sku_code: row.sku_code,
+        gtin: row.gtin || null,
+        color: row.cor || null,
+        normalized_color: normalize(row.cor),
+        active: true,
+      };
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null);
+
+  const variantIdBySku = new Map<string, string>();
+  for (const batch of chunk(variantRows, 500)) {
+    const { data, error } = await supabase.from("product_variants").upsert(batch, { onConflict: "sku_code" }).select("id, sku_code");
+    if (error) throw error;
+    for (const row of data as { id: string; sku_code: string }[]) {
+      variantIdBySku.set(row.sku_code, row.id);
+    }
+  }
+
+  return {
+    variantIdBySku,
+    insertedSkus: new Set(variantRows.filter((r) => !existingSkus.has(r.sku_code)).map((r) => r.sku_code)),
+    updatedSkus: new Set(variantRows.filter((r) => existingSkus.has(r.sku_code)).map((r) => r.sku_code)),
+  };
+}
+
 export async function importCatalog(fileName: string, rawRows: Record<string, unknown>[]): Promise<ImportSummary> {
   const { profile } = getAuthState();
   if (!isManagerOrAdmin(profile)) {
@@ -130,62 +208,9 @@ export async function importCatalog(fileName: string, rawRows: Record<string, un
   if (importInsertError) throw importInsertError;
 
   try {
-    // 1) upsert de products, um por model_code único.
-    const productsByCode = new Map<string, { name: string; normalized_name: string; model_code: string }>();
-    for (const row of valid) {
-      if (!productsByCode.has(row.model_code)) {
-        productsByCode.set(row.model_code, {
-          name: row.base,
-          normalized_name: normalize(row.base),
-          model_code: row.model_code,
-        });
-      }
-    }
-
-    const productIdByCode = new Map<string, string>();
-    for (const batch of chunk(Array.from(productsByCode.values()), 500)) {
-      const { data, error } = await supabase
-        .from("products")
-        .upsert(batch, { onConflict: "model_code" })
-        .select("id, model_code");
-      if (error) throw error;
-      for (const row of data as { id: string; model_code: string }[]) {
-        productIdByCode.set(row.model_code, row.id);
-      }
-    }
-
-    // 2) descobre quais sku_code já existiam, para separar inserted/updated.
-    const allSkus = valid.map((r) => r.sku_code);
-    const existingSkus = new Set<string>();
-    for (const batch of chunk(allSkus, 500)) {
-      const { data, error } = await supabase.from("product_variants").select("sku_code").in("sku_code", batch);
-      if (error) throw error;
-      for (const row of data as { sku_code: string }[]) existingSkus.add(row.sku_code);
-    }
-
-    // 3) upsert de product_variants.
-    const variantRows = valid
-      .map((row) => {
-        const productId = productIdByCode.get(row.model_code);
-        if (!productId) return null;
-        return {
-          product_id: productId,
-          sku_code: row.sku_code,
-          gtin: row.gtin || null,
-          color: row.cor || null,
-          normalized_color: normalize(row.cor),
-          active: true,
-        };
-      })
-      .filter((r): r is NonNullable<typeof r> => r !== null);
-
-    for (const batch of chunk(variantRows, 500)) {
-      const { error } = await supabase.from("product_variants").upsert(batch, { onConflict: "sku_code" });
-      if (error) throw error;
-    }
-
-    const inserted_rows = variantRows.filter((r) => !existingSkus.has(r.sku_code)).length;
-    const updated_rows = variantRows.filter((r) => existingSkus.has(r.sku_code)).length;
+    const { insertedSkus, updatedSkus } = await upsertProductsAndVariants(valid);
+    const inserted_rows = insertedSkus.size;
+    const updated_rows = updatedSkus.size;
     const rejected_rows = errors.length;
 
     await supabase

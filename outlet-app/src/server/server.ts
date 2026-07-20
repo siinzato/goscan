@@ -1,10 +1,13 @@
-// Backend mínimo: só existe para manter o endpoint de Claude Vision no servidor
-// (a ANTHROPIC_API_KEY nunca pode chegar ao navegador). Catálogo, aliases,
-// conferências e autenticação agora são Supabase — o frontend fala com o
-// Supabase diretamente (via RLS), sem passar por este servidor.
+// Backend mínimo: mantém no servidor o que não pode ir ao navegador —
+// Claude Vision (ANTHROPIC_API_KEY) e, a partir do Catálogo Visual, o
+// download SSRF-safe de imagens externas + escrita privilegiada no Storage
+// (SUPABASE_SERVICE_ROLE_KEY). Catálogo, aliases, conferências e
+// autenticação continuam Supabase direto do frontend (via RLS).
 import { MODEL_ALIASES } from "./aliases-seed.ts";
+import { getSupabaseAdmin, requireManagerOrAdmin, type AdminEnv } from "./supabaseAdmin.ts";
+import { processImportBatch, resetErrorItems } from "./catalogImages.ts";
 
-interface Env {
+interface Env extends AdminEnv {
   ANTHROPIC_API_KEY?: string;
 }
 
@@ -87,13 +90,36 @@ export default {
 
     try {
       if (path === "/api/status" && request.method === "GET") {
-        return json({ has_anthropic_key: !!env.ANTHROPIC_API_KEY });
+        return json({
+          has_anthropic_key: !!env.ANTHROPIC_API_KEY,
+          has_catalog_images_backend: !!(env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY),
+        });
       }
 
       if (path === "/api/parse-images" && request.method === "POST") {
         const body = (await request.json()) as { images?: { data: string; media_type: string }[] };
         const result = await callClaudeVision(env, body.images || []);
         return json(result);
+      }
+
+      if (path === "/api/catalog-images/process-batch" && request.method === "POST") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+        const body = (await request.json()) as { import_id?: string; limit?: number };
+        if (!body.import_id) return json({ error: "import_id é obrigatório." }, 400);
+        const admin = getSupabaseAdmin(env);
+        const result = await processImportBatch(admin, body.import_id, Math.min(Math.max(body.limit || 5, 1), 20));
+        return json(result);
+      }
+
+      if (path === "/api/catalog-images/reset-errors" && request.method === "POST") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+        const body = (await request.json()) as { import_id?: string };
+        if (!body.import_id) return json({ error: "import_id é obrigatório." }, 400);
+        const admin = getSupabaseAdmin(env);
+        const reset = await resetErrorItems(admin, body.import_id);
+        return json({ reset });
       }
 
       return json({ error: "not found" }, 404);

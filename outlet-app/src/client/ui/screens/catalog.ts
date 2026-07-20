@@ -4,6 +4,7 @@ import { getAuthState, isManagerOrAdmin } from "../../auth.ts";
 import { escapeHtml, debounce } from "../../utils.ts";
 import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
+import { renderCatalogVisualSection } from "./catalogVisual.ts";
 
 declare const XLSX: {
   read(data: ArrayBuffer): { SheetNames: string[]; Sheets: Record<string, unknown> };
@@ -13,6 +14,7 @@ declare const XLSX: {
 const PAGE_SIZE = 30;
 let page = 0;
 let query = "";
+let catalogTab: "skus" | "visual" = "skus";
 
 export async function renderCatalog(root: HTMLElement): Promise<void> {
   page = 0;
@@ -22,6 +24,27 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
 
   root.innerHTML = `
     <section class="catalog-screen">
+      <div class="input-mode-switch">
+        <button class="mode-btn ${catalogTab === "skus" ? "active" : ""}" data-catalog-tab="skus">${Icon.package}SKUs</button>
+        <button class="mode-btn ${catalogTab === "visual" ? "active" : ""}" data-catalog-tab="visual">${Icon.imagePlus}Catálogo Visual</button>
+      </div>
+      <div id="catalogTabContent"></div>
+    </section>`;
+
+  root.querySelectorAll<HTMLButtonElement>("[data-catalog-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      catalogTab = btn.dataset.catalogTab as "skus" | "visual";
+      void renderCatalog(root);
+    });
+  });
+
+  const content = root.querySelector<HTMLElement>("#catalogTabContent")!;
+  if (catalogTab === "visual") {
+    void renderCatalogVisualSection(content);
+    return;
+  }
+
+  content.innerHTML = `
       ${
         canImport
           ? `<div class="card">
@@ -49,8 +72,7 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
           <span id="pageInfo" class="hint-text"></span>
           <button class="icon-btn" id="btnNextPage" disabled aria-label="Próxima página">${Icon.chevronRight}</button>
         </div>
-      </div>
-    </section>`;
+      </div>`;
 
   await loadPage(root);
 

@@ -25,6 +25,15 @@ import iconSearchX from "lucide-static/icons/search-x.svg?raw";
 import iconFileSpreadsheet from "lucide-static/icons/file-spreadsheet.svg?raw";
 import iconImagePlus from "lucide-static/icons/image-plus.svg?raw";
 import iconLogOut from "lucide-static/icons/log-out.svg?raw";
+import iconStar from "lucide-static/icons/star.svg?raw";
+import iconEye from "lucide-static/icons/eye.svg?raw";
+import iconEyeOff from "lucide-static/icons/eye-off.svg?raw";
+import iconRefreshCw from "lucide-static/icons/refresh-cw.svg?raw";
+import iconPlay from "lucide-static/icons/play.svg?raw";
+import iconFileUp from "lucide-static/icons/file-up.svg?raw";
+import iconArchive from "lucide-static/icons/archive.svg?raw";
+import iconImageOff from "lucide-static/icons/image-off.svg?raw";
+import iconClock from "lucide-static/icons/clock.svg?raw";
 
 export const Icon = {
   camera: iconCamera,
@@ -52,6 +61,15 @@ export const Icon = {
   fileSpreadsheet: iconFileSpreadsheet,
   imagePlus: iconImagePlus,
   logOut: iconLogOut,
+  star: iconStar,
+  eye: iconEye,
+  eyeOff: iconEyeOff,
+  refresh: iconRefreshCw,
+  play: iconPlay,
+  fileUp: iconFileUp,
+  archive: iconArchive,
+  imageOff: iconImageOff,
+  clock: iconClock,
 } as const;
 
 export type IconName = keyof typeof Icon;

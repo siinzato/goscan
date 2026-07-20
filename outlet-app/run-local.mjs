@@ -19,7 +19,11 @@ if (existsSync(path.join(__dirname, ".env"))) {
 const PORT = process.env.PORT ? Number(process.env.PORT) : process.env.API_PORT ? Number(process.env.API_PORT) : 8788;
 const DIST_DIR = path.join(__dirname, "dist");
 
-const env = { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY };
+const env = {
+  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+  SUPABASE_URL: process.env.SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
+};
 
 const worker = (await import("./src/server/server.ts")).default;
 
@@ -67,5 +71,8 @@ server.listen(PORT, () => {
   console.log(`API/servidor rodando em http://localhost:${PORT}${existsSync(DIST_DIR) ? " (servindo dist/ também)" : ""}`);
   if (!env.ANTHROPIC_API_KEY) {
     console.log("Aviso: ANTHROPIC_API_KEY não definida — a leitura de prints por IA ficará desabilitada. Use a aba 'Colar texto' ou defina a variável de ambiente ANTHROPIC_API_KEY.");
+  }
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    console.log("Aviso: SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY não definidas — o processamento de imagens do Catálogo Visual ficará desabilitado (a importação ainda funciona, só sem baixar as imagens).");
   }
 });
