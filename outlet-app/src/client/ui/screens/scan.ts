@@ -63,8 +63,30 @@ let cooldownStartedAt = 0;
 
 let rootEl: HTMLElement | null = null;
 
+// Tocado só na transição pra "encontrou o produto" — nunca a cada ciclo de
+// análise (isso soaria a cada ~1s enquanto a câmera está só procurando).
+// Criado sob demanda (não no carregamento do módulo) pra não baixar o áudio
+// de quem nunca abre a tela de Escanear.
+let foundSound: HTMLAudioElement | null = null;
+function getFoundSound(): HTMLAudioElement {
+  if (!foundSound) {
+    foundSound = new Audio("/sounds/scan-found.mp3");
+    foundSound.preload = "auto";
+  }
+  return foundSound;
+}
+const FOUND_SOUND_STATES: ScanState[] = ["product_found", "multiple_capacities"];
+
 function setState(next: ScanState): void {
+  const isNewFind = FOUND_SOUND_STATES.includes(next) && !FOUND_SOUND_STATES.includes(scanState);
   scanState = next;
+  if (isNewFind) {
+    const sound = getFoundSound();
+    sound.currentTime = 0;
+    void sound.play().catch(() => {
+      /* navegador pode bloquear autoplay sem gesto do usuário — silencioso, não trava o fluxo */
+    });
+  }
   renderOverlay();
 }
 

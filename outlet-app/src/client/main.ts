@@ -3,8 +3,6 @@ import { initAuth, subscribeAuth } from "./auth.ts";
 import { mountShell } from "./ui/shell.ts";
 import { renderLogin } from "./ui/screens/login.ts";
 import { renderConfigError } from "./ui/configError.ts";
-import { subscribeNetwork } from "./offline.ts";
-import { renderNetworkBanner } from "./ui/networkBanner.ts";
 
 const root = document.getElementById("app-root")!;
 
@@ -42,11 +40,6 @@ async function boot() {
       mountShell(root);
     }
   });
-
-  const networkBanner = document.getElementById("network-banner");
-  if (networkBanner) {
-    subscribeNetwork((status) => renderNetworkBanner(networkBanner, status));
-  }
 }
 
 void boot();
