@@ -4,7 +4,7 @@ import { APP_NAME } from "../brand.ts";
 import { Icon } from "./icons.ts";
 import { renderHome } from "./screens/home.ts";
 import { renderConference } from "./screens/conference.ts";
-import { renderScan, teardownScan } from "./screens/scan.ts";
+import { renderScan, teardownScan, unlockScanSound } from "./screens/scan.ts";
 import { renderCatalog } from "./screens/catalog.ts";
 import { renderHistory } from "./screens/history.ts";
 import { renderProfile } from "./screens/profile.ts";
@@ -52,6 +52,11 @@ export function mountShell(root: HTMLElement): void {
 
     root.querySelectorAll<HTMLButtonElement>(".bottom-nav-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
+        // Precisa acontecer dentro deste clique (gesto real do usuário) — é a
+        // única chance de "destravar" o áudio do beep de reconhecimento antes
+        // do primeiro achado, já que o navegador bloqueia play() assíncrono
+        // sem gesto (ver unlockScanSound).
+        if (btn.dataset.route === "escanear") unlockScanSound();
         window.location.hash = `/${btn.dataset.route}`;
       });
     });

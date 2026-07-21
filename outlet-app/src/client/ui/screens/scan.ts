@@ -77,6 +77,28 @@ function getFoundSound(): HTMLAudioElement {
 }
 const FOUND_SOUND_STATES: ScanState[] = ["product_found", "multiple_capacities"];
 
+/**
+ * Safari (e a maioria dos navegadores mobile) só libera play() programático
+ * de áudio quando ele acontece dentro do mesmo gesto do usuário (clique/toque)
+ * — o beep de "produto encontrado" dispara depois, de forma assíncrona (após
+ * o reconhecimento), fora dessa janela, e o navegador bloqueia silenciosamente
+ * (sem erro visível, só não toca). Chamar isto dentro do próprio clique que
+ * abre a tela de Escanear "destrava" o elemento de áudio pro resto da sessão
+ * da página — os play() posteriores (assíncronos) passam a funcionar.
+ */
+export function unlockScanSound(): void {
+  const sound = getFoundSound();
+  sound
+    .play()
+    .then(() => {
+      sound.pause();
+      sound.currentTime = 0;
+    })
+    .catch(() => {
+      /* se nem isso for permitido, o beep simplesmente não toca — não é crítico */
+    });
+}
+
 function setState(next: ScanState): void {
   const isNewFind = FOUND_SOUND_STATES.includes(next) && !FOUND_SOUND_STATES.includes(scanState);
   scanState = next;
@@ -92,6 +114,10 @@ function setState(next: ScanState): void {
 
 export async function renderScan(root: HTMLElement): Promise<void> {
   rootEl = root;
+  // Reforço: se por algum motivo o clique no menu inferior não bastou pra
+  // destravar o áudio (ex.: navegação direta por hash), o primeiro toque
+  // em qualquer lugar desta tela tenta de novo.
+  root.addEventListener("click", unlockScanSound, { once: true });
   unsubscribeSession?.();
   scanState = "requesting_permission";
   currentResult = null;
