@@ -21,6 +21,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import sharp from "sharp";
 import { generateImageEmbedding, cosineSimilarity, MODEL_NAME, MODEL_VERSION, EMBEDDING_DIMENSION } from "./embeddingPipeline.ts";
 import { processAndNormalizeImage } from "./imagePipeline.ts";
+import { recalculateRecognitionQuality } from "./recognitionQuality.ts";
 
 const BUCKET = "scan-learning-samples";
 const DEDUP_MAX_DISTANCE = 0.03; // distância cosseno tão baixa que é praticamente a mesma foto
@@ -193,11 +194,13 @@ export async function recordLearningSample(admin: SupabaseClient, params: Record
     const { data: retryData, error: retryError } = await admin.from("visual_learning_samples").insert(baseRow).select("id").single();
     if (retryError) throw retryError;
     await enforceSampleLimit(admin, params.variantId);
+    void recalculateRecognitionQuality(admin, params.variantId);
     return { saved: true, reinforcedExisting: false, sampleId: retryData.id };
   }
   if (insertError) throw insertError;
 
   await enforceSampleLimit(admin, params.variantId);
+  void recalculateRecognitionQuality(admin, params.variantId);
   return { saved: true, reinforcedExisting: false, sampleId: inserted.id };
 }
 
@@ -269,8 +272,9 @@ export async function updateLearningSampleStatus(
   sampleId: string,
   status: "validated" | "rejected" | "disabled"
 ): Promise<void> {
-  const { error } = await admin.from("visual_learning_samples").update({ validation_status: status }).eq("id", sampleId);
+  const { data, error } = await admin.from("visual_learning_samples").update({ validation_status: status }).eq("id", sampleId).select("variant_id").maybeSingle();
   if (error) throw error;
+  if (data?.variant_id) void recalculateRecognitionQuality(admin, data.variant_id);
 }
 
 export interface LibrarySummary {

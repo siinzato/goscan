@@ -5,7 +5,7 @@ import {
   type ConferenceWithOperator,
   type ConferenceItemWithVariant,
 } from "../../conferencesApi.ts";
-import { escapeHtml, formatDateTime } from "../../utils.ts";
+import { escapeHtml, formatDateTime, renderErrorWithRetry } from "../../utils.ts";
 import { Icon } from "../icons.ts";
 
 function statusLabel(status: Conference["status"]): string {
@@ -35,7 +35,7 @@ export async function renderHistory(root: HTMLElement): Promise<void> {
   try {
     conferences = await listRecentConferences(50);
   } catch (err) {
-    root.innerHTML = `<div class="error-box">Erro ao carregar histórico: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(root, "Erro ao carregar histórico: " + (err instanceof Error ? err.message : String(err)), () => void renderHistory(root));
     return;
   }
 

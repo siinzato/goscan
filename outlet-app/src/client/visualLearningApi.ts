@@ -114,3 +114,62 @@ export interface ReportUnclassifiedProductResult {
 export function reportUnclassifiedProduct(params: { image_base64: string; observation: string | null }): Promise<ReportUnclassifiedProductResult> {
   return authedPost<ReportUnclassifiedProductResult>("/api/visual-learning/report-unclassified", params);
 }
+
+// ---------------------------------------------------------------------------
+// Qualidade de Reconhecimento
+// ---------------------------------------------------------------------------
+export interface RecognitionQuality {
+  variant_id: string;
+  product_id: string;
+  score_percent: number;
+  band: "excelente" | "bom" | "regular" | "fraco" | "critico";
+  estimated_only: boolean;
+  reference_count: number;
+  official_count: number;
+  learned_count: number;
+  distinct_source_types: number;
+  quality_technical_percent: number;
+  angle_coverage_percent: number;
+  angles_present: string[];
+  embedding_consistency_percent: number | null;
+  historical_accuracy_percent: number | null;
+  historical_sample_count: number;
+  avg_recognition_ms: number | null;
+  top_confusion_variant_id: string | null;
+  top_confusion_sku: string | null;
+  top_confusion_count: number | null;
+  recommendations: string[];
+  computed_at: string;
+}
+
+export async function getRecognitionQualityBatch(variantIds: string[]): Promise<Map<string, RecognitionQuality>> {
+  if (variantIds.length === 0) return new Map();
+  const { rows } = await authedGet<{ rows: RecognitionQuality[] }>(`/api/visual-learning/recognition-quality-batch?variant_ids=${variantIds.map(encodeURIComponent).join(",")}`);
+  return new Map(rows.map((r) => [r.variant_id, r]));
+}
+
+export interface RecognitionQualityListRow extends RecognitionQuality {
+  sku_code: string;
+  product_name: string;
+}
+
+export function listRecognitionQuality(opts: {
+  band?: string;
+  onlyNoReferences?: boolean;
+  page?: number;
+  pageSize?: number;
+  sort?: "score_asc" | "score_desc";
+} = {}): Promise<{ rows: RecognitionQualityListRow[]; total: number }> {
+  const params = new URLSearchParams();
+  if (opts.band) params.set("band", opts.band);
+  if (opts.onlyNoReferences) params.set("only_no_references", "1");
+  params.set("page", String(opts.page ?? 0));
+  params.set("page_size", String(opts.pageSize ?? 20));
+  params.set("sort", opts.sort ?? "score_asc");
+  return authedGet<{ rows: RecognitionQualityListRow[]; total: number }>(`/api/visual-learning/recognition-quality-list?${params.toString()}`);
+}
+
+/** Recalcula sob demanda depois de uma mudança feita direto pelo cliente (upload/arquivar/qualidade/reconhecimento) — o backend já recalcula sozinho após correções/confirmações do Modo Scan. */
+export function recalcRecognitionQuality(variantId: string): Promise<{ ok: true }> {
+  return authedPost<{ ok: true }>("/api/visual-learning/recalc-quality", { variant_id: variantId });
+}

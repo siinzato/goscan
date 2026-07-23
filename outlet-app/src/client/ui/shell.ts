@@ -3,12 +3,7 @@ import { escapeHtml } from "../utils.ts";
 import { APP_NAME } from "../brand.ts";
 import { Icon } from "./icons.ts";
 import { renderHome } from "./screens/home.ts";
-import { renderConference } from "./screens/conference.ts";
 import { renderScan, teardownScan, unlockScanSound } from "./screens/scan.ts";
-import { renderCatalog } from "./screens/catalog.ts";
-import { teardownTraining } from "./screens/catalogVisual.ts";
-import { renderHistory } from "./screens/history.ts";
-import { renderProfile } from "./screens/profile.ts";
 
 type Route = "inicio" | "conferir" | "escanear" | "catalogo" | "historico" | "perfil";
 
@@ -25,6 +20,41 @@ function currentRoute(): Route {
   const hash = window.location.hash.replace(/^#\/?/, "") as Route;
   return (TABS.some((t) => t.route === hash) ? hash : "inicio") as Route;
 }
+
+// Lazy loading por rota (nunca baixa código que a rota atual não precisa):
+// "Início" e "Escanear" ficam FORA de propósito. "Início" é sempre a
+// primeira tela mostrada — adiar o download dela não ganha nada. "Escanear"
+// precisa estar pronto no MESMO gesto de clique que destrava o áudio do
+// beep de reconhecimento no Safari/iOS (ver unlockScanSound) — um import()
+// dinâmico bem ali arrisca perder a "janela de gesto do usuário" em
+// aparelhos mais lentos, quebrando esse fix real de produção. As outras 4
+// rotas (Conferir/Catálogo/Histórico/Perfil) só baixam o código quando
+// abertas pela primeira vez.
+let catalogModule: typeof import("./screens/catalog.ts") | null = null;
+let catalogVisualModule: typeof import("./screens/catalogVisual.ts") | null = null;
+let conferenceModule: typeof import("./screens/conference.ts") | null = null;
+let historyModule: typeof import("./screens/history.ts") | null = null;
+let profileModule: typeof import("./screens/profile.ts") | null = null;
+
+async function ensureCatalogModule(): Promise<typeof import("./screens/catalog.ts")> {
+  if (!catalogVisualModule) catalogVisualModule = await import("./screens/catalogVisual.ts");
+  if (!catalogModule) catalogModule = await import("./screens/catalog.ts");
+  return catalogModule;
+}
+async function ensureConferenceModule(): Promise<typeof import("./screens/conference.ts")> {
+  if (!conferenceModule) conferenceModule = await import("./screens/conference.ts");
+  return conferenceModule;
+}
+async function ensureHistoryModule(): Promise<typeof import("./screens/history.ts")> {
+  if (!historyModule) historyModule = await import("./screens/history.ts");
+  return historyModule;
+}
+async function ensureProfileModule(): Promise<typeof import("./screens/profile.ts")> {
+  if (!profileModule) profileModule = await import("./screens/profile.ts");
+  return profileModule;
+}
+
+const ROUTE_SKELETON = `<div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card" style="height:120px"></div>`;
 
 let shellMounted = false;
 
@@ -56,7 +86,8 @@ export function mountShell(root: HTMLElement): void {
         // Precisa acontecer dentro deste clique (gesto real do usuário) — é a
         // única chance de "destravar" o áudio do beep de reconhecimento antes
         // do primeiro achado, já que o navegador bloqueia play() assíncrono
-        // sem gesto (ver unlockScanSound).
+        // sem gesto (ver unlockScanSound). scan.ts nunca é lazy-loaded — ver
+        // comentário acima — exatamente para essa chamada poder ser síncrona.
         if (btn.dataset.route === "escanear") unlockScanSound();
         window.location.hash = `/${btn.dataset.route}`;
       });
@@ -69,16 +100,21 @@ export function mountShell(root: HTMLElement): void {
 }
 
 let previousRoute: Route | null = null;
+let renderSeq = 0;
 
 function renderCurrentScreen(): void {
   const content = document.getElementById("screen-content");
   if (!content) return;
   const route = currentRoute();
+  const mySeq = ++renderSeq;
 
   // Sair da tela de câmera precisa sempre encerrar as tracks — nunca deixar
   // a câmera aberta em segundo plano enquanto o usuário navega para outra aba.
   if (previousRoute === "escanear" && route !== "escanear") teardownScan();
-  if (previousRoute === "catalogo" && route !== "catalogo") teardownTraining();
+  // Só chama se o módulo já tiver sido carregado alguma vez (o usuário
+  // precisa ter visitado "catalogo" antes pra isso não ser null) — nunca
+  // dispara um import() dentro do teardown, que precisa ser síncrono.
+  if (previousRoute === "catalogo" && route !== "catalogo") catalogVisualModule?.teardownTraining();
   previousRoute = route;
 
   document.querySelectorAll<HTMLButtonElement>(".bottom-nav-btn").forEach((btn) => {
@@ -91,24 +127,36 @@ function renderCurrentScreen(): void {
       void renderHome(content);
       break;
     case "conferir":
-      void renderConference(content);
+      if (!conferenceModule) content.innerHTML = ROUTE_SKELETON;
+      void ensureConferenceModule().then((m) => {
+        if (mySeq === renderSeq) void m.renderConference(content);
+      });
       break;
     case "escanear":
       void renderScan(content);
       break;
     case "catalogo":
-      void renderCatalog(content);
+      if (!catalogModule) content.innerHTML = ROUTE_SKELETON;
+      void ensureCatalogModule().then((m) => {
+        if (mySeq === renderSeq) void m.renderCatalog(content);
+      });
       break;
     case "historico":
-      void renderHistory(content);
+      if (!historyModule) content.innerHTML = ROUTE_SKELETON;
+      void ensureHistoryModule().then((m) => {
+        if (mySeq === renderSeq) void m.renderHistory(content);
+      });
       break;
     case "perfil":
-      void renderProfile(content);
+      if (!profileModule) content.innerHTML = ROUTE_SKELETON;
+      void ensureProfileModule().then((m) => {
+        if (mySeq === renderSeq) void m.renderProfile(content);
+      });
       break;
   }
 }
 
 window.addEventListener("beforeunload", () => {
   if (previousRoute === "escanear") teardownScan();
-  if (previousRoute === "catalogo") teardownTraining();
+  if (previousRoute === "catalogo") catalogVisualModule?.teardownTraining();
 });

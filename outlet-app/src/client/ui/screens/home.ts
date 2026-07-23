@@ -1,6 +1,6 @@
 import { getAuthState } from "../../auth.ts";
 import { getMyActiveConference, listRecentConferences, type Conference } from "../../conferencesApi.ts";
-import { escapeHtml, formatDateTime, initials } from "../../utils.ts";
+import { escapeHtml, formatDateTime, initials, renderErrorWithRetry } from "../../utils.ts";
 import { getNetworkStatus, subscribeNetwork, type NetworkStatus } from "../../offline.ts";
 import { Icon } from "../icons.ts";
 
@@ -42,7 +42,7 @@ export async function renderHome(root: HTMLElement): Promise<void> {
   try {
     [active, recent] = await Promise.all([getMyActiveConference(), listRecentConferences(8)]);
   } catch (err) {
-    root.innerHTML = `<div class="error-box">Erro ao carregar: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(root, "Erro ao carregar: " + (err instanceof Error ? err.message : String(err)), () => void renderHome(root));
     return;
   }
 

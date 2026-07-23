@@ -58,3 +58,21 @@ export function initials(name: string | null | undefined): string {
 export function localId(): string {
   return `local-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
+
+let retryHandlerSeq = 0;
+
+/**
+ * Estado de erro padrão pra carregamento de página inteira: mensagem +
+ * "Tentar novamente" — nunca deixa o usuário preso numa mensagem estática
+ * sem nenhuma ação de recuperação. `onRetry` é registrado automaticamente
+ * (não precisa buscar o botão manualmente no elemento chamador).
+ */
+export function renderErrorWithRetry(container: Element, message: string, onRetry: () => void): void {
+  const id = `retry-btn-${++retryHandlerSeq}`;
+  container.innerHTML = `
+    <div class="error-box-retry">
+      <p class="error-box">${escapeHtml(message)}</p>
+      <button type="button" class="btn-secondary" id="${id}">Tentar novamente</button>
+    </div>`;
+  document.getElementById(id)?.addEventListener("click", onRetry);
+}

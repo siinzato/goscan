@@ -1,7 +1,7 @@
 import { searchCatalog, type CatalogRow } from "../../catalogApi.ts";
 import { importCatalog } from "../../importer.ts";
 import { getAuthState, isManagerOrAdmin } from "../../auth.ts";
-import { escapeHtml, debounce } from "../../utils.ts";
+import { escapeHtml, debounce, renderErrorWithRetry } from "../../utils.ts";
 import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
 import { renderCatalogVisualSection } from "./catalogVisual.ts";
@@ -143,7 +143,7 @@ async function loadPage(root: HTMLElement): Promise<void> {
     (root.querySelector("#btnPrevPage") as HTMLButtonElement).disabled = page === 0;
     (root.querySelector("#btnNextPage") as HTMLButtonElement).disabled = page + 1 >= totalPages;
   } catch (err) {
-    wrap.innerHTML = `<div class="error-box">Erro ao buscar catálogo: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(wrap, "Erro ao buscar catálogo: " + (err instanceof Error ? err.message : String(err)), () => void loadPage(root));
   }
 }
 

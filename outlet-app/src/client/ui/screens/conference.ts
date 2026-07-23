@@ -1,4 +1,4 @@
-import { escapeHtml, debounce } from "../../utils.ts";
+import { escapeHtml, debounce, renderErrorWithRetry } from "../../utils.ts";
 import { matchItems, matchItem, type MatchResult } from "../../matching.ts";
 import { parseImagesLocally } from "../../ocr.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
@@ -85,9 +85,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   try {
     session = await startOrResumeConference();
   } catch (err) {
-    root.innerHTML = `<div class="error-box">Erro ao iniciar conferência: ${escapeHtml(
-      err instanceof Error ? err.message : String(err)
-    )}</div>`;
+    renderErrorWithRetry(root, "Erro ao iniciar conferência: " + (err instanceof Error ? err.message : String(err)), () => void renderConference(root));
     return;
   }
 

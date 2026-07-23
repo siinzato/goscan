@@ -54,7 +54,23 @@ export interface RecognizeResult {
   used_pgvector: boolean;
   /** Só presente quando status="no_result" — diferencia "base vazia" de "achou mas sem confiança". */
   code?: RecognizeErrorCode;
+  /** Tempo por etapa (ms) — uso interno (log de performance em server.ts), nunca enviado ao cliente. */
+  timings?: RecognizeTimings;
 }
+
+export interface RecognizeTimings {
+  embeddingMs: number;
+  vectorSearchMs: number;
+  postProcessMs: number;
+  siblingExpandMs: number;
+  totalMs: number;
+}
+
+/** Liga o diagnóstico de proporção (structuralSignals) + o log verboso de candidatos —
+ * desligado por padrão (opt-in via SCAN_DEBUG=1) porque tem custo real (2 operações sharp
+ * extras por scan) e hoje serve só para calibração manual, nunca para decidir o resultado
+ * (ver isAspectRatioInconsistentWithCategory: sempre false abaixo). */
+const SCAN_DEBUG = process.env.SCAN_DEBUG === "1";
 
 /** Agrupa matches de imagens por produto, usando a MELHOR imagem (menor distância) por
  * produto — nunca soma/conta imagens, exatamente para que um produto com muitas fotos
@@ -345,8 +361,15 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
   const startedAt = Date.now();
   const recognitionId = crypto.randomUUID();
 
+  const embeddingStartedAt = Date.now();
   const queryVector = await generateImageEmbedding(imageBuffer);
+  const embeddingMs = Date.now() - embeddingStartedAt;
+
+  const vectorSearchStartedAt = Date.now();
   const { matches, usedPgvector } = await findSimilarImages(admin, queryVector, SCAN_CONFIG.rawMatchLimit);
+  const vectorSearchMs = Date.now() - vectorSearchStartedAt;
+
+  const postProcessStartedAt = Date.now();
 
   // Categoria detectada por votação entre os vizinhos BRUTOS (antes de
   // agrupar por produto) — ver comentário de detectCategory() sobre por que
@@ -395,9 +418,14 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
   // isso isto agora é só DIAGNÓSTICO (nunca muda o resultado) até haver
   // medição real por FAMÍLIA (não por categoria) o suficiente pra calibrar
   // uma faixa própria de cada uma.
-  const aspectMeasurement = await measureAspectRatio(imageBuffer);
+  // Só calculado com SCAN_DEBUG=1 — tem custo real (2 operações sharp extras
+  // por scan) e nunca influencia `status`/`candidates` (aspectRatioConflict
+  // fica sempre false).
+  const aspectMeasurement = SCAN_DEBUG ? await measureAspectRatio(imageBuffer) : null;
   const aspectRatioConflict = false;
   void isAspectRatioInconsistentWithCategory; // mantido para uso futuro (faixa por família), não removido
+
+  const postProcessMs = Date.now() - postProcessStartedAt;
 
   const baseCandidates: RecognizeCandidate[] = top.map((m) => ({
     product_id: m.product_id,
@@ -418,6 +446,7 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
   let requiresCapacitySelection = false;
   let candidates = baseCandidates;
 
+  const siblingExpandStartedAt = Date.now();
   if (best && confidenceLevel !== "none") {
     const siblings = await expandFamilySiblings(admin, best);
     if (siblings.length > 0) {
@@ -426,6 +455,7 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
       candidates = [...candidates, ...siblings.filter((s) => !existingIds.has(s.product_id))];
     }
   }
+  const siblingExpandMs = Date.now() - siblingExpandStartedAt;
 
   // "Sem candidato compatível": o gate de categoria OU o de família zerou a
   // lista. Categoria: seja porque foi detectada com clareza e todo mundo que
@@ -466,9 +496,10 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
       : undefined;
   if (status === "no_result") candidates = [];
 
-  // Diagnóstico dev-only: os 5 melhores candidatos brutos (globais, sem
-  // filtro) + categoria e família decididas, nunca a imagem/vetor.
-  if (process.env.NODE_ENV !== "production") {
+  // Diagnóstico opt-in (SCAN_DEBUG=1): os 5 melhores candidatos brutos
+  // (globais, sem filtro) + categoria e família decididas, nunca a
+  // imagem/vetor. Desligado por padrão — ver SCAN_DEBUG acima.
+  if (SCAN_DEBUG) {
     console.log(
       `[scan/recognize/debug] top5=${JSON.stringify(
         grouped.slice(0, 5).map((m) => ({ sku: m.sku_code, product: m.product_name, category: m.category, family: m.visual_family_key, source: m.source, score: Number(m.score_raw.toFixed(4)) }))
@@ -480,6 +511,7 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
     );
   }
 
+  const totalMs = Date.now() - startedAt;
   return {
     recognition_id: recognitionId,
     status,
@@ -490,10 +522,40 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
     detected_category: categoryDetection.category,
     detected_family: familyDetection.family,
     requires_capacity_selection: requiresCapacitySelection,
-    processing_time_ms: Date.now() - startedAt,
+    processing_time_ms: totalMs,
     used_pgvector: usedPgvector,
     code,
+    timings: { embeddingMs, vectorSearchMs, postProcessMs, siblingExpandMs, totalMs },
   };
+}
+
+/**
+ * Grava uma linha de histórico real de performance/resultado (migration
+ * 0020) — usada para medir tempo por etapa ao longo do tempo e, cruzando com
+ * visual_learning_samples.original_prediction_id, a Qualidade de
+ * Reconhecimento (tempo médio real, taxa de acerto real). Nunca lança —
+ * chamado sempre como fire-and-forget (`void logRecognitionPerformance(...)`),
+ * uma falha aqui nunca pode atrapalhar a resposta real ao operador.
+ */
+export async function logRecognitionPerformance(admin: SupabaseClient, result: RecognizeResult): Promise<void> {
+  if (!result.timings) return;
+  try {
+    await admin.from("scan_recognition_log").insert({
+      recognition_id: result.recognition_id,
+      variant_id: result.candidates[0]?.variant_id ?? null,
+      status: result.status,
+      confidence_level: result.confidence_level,
+      top_score: result.candidates[0]?.score ?? null,
+      used_pgvector: result.used_pgvector,
+      embedding_ms: result.timings.embeddingMs,
+      vector_search_ms: result.timings.vectorSearchMs,
+      post_process_ms: result.timings.postProcessMs,
+      sibling_expand_ms: result.timings.siblingExpandMs,
+      total_ms: result.timings.totalMs,
+    });
+  } catch (err) {
+    console.warn("[scan/recognize] falha ao gravar log de performance (não afeta o reconhecimento):", err instanceof Error ? err.message : err);
+  }
 }
 
 export { MODEL_NAME, MODEL_VERSION };

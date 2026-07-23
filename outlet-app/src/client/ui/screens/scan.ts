@@ -385,17 +385,28 @@ function renderOverlay(): void {
       // segurança, não falta de nitidez.
       const safetyRejectCodes = ["CATEGORY_MISMATCH", "CATEGORY_UNCERTAIN", "FAMILY_MISMATCH", "ASPECT_RATIO_MISMATCH"];
       const isCategorySafetyReject = !!lastRecognitionAttempt?.code && safetyRejectCodes.includes(lastRecognitionAttempt.code);
+      const noReferencesAtAll = lastRecognitionAttempt?.code === "NO_EMBEDDINGS_FOUND";
       sheet.innerHTML = `
         <div class="scan-card">
-          <p>${isCategorySafetyReject ? "Não foi possível reconhecer este produto com segurança." : "Produto não reconhecido."}</p>
+          <p class="scan-found-title">${isCategorySafetyReject ? "Não foi possível reconhecer este produto com segurança." : "Produto não encontrado."}</p>
           <p class="hint-text">${
             isCategorySafetyReject
-              ? "Não há evidência visual suficiente pra confirmar a categoria do produto (garrafa, copo, etc.) com segurança — por precaução, nada foi sugerido. Aproxime mais o produto, melhore a iluminação ou busque manualmente."
-              : "Aproxime mais o produto da câmera ou busque manualmente."
+              ? "Não há evidência visual suficiente pra confirmar a categoria do produto (garrafa, copo, etc.) com segurança — por precaução, nada foi sugerido. Aproxime mais o produto ou melhore a iluminação."
+              : noReferencesAtAll
+                ? "Ainda não existe nenhuma referência visual cadastrada no sistema."
+                : "O GoScan não localizou este produto nem nenhuma referência parecida o suficiente."
           }</p>
-          <button class="btn-primary btn-block" id="scanManual">${Icon.search}Buscar manualmente</button>
+          <p>Quer vincular este produto a um SKU e ensinar o GoScan a reconhecê-lo da próxima vez?</p>
+          <div class="scan-actions">
+            <button class="btn-primary btn-block" id="scanLinkSku">${Icon.search}Sim, vincular a um SKU</button>
+            <button class="btn-secondary btn-block" id="scanKeepTrying">Continuar tentando</button>
+          </div>
         </div>`;
-      sheet.querySelector("#scanManual")!.addEventListener("click", () => setState("manual_search"));
+      sheet.querySelector("#scanLinkSku")!.addEventListener("click", () => setState("manual_search"));
+      sheet.querySelector("#scanKeepTrying")!.addEventListener("click", () => {
+        noResultStreak = 0;
+        setState("analyzing");
+      });
       break;
     }
 

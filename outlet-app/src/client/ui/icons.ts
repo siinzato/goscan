@@ -41,6 +41,7 @@ import iconFlashlight from "lucide-static/icons/flashlight.svg?raw";
 import iconFlashlightOff from "lucide-static/icons/flashlight-off.svg?raw";
 import iconSwitchCamera from "lucide-static/icons/switch-camera.svg?raw";
 import iconCameraOff from "lucide-static/icons/camera-off.svg?raw";
+import iconGauge from "lucide-static/icons/gauge.svg?raw";
 
 export const Icon = {
   camera: iconCamera,
@@ -84,6 +85,7 @@ export const Icon = {
   flashlightOff: iconFlashlightOff,
   switchCamera: iconSwitchCamera,
   cameraOff: iconCameraOff,
+  gauge: iconGauge,
 } as const;
 
 export type IconName = keyof typeof Icon;

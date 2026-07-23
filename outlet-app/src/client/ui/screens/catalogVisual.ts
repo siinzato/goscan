@@ -2,7 +2,7 @@
 // o futuro Modo Scan. Sub-seção dentro da tela "Catálogo" (não ocupa um
 // ícone novo na bottom nav). Gerencia sua própria sub-navegação em memória
 // (lista / detalhe / importações), sem tocar no roteador global do app.
-import { escapeHtml, debounce } from "../../utils.ts";
+import { escapeHtml, debounce, renderErrorWithRetry } from "../../utils.ts";
 import { getAuthState, isManagerOrAdmin } from "../../auth.ts";
 import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
@@ -30,7 +30,17 @@ import {
 import { parseCatalogVisualSheet, buildImportPreview, createCatalogImageImport, type ImportPreview } from "../../catalogImagesImporter.ts";
 import { processImportBatch, resetImportErrors } from "../../catalogImagesBackendClient.ts";
 import { startCamera, blobToBase64, CameraPermissionDeniedError, CameraUnavailableError, type CameraController } from "../../scanCamera.ts";
-import { assessScanFrameQuality, recordAdminReference, getLibrarySummary, type LibrarySummary } from "../../visualLearningApi.ts";
+import {
+  assessScanFrameQuality,
+  recordAdminReference,
+  getLibrarySummary,
+  type LibrarySummary,
+  recalcRecognitionQuality,
+  getRecognitionQualityBatch,
+  listRecognitionQuality,
+  type RecognitionQuality,
+  type RecognitionQualityListRow,
+} from "../../visualLearningApi.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
 
 declare const XLSX: {
@@ -47,6 +57,23 @@ let listQuery = "";
 let listFilter: CatalogVisualFilter = "all";
 let listPage = 0;
 const LIST_PAGE_SIZE = 20;
+
+// estado do filtro de Qualidade de Reconhecimento — quando definido, a lista
+// passa a vir de listRecognitionQuality (banda/ordenação) em vez de
+// listCatalogVisualProducts; "todos" volta pro fluxo normal de sempre.
+type QualityBandFilter = "todos" | "excelente" | "bom" | "regular" | "fraco" | "critico" | "sem_referencias";
+let qualityBandFilter: QualityBandFilter = "todos";
+let qualitySort: "score_asc" | "score_desc" = "score_asc";
+
+const QUALITY_BAND_LABELS: Record<QualityBandFilter, string> = {
+  todos: "Todos",
+  excelente: "Excelente",
+  bom: "Bom",
+  regular: "Regular",
+  fraco: "Fraco",
+  critico: "Crítico",
+  sem_referencias: "Sem referências",
+};
 
 const FILTER_LABELS: Record<CatalogVisualFilter, string> = {
   all: "Todos",
@@ -119,7 +146,7 @@ async function renderSummary(container: HTMLElement): Promise<void> {
         <div class="summary-stat"><strong>${s.last_import ? new Date(s.last_import.created_at).toLocaleDateString("pt-BR") : "-"}</strong><span>Última importação</span></div>
       </div>`;
   } catch (err) {
-    container.innerHTML = `<div class="error-box">Erro ao carregar resumo: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(container, "Erro ao carregar resumo: " + (err instanceof Error ? err.message : String(err)), () => void renderSummary(container));
   }
 }
 
@@ -148,6 +175,17 @@ async function renderListView(body: HTMLElement): Promise<void> {
         ${(Object.keys(FILTER_LABELS) as CatalogVisualFilter[])
           .map((f) => `<button type="button" class="chip ${listFilter === f ? "active" : ""}" data-filter="${f}">${FILTER_LABELS[f]}</button>`)
           .join("")}
+      </div>
+      <p class="hint-text" style="margin:10px 0 4px">${Icon.gauge}Qualidade de Reconhecimento</p>
+      <div class="chip-row" id="cvQualityChips">
+        ${(Object.keys(QUALITY_BAND_LABELS) as QualityBandFilter[])
+          .map((b) => `<button type="button" class="chip ${qualityBandFilter === b ? "active" : ""}" data-quality-band="${b}">${QUALITY_BAND_LABELS[b]}</button>`)
+          .join("")}
+        ${
+          qualityBandFilter !== "todos"
+            ? `<button type="button" class="chip" id="cvQualitySortToggle">${Icon.refresh}${qualitySort === "score_asc" ? "Quem mais precisa de treinamento" : "Melhor qualidade primeiro"}</button>`
+            : ""
+        }
       </div>
       <div id="cvListWrap"><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div></div>
       <div class="pagination">
@@ -185,6 +223,18 @@ async function renderListView(body: HTMLElement): Promise<void> {
     });
   });
 
+  body.querySelectorAll<HTMLButtonElement>("[data-quality-band]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      qualityBandFilter = btn.dataset.qualityBand as QualityBandFilter;
+      listPage = 0;
+      void renderListView(body);
+    });
+  });
+  body.querySelector("#cvQualitySortToggle")?.addEventListener("click", () => {
+    qualitySort = qualitySort === "score_asc" ? "score_desc" : "score_asc";
+    void renderListView(body);
+  });
+
   body.querySelector("#cvPrevPage")!.addEventListener("click", () => {
     if (listPage > 0) {
       listPage--;
@@ -202,6 +252,21 @@ async function renderListView(body: HTMLElement): Promise<void> {
 async function loadListPage(body: HTMLElement): Promise<void> {
   const wrap = body.querySelector("#cvListWrap")!;
   try {
+    if (qualityBandFilter !== "todos") {
+      const { rows, total } = await listRecognitionQuality({
+        band: qualityBandFilter === "sem_referencias" ? "critico" : qualityBandFilter,
+        onlyNoReferences: qualityBandFilter === "sem_referencias",
+        page: listPage,
+        pageSize: LIST_PAGE_SIZE,
+        sort: qualitySort,
+      });
+      renderQualityCards(wrap, rows);
+      const totalPages = Math.max(1, Math.ceil(total / LIST_PAGE_SIZE));
+      body.querySelector("#cvPageInfo")!.textContent = `Página ${listPage + 1} de ${totalPages} (${total})`;
+      (body.querySelector("#cvPrevPage") as HTMLButtonElement).disabled = listPage === 0;
+      (body.querySelector("#cvNextPage") as HTMLButtonElement).disabled = listPage + 1 >= totalPages;
+      return;
+    }
     const { rows, total } = await listCatalogVisualProducts(listQuery, listFilter, listPage, LIST_PAGE_SIZE);
     renderProductCards(wrap, rows);
     void hydrateThumbnails(wrap);
@@ -210,8 +275,48 @@ async function loadListPage(body: HTMLElement): Promise<void> {
     (body.querySelector("#cvPrevPage") as HTMLButtonElement).disabled = listPage === 0;
     (body.querySelector("#cvNextPage") as HTMLButtonElement).disabled = listPage + 1 >= totalPages;
   } catch (err) {
-    wrap.innerHTML = `<div class="error-box">Erro ao buscar: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(wrap, "Erro ao buscar: " + (err instanceof Error ? err.message : String(err)), () => void loadListPage(body));
   }
+}
+
+function renderQualityCards(wrap: Element, rows: RecognitionQualityListRow[]): void {
+  if (rows.length === 0) {
+    wrap.innerHTML = `<div class="empty-state">${Icon.searchX}<p>Nenhum produto nessa faixa de qualidade.</p></div>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <div class="product-card-list">
+      ${rows
+        .map((q) => {
+          const css = BAND_CSS[q.band] ?? "info";
+          const label = BAND_LABELS[q.band] ?? q.band;
+          return `
+        <div class="product-card" data-open-variant="${q.variant_id}" style="cursor:pointer">
+          <div class="product-card-top">
+            <div style="flex:1;min-width:0">
+              <p class="product-card-name">${escapeHtml(q.product_name)}</p>
+              <div class="product-card-meta">
+                <span class="sku-code">${escapeHtml(q.sku_code)}</span>
+                <span>${q.reference_count} referência(s)</span>
+              </div>
+            </div>
+          </div>
+          <div class="product-card-bottom">
+            <span class="status-badge ${css}">${Icon.gauge}${q.score_percent}% ${escapeHtml(label)}${q.estimated_only ? " (estimado)" : ""}</span>
+          </div>
+        </div>`;
+        })
+        .join("")}
+    </div>`;
+
+  wrap.querySelectorAll<HTMLElement>("[data-open-variant]").forEach((el) => {
+    el.addEventListener("click", () => {
+      selectedVariantId = el.dataset.openVariant!;
+      subView = "detail";
+      const body = wrap.closest("#catalogVisualBody") as HTMLElement;
+      void renderCurrentSubView(body);
+    });
+  });
 }
 
 function productStatusBadges(p: CatalogVisualProduct): string {
@@ -223,6 +328,67 @@ function productStatusBadges(p: CatalogVisualProduct): string {
     parts.push(`<span class="status-badge success">${Icon.checkCircle}Pronta p/ reconhecimento</span>`);
   }
   return parts.join("");
+}
+
+const BAND_LABELS: Record<string, string> = { excelente: "Excelente", bom: "Bom", regular: "Regular", fraco: "Fraco", critico: "Crítico" };
+const BAND_CSS: Record<string, string> = { excelente: "success", bom: "success", regular: "warning", fraco: "warning", critico: "error" };
+
+function qualityBadgeHtml(variantId: string): string {
+  return `<span class="status-badge quality-badge-placeholder" data-quality-variant="${variantId}">…</span>`;
+}
+
+function renderQualityBadgeInto(el: Element, q: RecognitionQuality | undefined): void {
+  if (!q) {
+    el.outerHTML = "";
+    return;
+  }
+  const css = BAND_CSS[q.band] ?? "info";
+  const label = BAND_LABELS[q.band] ?? q.band;
+  el.outerHTML = `<span class="status-badge ${css}" title="Qualidade de Reconhecimento">${Icon.gauge}${q.score_percent}% ${escapeHtml(label)}${q.estimated_only ? " (estimado)" : ""}</span>`;
+}
+
+const ANGLE_LABELS: Record<string, string> = { frente: "Frente", traseira: "Traseira", lateral: "Lateral", superior: "Superior/tampa", base: "Base", detalhe: "Detalhe" };
+
+function renderQualityCardHtml(q: RecognitionQuality): string {
+  const css = BAND_CSS[q.band] ?? "info";
+  const label = BAND_LABELS[q.band] ?? q.band;
+  return `
+    <div class="card">
+      <div class="product-card-top">
+        <h2 style="margin:0">${Icon.gauge}Qualidade de Reconhecimento</h2>
+        <span class="status-badge ${css}" style="font-size:14px">${q.score_percent}% — ${escapeHtml(label)}</span>
+      </div>
+      ${q.estimated_only ? `<p class="hint-text">Qualidade estimada pelas referências cadastradas — ainda não há uso operacional (scans reais) suficiente para confirmar com dados de campo.</p>` : `<p class="hint-text">Calculada com ${q.historical_sample_count} reconhecimento(s) reais registrados, além das referências cadastradas.</p>`}
+      <div class="summary-grid">
+        <div class="summary-stat"><strong>${q.reference_count}</strong><span>Referências (${q.official_count} oficiais, ${q.learned_count} aprendidas)</span></div>
+        <div class="summary-stat"><strong>${q.quality_technical_percent}%</strong><span>Qualidade técnica</span></div>
+        <div class="summary-stat"><strong>${q.angle_coverage_percent}%</strong><span>Cobertura de ângulos${q.angles_present.length ? ` (${q.angles_present.map((a) => ANGLE_LABELS[a] ?? a).join(", ")})` : ""}</span></div>
+        <div class="summary-stat"><strong>${q.embedding_consistency_percent ?? "-"}${q.embedding_consistency_percent !== null ? "%" : ""}</strong><span>Consistência das referências</span></div>
+        ${q.historical_accuracy_percent !== null ? `<div class="summary-stat"><strong>${q.historical_accuracy_percent}%</strong><span>Taxa de acerto real</span></div>` : ""}
+        ${q.avg_recognition_ms !== null ? `<div class="summary-stat"><strong>${(q.avg_recognition_ms / 1000).toFixed(1)}s</strong><span>Tempo médio real</span></div>` : ""}
+      </div>
+      ${
+        q.top_confusion_sku
+          ? `<div class="error-box" style="margin-top:10px">Confundido com <strong>${escapeHtml(q.top_confusion_sku)}</strong> em ${q.top_confusion_count} ocorrência(s) registradas.</div>`
+          : ""
+      }
+      <h3 style="margin:14px 0 6px;font-size:14px">Recomendações</h3>
+      <ul class="quality-recommendations">
+        ${q.recommendations.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}
+      </ul>
+    </div>`;
+}
+
+async function hydrateQualityBadges(container: Element, variantIds: string[]): Promise<void> {
+  if (variantIds.length === 0) return;
+  try {
+    const batch = await getRecognitionQualityBatch(variantIds);
+    container.querySelectorAll<HTMLElement>("[data-quality-variant]").forEach((el) => {
+      renderQualityBadgeInto(el, batch.get(el.dataset.qualityVariant!));
+    });
+  } catch {
+    // indicador é um bônus informativo — nunca quebra a lista principal por causa dele
+  }
 }
 
 function renderProductCards(wrap: Element, rows: CatalogVisualProduct[]): void {
@@ -246,7 +412,7 @@ function renderProductCards(wrap: Element, rows: CatalogVisualProduct[]): void {
               </div>
             </div>
           </div>
-          <div class="product-card-bottom">${productStatusBadges(p)}</div>
+          <div class="product-card-bottom">${productStatusBadges(p)}${qualityBadgeHtml(p.variant_id)}</div>
         </div>`
         )
         .join("")}
@@ -260,6 +426,11 @@ function renderProductCards(wrap: Element, rows: CatalogVisualProduct[]): void {
       void renderCurrentSubView(body);
     });
   });
+
+  void hydrateQualityBadges(
+    wrap,
+    rows.map((p) => p.variant_id)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -281,11 +452,13 @@ async function renderProductDetail(body: HTMLElement, variantId: string): Promis
 
   let detail;
   let librarySummary: LibrarySummary | null = null;
+  let quality: RecognitionQuality | null = null;
   try {
     detail = await getProductVisualDetail(variantId);
     librarySummary = await getLibrarySummary(variantId).catch(() => null);
+    quality = (await getRecognitionQualityBatch([variantId]).catch(() => new Map())).get(variantId) ?? null;
   } catch (err) {
-    body.innerHTML = `<div class="error-box">Erro: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(body, "Erro: " + (err instanceof Error ? err.message : String(err)), () => void renderProductDetail(body, variantId));
     return;
   }
   const { variant, images } = detail;
@@ -320,6 +493,8 @@ async function renderProductDetail(body: HTMLElement, variantId: string): Promis
           </div>`
         : ""
     }
+
+    ${quality ? renderQualityCardHtml(quality) : ""}
 
     ${
       canManage
@@ -451,16 +626,19 @@ function renderImageActions(body: HTMLElement, variantId: string, image: Product
   });
   container.querySelector("#actToggleRecognition")?.addEventListener("click", async () => {
     await setRecognitionEnabled(image.id, !image.recognition_enabled);
+    void recalcRecognitionQuality(variantId);
     showToast("Atualizado.", "success");
     void renderProductDetail(body, variantId);
   });
   container.querySelector("#actApprove")?.addEventListener("click", async () => {
     await setImageQuality(image.id, "aprovada");
+    void recalcRecognitionQuality(variantId);
     showToast("Imagem aprovada.", "success");
     void renderProductDetail(body, variantId);
   });
   container.querySelector("#actReject")?.addEventListener("click", async () => {
     await setImageQuality(image.id, "rejeitada");
+    void recalcRecognitionQuality(variantId);
     showToast("Imagem rejeitada.", "success");
     void renderProductDetail(body, variantId);
   });
@@ -473,6 +651,7 @@ function renderImageActions(body: HTMLElement, variantId: string, image: Product
     });
     if (!confirmed) return;
     await archiveImage(image.id);
+    void recalcRecognitionQuality(variantId);
     showToast("Imagem arquivada.", "success");
     void renderProductDetail(body, variantId);
   });
@@ -481,6 +660,7 @@ function renderImageActions(body: HTMLElement, variantId: string, image: Product
     const imageType = (container.querySelector("#cvImageType") as HTMLSelectElement).value as ImageType;
     const viewAngle = (container.querySelector("#cvImageAngle") as HTMLInputElement).value || "nao_informado";
     await setImageTypeAndAngle(image.id, imageType, viewAngle);
+    void recalcRecognitionQuality(variantId);
     showToast("Tipo/ângulo atualizado.", "success");
     void renderProductDetail(body, variantId);
   });
@@ -519,6 +699,7 @@ function wireManualUpload(body: HTMLElement, variantId: string): void {
     statusEl.textContent = "Enviando…";
     try {
       await uploadManualImage({ variantId, file, imageType, viewAngle });
+      void recalcRecognitionQuality(variantId);
       showToast("Imagem adicionada.", "success");
       void renderProductDetail(body, variantId);
     } catch (err) {

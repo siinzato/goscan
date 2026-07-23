@@ -10,8 +10,9 @@ import { processEmbeddingBatch, processEmbeddingsForVariant, getEmbeddingStatusS
 import { generateImageEmbedding } from "./embeddingPipeline.ts";
 import { processAndNormalizeImage } from "./imagePipeline.ts";
 import { validateScanFrame, InvalidFrameError } from "./scanFrameValidator.ts";
-import { recognizeFrame } from "./scanRecognize.ts";
+import { recognizeFrame, logRecognitionPerformance } from "./scanRecognize.ts";
 import { recordLearningSample, listLearningSamples, updateLearningSampleStatus, assessFrameQuality, getLibrarySummary, reportUnclassifiedProduct } from "./visualLearning.ts";
+import { recalculateRecognitionQuality, getRecognitionQualityForVariants, listRecognitionQuality } from "./recognitionQuality.ts";
 import { isRateLimited } from "./scanRateLimiter.ts";
 import { SCAN_CONFIG } from "./scanConfig.ts";
 
@@ -256,7 +257,12 @@ export default {
           console.log(
             `[scan/recognize] recognition_id=${result.recognition_id} status=${result.status} confidence=${result.confidence_level} candidates=${result.candidates.length} time_ms=${result.processing_time_ms}`
           );
-          return json(result);
+          // Histórico real de performance/candidato vencedor (migration 0020) —
+          // fire-and-forget: nunca atrasa nem derruba a resposta ao operador
+          // por causa de uma falha no log.
+          void logRecognitionPerformance(admin, result);
+          const { timings: _timings, ...publicResult } = result;
+          return json(publicResult);
         } catch (err) {
           if (err instanceof InvalidFrameError) return json({ error: err.message }, 422);
           if (err instanceof Error && err.message === "TIMEOUT") {
@@ -491,12 +497,73 @@ export default {
         }
       }
 
+      // --- Qualidade de Reconhecimento (Catálogo Visual) ---
+      if (path === "/api/visual-learning/recognition-quality-batch" && request.method === "GET") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        const idsParam = url.searchParams.get("variant_ids") || "";
+        const variantIds = idsParam
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const admin = getSupabaseAdmin(env);
+        const rows = await getRecognitionQualityForVariants(admin, variantIds);
+        return json({ rows });
+      }
+
+      if (path === "/api/visual-learning/recognition-quality-list" && request.method === "GET") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        const admin = getSupabaseAdmin(env);
+        const band = url.searchParams.get("band") || undefined;
+        const onlyNoReferences = url.searchParams.get("only_no_references") === "1";
+        const page = Number(url.searchParams.get("page") || "0");
+        const pageSize = Number(url.searchParams.get("page_size") || "20");
+        const sortBy = url.searchParams.get("sort") === "score_desc" ? "score_desc" : "score_asc";
+        const { rows, total } = await listRecognitionQuality(admin, { band, onlyNoReferences, page, pageSize, sortBy });
+        return json({ rows, total });
+      }
+
+      if (path === "/api/visual-learning/recalc-quality" && request.method === "POST") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        let body: { variant_id?: string };
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          return json({ error: "Corpo da requisição inválido (JSON esperado)." }, 400);
+        }
+        if (!body.variant_id) return json({ error: "variant_id é obrigatório." }, 400);
+
+        const admin = getSupabaseAdmin(env);
+        await recalculateRecognitionQuality(admin, body.variant_id);
+        return json({ ok: true });
+      }
+
       return json({ error: "not found" }, 404);
     } catch (err) {
-      return json({ error: String(err instanceof Error ? err.message : err) }, 500);
+      return json({ error: errorMessage(err) }, 500);
     }
   },
 };
+
+// BUG REAL corrigido: erros do PostgREST/Supabase (ex.: ambiguidade de
+// relacionamento, violação de constraint) chegam aqui como objeto plano
+// { message, code, details, hint }, não como instância de Error — o extrator
+// antigo (`err instanceof Error ? err.message : err`) caía no `else` e
+// serializava o objeto inteiro como string, virando "[object Object]" pro
+// operador. Qualquer objeto com uma propriedade `message` string agora é
+// tratado como teria um `.message` de verdade.
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object" && "message" in err && typeof (err as { message: unknown }).message === "string") {
+    return (err as { message: string }).message;
+  }
+  return String(err);
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {

@@ -306,11 +306,33 @@ interface LearningSampleJoinRow {
   product_name: string;
 }
 
+interface LearningSampleRpcRow {
+  sample_id: string;
+  distance: number;
+  product_id: string;
+  variant_id: string;
+  storage_path: string;
+  sku_code: string;
+  product_name: string;
+  category: string | null;
+  family: string | null;
+  capacity_ml: number | null;
+  color: string | null;
+}
+
 /**
  * Busca nas referências APRENDIDAS (scans confirmados/corrigidos por
  * operadores, migration 0016) — mesmo padrão de findSimilarImages: tenta
  * pgvector primeiro, cai para JS se indisponível. Só "validated"+"active"
  * participam; nunca inclui pending/rejected/disabled.
+ *
+ * OTIMIZAÇÃO (migration 0020): a função match_visual_learning_samples agora
+ * devolve todas as colunas de exibição junto com a distância — evita a
+ * segunda consulta ("refiltra pelo estado atual") que existia antes só para
+ * buscar storage_path/sku/nome/etc, já que os MESMOS filtros
+ * (validation_status/active) já são aplicados dentro da própria função SQL.
+ * O caminho de fallback em JS (pgvector indisponível) continua idêntico ao
+ * de antes, incluindo a segunda consulta — ele nunca teve essas colunas.
  */
 async function findSimilarLearningSamples(
   admin: SupabaseClient,
@@ -324,28 +346,44 @@ async function findSimilarLearningSamples(
     match_count: limit,
   });
 
-  let ranked: { sample_id: string; distance: number }[];
   if (!rpcError && rpcData) {
-    ranked = (rpcData as { sample_id: string; distance: number }[]).map((r) => ({ sample_id: r.sample_id, distance: r.distance }));
-  } else {
-    const { data: rows, error: rowsError } = await admin
-      .from("visual_learning_samples")
-      .select("id, embedding")
-      .eq("model_name", MODEL_NAME)
-      .eq("model_version", MODEL_VERSION)
-      .eq("validation_status", "validated")
-      .eq("active", true)
-      .not("embedding", "is", null);
-    if (rowsError) throw rowsError; // função pode não existir se 0016 não foi aplicada — erro real, não silencia
-    ranked = ((rows as { id: string; embedding: number[] }[]) || [])
-      .map((r) => ({ sample_id: r.id, distance: 1 - cosineSimilarity(queryVector, r.embedding) }))
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, limit);
+    return (rpcData as LearningSampleRpcRow[]).map((row) => ({
+      product_image_id: row.sample_id, // amostra aprendida não tem product_image_id real — usa o próprio id da amostra
+      product_id: row.product_id,
+      variant_id: row.variant_id,
+      distance: row.distance,
+      score_raw: 1 - row.distance,
+      score_normalized: 0, // recalculado depois do merge com o pool completo
+      storage_path: row.storage_path,
+      sku_code: row.sku_code,
+      product_name: row.product_name,
+      category: row.category,
+      visual_family_key: row.family,
+      variant_key: row.color,
+      capacity_ml: row.capacity_ml,
+      source: "learned" as const,
+    }));
   }
+
+  // Fallback sem pgvector (função/extensão indisponível): compara em JS contra
+  // todos os embeddings "validated"+"active", depois refiltra pelo estado
+  // ATUAL — mantido exatamente como antes, nunca chamado quando pgvector está
+  // disponível (caminho raro, só para projetos sem a extensão).
+  const { data: rows, error: rowsError } = await admin
+    .from("visual_learning_samples")
+    .select("id, embedding")
+    .eq("model_name", MODEL_NAME)
+    .eq("model_version", MODEL_VERSION)
+    .eq("validation_status", "validated")
+    .eq("active", true)
+    .not("embedding", "is", null);
+  if (rowsError) throw rowsError; // função pode não existir se 0016 não foi aplicada — erro real, não silencia
+  const ranked = ((rows as { id: string; embedding: number[] }[]) || [])
+    .map((r) => ({ sample_id: r.id, distance: 1 - cosineSimilarity(queryVector, r.embedding) }))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, limit);
   if (ranked.length === 0) return [];
 
-  // Refiltra pelo estado ATUAL — mesmo princípio de findSimilarImages: uma
-  // amostra pode ter sido desativada pelo admin depois de "ready".
   const sampleIds = ranked.map((r) => r.sample_id);
   const { data: samplesData, error: samplesError } = await admin
     .from("visual_learning_samples")
@@ -361,12 +399,12 @@ async function findSimilarLearningSamples(
       const row = byId.get(r.sample_id);
       if (!row) return null;
       return {
-        product_image_id: row.id, // amostra aprendida não tem product_image_id real — usa o próprio id da amostra
+        product_image_id: row.id,
         product_id: row.product_id,
         variant_id: row.variant_id,
         distance: r.distance,
         score_raw: 1 - r.distance,
-        score_normalized: 0, // recalculado depois do merge com o pool completo
+        score_normalized: 0,
         storage_path: row.storage_path,
         sku_code: row.sku_code,
         product_name: row.product_name,
@@ -380,17 +418,36 @@ async function findSimilarLearningSamples(
     .filter((m): m is SimilarityMatch => m !== null);
 }
 
+interface CatalogRpcRow {
+  product_image_id: string;
+  distance: number;
+  product_id: string;
+  variant_id: string;
+  storage_path: string | null;
+  sku_code: string;
+  product_name: string;
+  category: string | null;
+  visual_family_key: string | null;
+  variant_key: string | null;
+  capacity_ml: number | null;
+}
+
 /**
- * Busca as imagens mais semelhantes a um vetor de consulta. Tenta pgvector
- * (match_image_embeddings, migration 0012) primeiro; se a função/extensão não
- * existir (0012 não aplicada ou pgvector indisponível no projeto), cai para
- * comparação em JavaScript sobre os embeddings "ready" — o resultado é o
- * mesmo, só muda a performance. Nunca usa nome/SKU como parte do score.
+ * Busca as imagens do catálogo oficial mais semelhantes a um vetor de
+ * consulta. Tenta pgvector (match_image_embeddings) primeiro; se a
+ * função/extensão não existir, cai para comparação em JavaScript sobre os
+ * embeddings "ready" — o resultado é o mesmo, só muda a performance.
+ *
+ * OTIMIZAÇÃO (migration 0020): a função SQL agora devolve todas as colunas de
+ * exibição (incluindo os MESMOS filtros de quality_status/recognition_enabled
+ * que antes só existiam na segunda consulta em JS) — elimina a consulta
+ * extra no caminho comum (pgvector disponível). O fallback sem pgvector
+ * continua idêntico ao de antes, incluindo a segunda consulta.
  */
-export async function findSimilarImages(
+async function findSimilarCatalogImages(
   admin: SupabaseClient,
   queryVector: number[],
-  limit = 5
+  limit: number
 ): Promise<{ matches: SimilarityMatch[]; usedPgvector: boolean }> {
   const { data: rpcData, error: rpcError } = await admin.rpc("match_image_embeddings", {
     query_embedding: queryVector,
@@ -399,29 +456,42 @@ export async function findSimilarImages(
     match_count: limit,
   });
 
-  let ranked: { product_image_id: string; distance: number }[];
-  let usedPgvector: boolean;
-
   if (!rpcError && rpcData) {
-    ranked = (rpcData as { product_image_id: string; distance: number }[]).map((r) => ({ product_image_id: r.product_image_id, distance: r.distance }));
-    usedPgvector = true;
-  } else {
-    const { data: readyRows, error: readyError } = await admin
-      .from("image_embeddings")
-      .select("product_image_id, embedding")
-      .eq("model_name", MODEL_NAME)
-      .eq("model_version", MODEL_VERSION)
-      .eq("status", "ready");
-    if (readyError) throw readyError;
-
-    ranked = ((readyRows as { product_image_id: string; embedding: number[] }[]) || [])
-      .map((r) => ({ product_image_id: r.product_image_id, distance: 1 - cosineSimilarity(queryVector, r.embedding) }))
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, limit);
-    usedPgvector = false;
+    const matches: SimilarityMatch[] = (rpcData as CatalogRpcRow[]).map((row) => ({
+      product_image_id: row.product_image_id,
+      product_id: row.product_id,
+      variant_id: row.variant_id,
+      distance: row.distance,
+      score_raw: 1 - row.distance,
+      score_normalized: 0, // recalculado depois do merge com o pool completo
+      storage_path: row.storage_path,
+      sku_code: row.sku_code,
+      product_name: row.product_name,
+      category: row.category,
+      visual_family_key: row.visual_family_key,
+      variant_key: row.variant_key,
+      capacity_ml: row.capacity_ml,
+      source: "catalog" as const,
+    }));
+    return { matches, usedPgvector: true };
   }
 
-  if (ranked.length === 0) return { matches: [], usedPgvector };
+  // Fallback sem pgvector — mantido exatamente como antes (busca bruta em JS +
+  // segunda consulta pelo estado atual), só usado quando a extensão/função
+  // não está disponível no projeto.
+  const { data: readyRows, error: readyError } = await admin
+    .from("image_embeddings")
+    .select("product_image_id, embedding")
+    .eq("model_name", MODEL_NAME)
+    .eq("model_version", MODEL_VERSION)
+    .eq("status", "ready");
+  if (readyError) throw readyError;
+
+  const ranked = ((readyRows as { product_image_id: string; embedding: number[] }[]) || [])
+    .map((r) => ({ product_image_id: r.product_image_id, distance: 1 - cosineSimilarity(queryVector, r.embedding) }))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, limit);
+  if (ranked.length === 0) return { matches: [], usedPgvector: false };
 
   interface ImageJoinRow {
     id: string;
@@ -434,9 +504,6 @@ export async function findSimilarImages(
     } | null;
   }
 
-  // Refiltra pelo estado ATUAL da imagem/variante/produto — um embedding
-  // "ready" pode ter sido gerado antes de a imagem ser arquivada/rejeitada ou
-  // o produto ser desativado; nunca confiamos só na existência do embedding.
   const imageIds = ranked.map((r) => r.product_image_id);
   const { data: imagesData, error: imagesError } = await admin
     .from("product_images")
@@ -451,7 +518,6 @@ export async function findSimilarImages(
   if (imagesError) throw imagesError;
 
   const byId = new Map((imagesData as unknown as ImageJoinRow[]).map((row) => [row.id, row]));
-  const maxDistance = Math.max(...ranked.map((r) => r.distance), 1e-9);
 
   const matches: SimilarityMatch[] = ranked
     .map((r): SimilarityMatch | null => {
@@ -460,14 +526,13 @@ export async function findSimilarImages(
       const variant = row.product_variants;
       const product = variant?.products;
       if (!product || !variant) return null;
-      const scoreRaw = 1 - r.distance;
       return {
         product_image_id: r.product_image_id,
         product_id: product.id,
         variant_id: variant.id,
         distance: r.distance,
-        score_raw: scoreRaw,
-        score_normalized: Math.max(0, 1 - r.distance / maxDistance),
+        score_raw: 1 - r.distance,
+        score_normalized: 0,
         storage_path: row.storage_path,
         sku_code: variant?.sku_code ?? "",
         product_name: product?.name ?? "",
@@ -480,22 +545,37 @@ export async function findSimilarImages(
     })
     .filter((m): m is SimilarityMatch => m !== null);
 
-  // Memória visual (migration 0016): referências de scans reais confirmados/
-  // corrigidos por operadores participam do MESMO pool de busca, não de uma
-  // lista separada — mesclado aqui e reordenado por distância antes de
-  // devolver, pra que groupByProduct (scanRecognize.ts) trate as duas fontes
-  // igual. Erro ao buscar aprendizado não derruba o reconhecimento normal —
-  // fotos oficiais continuam funcionando mesmo se a memória visual falhar.
-  let learned: SimilarityMatch[] = [];
-  try {
-    learned = await findSimilarLearningSamples(admin, queryVector, limit);
-  } catch (err) {
-    console.warn("[visualEmbeddings] falha ao buscar memória visual (seguindo só com catálogo oficial):", err instanceof Error ? err.message : err);
-  }
+  return { matches, usedPgvector: false };
+}
 
-  const merged = [...matches, ...learned].sort((a, b) => a.distance - b.distance).slice(0, limit);
+/**
+ * Busca as imagens mais semelhantes a um vetor de consulta, mesclando o
+ * catálogo oficial com a memória visual (migration 0016).
+ *
+ * OTIMIZAÇÃO (migration 0020): as duas buscas (catálogo e memória visual) são
+ * independentes uma da outra — antes eram feitas em sequência (uma esperava a
+ * outra terminar); agora rodam em paralelo via Promise.all, reduzindo o tempo
+ * de rede pela metade sem mudar nenhum filtro/critério/resultado. Erro ao
+ * buscar aprendizado não derruba o reconhecimento normal — fotos oficiais
+ * continuam funcionando mesmo se a memória visual falhar. Nunca usa
+ * nome/SKU como parte do score.
+ */
+export async function findSimilarImages(
+  admin: SupabaseClient,
+  queryVector: number[],
+  limit = 5
+): Promise<{ matches: SimilarityMatch[]; usedPgvector: boolean }> {
+  const [catalogResult, learnedResult] = await Promise.all([
+    findSimilarCatalogImages(admin, queryVector, limit),
+    findSimilarLearningSamples(admin, queryVector, limit).catch((err) => {
+      console.warn("[visualEmbeddings] falha ao buscar memória visual (seguindo só com catálogo oficial):", err instanceof Error ? err.message : err);
+      return [] as SimilarityMatch[];
+    }),
+  ]);
+
+  const merged = [...catalogResult.matches, ...learnedResult].sort((a, b) => a.distance - b.distance).slice(0, limit);
   const mergedMaxDistance = Math.max(...merged.map((m) => m.distance), 1e-9);
   const normalized = merged.map((m) => ({ ...m, score_normalized: Math.max(0, 1 - m.distance / mergedMaxDistance) }));
 
-  return { matches: normalized, usedPgvector };
+  return { matches: normalized, usedPgvector: catalogResult.usedPgvector };
 }

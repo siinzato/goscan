@@ -105,6 +105,10 @@ h1, h2, h3 { font-family: var(--font-ui); font-weight: 700; color: var(--text-pr
 
 .config-error h1 { font-size: 20px; }
 
+.boot-loading-logo { width: 140px; height: auto; margin-bottom: 8px; }
+.boot-loading-actions { display: flex; gap: 10px; margin-top: 12px; }
+.boot-loading-actions .btn-primary, .boot-loading-actions .btn-secondary { min-width: 140px; }
+
 /* ---------------------------------------------------------------------- */
 /* App shell mobile-first                                                 */
 /* ---------------------------------------------------------------------- */
@@ -349,6 +353,12 @@ textarea { font-family: var(--font-ui); font-size: 15px; resize: vertical; }
 .notice-box { background: var(--status-success-bg); color: var(--status-success); border: 1px solid currentColor; }
 .error-box { background: var(--status-error-bg); color: var(--status-error); border: 1px solid currentColor; }
 .warning-box { background: var(--status-warning-bg); border: 1px solid currentColor; color: var(--status-warning); }
+
+.quality-recommendations { margin: 0; padding-left: 18px; font-size: 13px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 6px; }
+.quality-recommendations li { line-height: 1.4; }
+
+.error-box-retry { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+.error-box-retry .btn-secondary { min-width: 160px; }
 
 /* ---------------------------------------------------------------------- */
 /* Home / operador / lista recente                                        */
