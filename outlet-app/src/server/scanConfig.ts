@@ -54,6 +54,43 @@ export const SCAN_CONFIG = {
     mediumMaxDistance: 0.38, // até aqui (e sem "alta"): confiança média
     highMaxDistance: 0.15, // só pode ser "alta" com distância até aqui...
     highMinGapToSecond: 0.08, // ...E com folga mínima pro 2º produto (não-irmão de família) mais próximo
+    //
+    // BUG REAL corrigido: uma Garrafa Fresh real (câmera, não foto de
+    // catálogo) foi capturada com distância 0.52-0.57 contra a própria
+    // categoria "garrafa" (evidência real medida em produção — nenhuma foto
+    // de referência da garrafa parecia o suficiente com aquele ambiente
+    // real) e 0.36-0.39 contra "copo" — o gate por MARGEM RELATIVA entre
+    // categorias (categoryGateMinGap em scanRecognize.ts) via corretamente
+    // uma folga grande entre as duas (~0.15-0.21) e declarava a categoria
+    // "clara", mesmo a vencedora (copo) sendo, em termos ABSOLUTOS, um match
+    // ruim (perto do teto de mediumMaxDistance). Margem relativa entre duas
+    // categorias ruins não prova que a vencedora é confiável. Este teto
+    // absoluto é deliberadamente mais rígido que mediumMaxDistance — mesmo
+    // sacrificando alguns acertos legítimos sob luz muito ruim (a Parte 5
+    // mediu até 0.36 pra mesmo-produto em luz forte), prefere dizer "não
+    // identificado" a arriscar uma categoria errada, como pedido
+    // explicitamente pelo usuário. Provisório — recalibrar com mais fotos
+    // reais por variante (catálogo ainda tem só 1 foto por cor em várias).
+    categoryMaxDistance: 0.32,
+  },
+
+  // Sinal estrutural REAL (não embedding): proporção altura/largura, medida
+  // recortando o fundo da imagem (sharp .trim()) e comparando a caixa
+  // delimitadora do produto. Medição real contra fotos de catálogo (estúdio,
+  // fundo uniforme):
+  //   garrafa-fresh: 3.11 / 3.26 / 3.35
+  //   copo-vibe:     1.74 / 1.74
+  //   copo-life:     1.84 / 2.68 / 2.69
+  // Separação limpa entre 2.69 (copo) e 3.11 (garrafa) — usa o meio (2.9)
+  // como limite. Só serve como regra ELIMINATÓRIA quando a medição é
+  // confiável (o recorte realmente achou um objeto menor que o quadro
+  // inteiro) — fundo poluído de uma foto de câmera real geralmente IMPEDE
+  // o .trim() de encontrar o produto, e nesse caso a "proporção" medida
+  // seria só a do quadro da câmera, não do objeto — por isso nunca é
+  // aplicada às cegas, só quando structuralSignals.ts confirma que o
+  // recorte é confiável.
+  aspectRatio: {
+    garrafaMinRatio: 2.9,
   },
 } as const;
 

@@ -11,6 +11,7 @@ import { generateImageEmbedding } from "./embeddingPipeline.ts";
 import { processAndNormalizeImage } from "./imagePipeline.ts";
 import { validateScanFrame, InvalidFrameError } from "./scanFrameValidator.ts";
 import { recognizeFrame } from "./scanRecognize.ts";
+import { recordLearningSample, listLearningSamples, updateLearningSampleStatus, assessFrameQuality, getLibrarySummary, reportUnclassifiedProduct } from "./visualLearning.ts";
 import { isRateLimited } from "./scanRateLimiter.ts";
 import { SCAN_CONFIG } from "./scanConfig.ts";
 
@@ -265,6 +266,228 @@ export default {
         } finally {
           // rawBuffer/frame saem de escopo aqui — nada foi persistido em disco,
           // Storage ou log; a única coisa que sobrevive é o resultado estrutural.
+        }
+      }
+
+      // --- Memória visual (aprendizado controlado a partir de scans reais) ---
+      // Só grava com confirmação humana explícita — o operador já viu o
+      // resultado e confirmou/corrigiu antes desta chamada acontecer. Nunca
+      // é chamado automaticamente pelo loop de análise.
+      if (path === "/api/scan/learn" && request.method === "POST") {
+        const auth = await requireActiveUser(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        let body: {
+          variant_id?: string;
+          image_base64?: string;
+          source_type?: "confirmed_scan" | "corrected_scan";
+          original_prediction_id?: string | null;
+          original_confidence?: number | null;
+          recognition_status?: string | null;
+        };
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          return json({ error: "Corpo da requisição inválido (JSON esperado)." }, 400);
+        }
+        if (!body.variant_id || typeof body.variant_id !== "string") {
+          return json({ error: "variant_id é obrigatório." }, 400);
+        }
+        if (!body.image_base64 || typeof body.image_base64 !== "string") {
+          return json({ error: "image_base64 é obrigatório." }, 400);
+        }
+        if (body.source_type !== "confirmed_scan" && body.source_type !== "corrected_scan") {
+          return json({ error: "source_type deve ser 'confirmed_scan' ou 'corrected_scan'." }, 400);
+        }
+
+        let rawBuffer: Buffer;
+        try {
+          rawBuffer = Buffer.from(body.image_base64, "base64");
+        } catch {
+          return json({ error: "image_base64 inválido (não é base64 válido)." }, 400);
+        }
+
+        const admin = getSupabaseAdmin(env);
+        try {
+          const frame = await validateScanFrame(rawBuffer);
+          const result = await recordLearningSample(admin, {
+            variantId: body.variant_id,
+            imageBuffer: frame.buffer,
+            sourceType: body.source_type,
+            originalPredictionId: body.original_prediction_id ?? null,
+            originalConfidence: body.original_confidence ?? null,
+            recognitionStatus: body.recognition_status ?? null,
+            correctedBy: body.source_type === "corrected_scan" ? auth.profile.id : null,
+          });
+          console.log(
+            `[scan/learn] variant_id=${body.variant_id} source_type=${body.source_type} saved=${result.saved} reinforced=${result.reinforcedExisting} reason=${result.reason ?? "-"}`
+          );
+          return json(result);
+        } catch (err) {
+          if (err instanceof InvalidFrameError) return json({ error: err.message }, 422);
+          throw err;
+        }
+      }
+
+      if (path === "/api/visual-learning/list" && request.method === "GET") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        const admin = getSupabaseAdmin(env);
+        const status = url.searchParams.get("status") || undefined;
+        const variantId = url.searchParams.get("variant_id") || undefined;
+        const page = Number(url.searchParams.get("page") || "0");
+        const pageSize = Number(url.searchParams.get("page_size") || "30");
+        const { rows, total } = await listLearningSamples(admin, { status, variantId, page, pageSize });
+        return json({ rows, total });
+      }
+
+      if (path === "/api/visual-learning/update-status" && request.method === "POST") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        let body: { sample_id?: string; status?: "validated" | "rejected" | "disabled" };
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          return json({ error: "Corpo da requisição inválido (JSON esperado)." }, 400);
+        }
+        if (!body.sample_id || typeof body.sample_id !== "string") {
+          return json({ error: "sample_id é obrigatório." }, 400);
+        }
+        if (!body.status || !["validated", "rejected", "disabled"].includes(body.status)) {
+          return json({ error: "status deve ser 'validated', 'rejected' ou 'disabled'." }, 400);
+        }
+
+        const admin = getSupabaseAdmin(env);
+        await updateLearningSampleStatus(admin, body.sample_id, body.status);
+        return json({ ok: true });
+      }
+
+      // --- "Criar Reconhecimento": treinamento guiado multi-ângulo (Catálogo Visual) ---
+      // Restrito a manager/admin — é uma ferramenta de curadoria da empresa,
+      // não uma ação operacional de conferência.
+      if (path === "/api/scan/assess-quality" && request.method === "POST") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        let body: { image_base64?: string };
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          return json({ error: "Corpo da requisição inválido (JSON esperado)." }, 400);
+        }
+        if (!body.image_base64 || typeof body.image_base64 !== "string") {
+          return json({ error: "image_base64 é obrigatório." }, 400);
+        }
+        let rawBuffer: Buffer;
+        try {
+          rawBuffer = Buffer.from(body.image_base64, "base64");
+        } catch {
+          return json({ error: "image_base64 inválido (não é base64 válido)." }, 400);
+        }
+        try {
+          const frame = await validateScanFrame(rawBuffer);
+          const assessment = await assessFrameQuality(frame.buffer);
+          return json(assessment);
+        } catch (err) {
+          if (err instanceof InvalidFrameError) return json({ error: err.message }, 422);
+          throw err;
+        }
+      }
+
+      if (path === "/api/visual-learning/admin-reference" && request.method === "POST") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        let body: { variant_id?: string; image_base64?: string; view_angle?: string | null };
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          return json({ error: "Corpo da requisição inválido (JSON esperado)." }, 400);
+        }
+        if (!body.variant_id || typeof body.variant_id !== "string") {
+          return json({ error: "variant_id é obrigatório." }, 400);
+        }
+        if (!body.image_base64 || typeof body.image_base64 !== "string") {
+          return json({ error: "image_base64 é obrigatório." }, 400);
+        }
+        let rawBuffer: Buffer;
+        try {
+          rawBuffer = Buffer.from(body.image_base64, "base64");
+        } catch {
+          return json({ error: "image_base64 inválido (não é base64 válido)." }, 400);
+        }
+
+        const admin = getSupabaseAdmin(env);
+        try {
+          const frame = await validateScanFrame(rawBuffer);
+          const result = await recordLearningSample(admin, {
+            variantId: body.variant_id,
+            imageBuffer: frame.buffer,
+            sourceType: "admin_upload",
+            originalPredictionId: null,
+            originalConfidence: null,
+            recognitionStatus: null,
+            correctedBy: null,
+            viewAngle: body.view_angle ?? null,
+          });
+          console.log(`[visual-learning/admin-reference] variant_id=${body.variant_id} view_angle=${body.view_angle ?? "-"} saved=${result.saved} reinforced=${result.reinforcedExisting} reason=${result.reason ?? "-"}`);
+          return json(result);
+        } catch (err) {
+          if (err instanceof InvalidFrameError) return json({ error: err.message }, 422);
+          throw err;
+        }
+      }
+
+      if (path === "/api/visual-learning/library-summary" && request.method === "GET") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        const variantId = url.searchParams.get("variant_id");
+        if (!variantId) return json({ error: "variant_id é obrigatório." }, 400);
+
+        const admin = getSupabaseAdmin(env);
+        const summary = await getLibrarySummary(admin, variantId);
+        return json(summary);
+      }
+
+      // --- "Nenhuma dessas opções" → produto ainda não cadastrado ---
+      // Qualquer usuário ativo pode abrir a pendência (é quem está no chão
+      // fazendo a conferência que esbarra num produto sem SKU cadastrado).
+      if (path === "/api/visual-learning/report-unclassified" && request.method === "POST") {
+        const auth = await requireActiveUser(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+
+        let body: { image_base64?: string; observation?: string | null };
+        try {
+          body = (await request.json()) as typeof body;
+        } catch {
+          return json({ error: "Corpo da requisição inválido (JSON esperado)." }, 400);
+        }
+        if (!body.image_base64 || typeof body.image_base64 !== "string") {
+          return json({ error: "image_base64 é obrigatório." }, 400);
+        }
+        let rawBuffer: Buffer;
+        try {
+          rawBuffer = Buffer.from(body.image_base64, "base64");
+        } catch {
+          return json({ error: "image_base64 inválido (não é base64 válido)." }, 400);
+        }
+
+        const admin = getSupabaseAdmin(env);
+        try {
+          const frame = await validateScanFrame(rawBuffer);
+          const result = await reportUnclassifiedProduct(admin, {
+            reportedBy: auth.profile.id,
+            imageBuffer: frame.buffer,
+            observation: typeof body.observation === "string" && body.observation.trim() ? body.observation.trim().slice(0, 2000) : null,
+          });
+          console.log(`[visual-learning/report-unclassified] reported_by=${auth.profile.id} report_id=${result.reportId}`);
+          return json(result);
+        } catch (err) {
+          if (err instanceof InvalidFrameError) return json({ error: err.message }, 422);
+          throw err;
         }
       }
 

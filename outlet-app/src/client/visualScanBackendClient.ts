@@ -47,6 +47,7 @@ export interface SimilarityMatch {
   storage_path: string | null;
   sku_code: string;
   product_name: string;
+  category: string | null;
   visual_family_key: string | null;
   variant_key: string | null;
   capacity_ml: number | null;

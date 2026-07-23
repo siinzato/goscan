@@ -6,6 +6,7 @@ import { renderHome } from "./screens/home.ts";
 import { renderConference } from "./screens/conference.ts";
 import { renderScan, teardownScan, unlockScanSound } from "./screens/scan.ts";
 import { renderCatalog } from "./screens/catalog.ts";
+import { teardownTraining } from "./screens/catalogVisual.ts";
 import { renderHistory } from "./screens/history.ts";
 import { renderProfile } from "./screens/profile.ts";
 
@@ -77,6 +78,7 @@ function renderCurrentScreen(): void {
   // Sair da tela de câmera precisa sempre encerrar as tracks — nunca deixar
   // a câmera aberta em segundo plano enquanto o usuário navega para outra aba.
   if (previousRoute === "escanear" && route !== "escanear") teardownScan();
+  if (previousRoute === "catalogo" && route !== "catalogo") teardownTraining();
   previousRoute = route;
 
   document.querySelectorAll<HTMLButtonElement>(".bottom-nav-btn").forEach((btn) => {
@@ -108,4 +110,5 @@ function renderCurrentScreen(): void {
 
 window.addEventListener("beforeunload", () => {
   if (previousRoute === "escanear") teardownScan();
+  if (previousRoute === "catalogo") teardownTraining();
 });

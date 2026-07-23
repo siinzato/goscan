@@ -29,13 +29,16 @@ import {
 } from "../../catalogImagesApi.ts";
 import { parseCatalogVisualSheet, buildImportPreview, createCatalogImageImport, type ImportPreview } from "../../catalogImagesImporter.ts";
 import { processImportBatch, resetImportErrors } from "../../catalogImagesBackendClient.ts";
+import { startCamera, blobToBase64, CameraPermissionDeniedError, CameraUnavailableError, type CameraController } from "../../scanCamera.ts";
+import { assessScanFrameQuality, recordAdminReference, getLibrarySummary, type LibrarySummary } from "../../visualLearningApi.ts";
+import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
 
 declare const XLSX: {
   read(data: ArrayBuffer): { SheetNames: string[]; Sheets: Record<string, unknown> };
   utils: { sheet_to_json(ws: unknown, opts?: Record<string, unknown>): unknown[][] };
 };
 
-type SubView = "list" | "detail" | "imports";
+type SubView = "list" | "detail" | "imports" | "training";
 let subView: SubView = "list";
 let selectedVariantId: string | null = null;
 
@@ -63,10 +66,17 @@ export async function renderCatalogVisualSection(root: HTMLElement): Promise<voi
 }
 
 async function renderCurrentSubView(body: HTMLElement): Promise<void> {
+  // Sair de qualquer subView pra uma diferente de "training" precisa sempre
+  // encerrar a câmera de treinamento — nunca deixar tracks abertas em segundo
+  // plano (mesmo princípio de teardownScan em scan.ts).
+  if (subView !== "training") teardownTraining();
+
   if (subView === "detail" && selectedVariantId) {
     await renderProductDetail(body, selectedVariantId);
   } else if (subView === "imports") {
     await renderImportsView(body);
+  } else if (subView === "training") {
+    await renderTrainingView(body);
   } else {
     await renderListView(body);
   }
@@ -125,7 +135,10 @@ async function renderListView(body: HTMLElement): Promise<void> {
     <div class="card">
       <div class="product-card-top">
         <h2 style="margin:0">Produtos</h2>
-        ${canManage ? `<button class="btn-secondary" id="btnGoImports">${Icon.fileUp}Importações</button>` : ""}
+        <div class="chip-row" style="margin:0">
+          ${canManage ? `<button class="btn-primary" id="btnGoTraining">${Icon.scan}Criar Reconhecimento</button>` : ""}
+          ${canManage ? `<button class="btn-secondary" id="btnGoImports">${Icon.fileUp}Importações</button>` : ""}
+        </div>
       </div>
       <div class="search-row">
         <label for="cvSearch" class="sr-only">Buscar por SKU ou nome</label>
@@ -148,6 +161,11 @@ async function renderListView(body: HTMLElement): Promise<void> {
 
   body.querySelector("#btnGoImports")?.addEventListener("click", () => {
     subView = "imports";
+    void renderCurrentSubView(body);
+  });
+  body.querySelector("#btnGoTraining")?.addEventListener("click", () => {
+    resetTrainingState();
+    subView = "training";
     void renderCurrentSubView(body);
   });
 
@@ -262,8 +280,10 @@ async function renderProductDetail(body: HTMLElement, variantId: string): Promis
   const canManage = isManagerOrAdmin(profile);
 
   let detail;
+  let librarySummary: LibrarySummary | null = null;
   try {
     detail = await getProductVisualDetail(variantId);
+    librarySummary = await getLibrarySummary(variantId).catch(() => null);
   } catch (err) {
     body.innerHTML = `<div class="error-box">Erro: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
     return;
@@ -285,6 +305,21 @@ async function renderProductDetail(body: HTMLElement, variantId: string): Promis
       </div>
       <p class="hint-text" style="margin:0">${activeImages.length} imagem(ns) ativa(s)${archivedImages.length ? `, ${archivedImages.length} arquivada(s)` : ""}</p>
     </div>
+
+    ${
+      librarySummary
+        ? `<div class="card">
+            <h2>Memória de reconhecimento</h2>
+            <div class="summary-grid">
+              <div class="summary-stat"><strong>${librarySummary.official_count}</strong><span>Fotos oficiais</span></div>
+              <div class="summary-stat"><strong>${librarySummary.admin_training_count}</strong><span>Treinamentos</span></div>
+              <div class="summary-stat"><strong>${librarySummary.corrected_count}</strong><span>Correções</span></div>
+              <div class="summary-stat"><strong>${librarySummary.confirmed_count}</strong><span>Confirmações</span></div>
+              <div class="summary-stat"><strong>${librarySummary.total}</strong><span>Total de referências</span></div>
+            </div>
+          </div>`
+        : ""
+    }
 
     ${
       canManage
@@ -714,4 +749,264 @@ async function toggleReport(importId: string): Promise<void> {
   } catch (err) {
     el.innerHTML = `<div class="error-box">${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// CRIAR RECONHECIMENTO — treinamento guiado multi-ângulo. Reaproveita a MESMA
+// câmera do Modo Scan (scanCamera.ts) e a MESMA busca de produto do modo
+// manual (catalogApi.ts) — nenhum SKU novo pode ser criado aqui, só vinculado
+// a um produto que já existe. Cada foto aceita vira uma referência real em
+// visual_learning_samples (source_type="admin_upload"), que entra IMEDIATAMENTE
+// na busca de reconhecimento (mesma tabela que scans confirmados/corrigidos
+// já alimentam) — sem precisar de novo deploy/reinício.
+// ---------------------------------------------------------------------------
+interface AngleStep {
+  key: string;
+  label: string;
+}
+const ANGLE_STEPS: AngleStep[] = [
+  { key: "frente", label: "Fotografe a frente do produto" },
+  { key: "traseira", label: "Agora fotografe a parte traseira" },
+  { key: "esquerda", label: "Agora fotografe o lado esquerdo" },
+  { key: "direita", label: "Agora fotografe o lado direito" },
+  { key: "superior", label: "Agora fotografe a parte superior (tampa)" },
+  { key: "base", label: "Agora fotografe a parte inferior (base)" },
+];
+
+interface CapturedShot {
+  angleKey: string;
+  base64: string;
+}
+
+type TrainingPhase = "capturing" | "select_product" | "submitting" | "done";
+
+let trainingCamera: CameraController | null = null;
+let trainingStepIndex = 0;
+let trainingCaptures: CapturedShot[] = [];
+let trainingPhase: TrainingPhase = "capturing";
+let trainingSelectedVariant: CatalogRow | null = null;
+let trainingSubmitResults: { angleKey: string; saved: boolean; reinforced: boolean; reason?: string }[] = [];
+let trainingError = "";
+
+function resetTrainingState(): void {
+  trainingStepIndex = 0;
+  trainingCaptures = [];
+  trainingPhase = "capturing";
+  trainingSelectedVariant = null;
+  trainingSubmitResults = [];
+  trainingError = "";
+}
+
+/** Nunca deixa a câmera de treinamento aberta em segundo plano — mesmo princípio de teardownScan (scan.ts). */
+export function teardownTraining(): void {
+  trainingCamera?.stop();
+  trainingCamera = null;
+}
+
+async function renderTrainingView(body: HTMLElement): Promise<void> {
+  if (trainingPhase === "capturing") {
+    await renderTrainingCapture(body);
+  } else if (trainingPhase === "select_product") {
+    renderTrainingProductSelect(body);
+  } else if (trainingPhase === "submitting") {
+    renderTrainingSubmitting(body);
+  } else {
+    renderTrainingDone(body);
+  }
+}
+
+async function renderTrainingCapture(body: HTMLElement): Promise<void> {
+  const step = ANGLE_STEPS[trainingStepIndex];
+  body.innerHTML = `
+    <button class="link-btn" id="trainCancel" style="text-align:left">${Icon.chevronLeft} Cancelar treinamento</button>
+    <div class="card">
+      <h2>Criar Reconhecimento</h2>
+      <p class="hint-text">Etapa ${trainingStepIndex + 1} de ${ANGLE_STEPS.length} — ${trainingCaptures.length} foto(s) capturada(s) até agora.</p>
+      <div class="scan-camera-wrap" style="position:relative;max-width:420px">
+        <video id="trainVideo" class="scan-video" playsinline muted></video>
+      </div>
+      <p class="scan-found-title" style="margin-top:12px">${escapeHtml(step.label)}</p>
+      <div id="trainCaptureStatus" role="status" aria-live="polite"></div>
+      <div class="scan-actions">
+        <button class="btn-primary btn-block" id="trainCaptureBtn">${Icon.camera}Capturar</button>
+        <button class="btn-secondary btn-block" id="trainSkipBtn">Pular esta etapa</button>
+      </div>
+    </div>`;
+
+  body.querySelector("#trainCancel")!.addEventListener("click", () => {
+    teardownTraining();
+    subView = "list";
+    void renderCurrentSubView(body);
+  });
+
+  const videoEl = body.querySelector<HTMLVideoElement>("#trainVideo")!;
+  try {
+    if (!trainingCamera) {
+      trainingCamera = await startCamera(videoEl, "environment");
+    }
+  } catch (err) {
+    const statusEl = body.querySelector("#trainCaptureStatus")!;
+    const message =
+      err instanceof CameraPermissionDeniedError
+        ? "Permissão de câmera negada. Habilite o acesso à câmera nas configurações do navegador."
+        : err instanceof CameraUnavailableError
+          ? "Não foi possível acessar a câmera: " + err.message
+          : "Erro inesperado ao abrir a câmera.";
+    statusEl.innerHTML = `<p class="error-box">${escapeHtml(message)}</p>`;
+    return;
+  }
+
+  body.querySelector("#trainSkipBtn")!.addEventListener("click", () => {
+    advanceTrainingStep(body);
+  });
+
+  body.querySelector("#trainCaptureBtn")!.addEventListener("click", async () => {
+    const btn = body.querySelector<HTMLButtonElement>("#trainCaptureBtn")!;
+    const statusEl = body.querySelector("#trainCaptureStatus")!;
+    btn.disabled = true;
+    statusEl.innerHTML = `<p class="hint-text">Analisando qualidade da foto…</p>`;
+    try {
+      const blob = await trainingCamera!.captureFrameBlob(900, 0.9);
+      if (!blob) {
+        statusEl.innerHTML = `<p class="error-box">Não foi possível capturar o quadro. Tente novamente.</p>`;
+        return;
+      }
+      const base64 = await blobToBase64(blob);
+      const assessment = await assessScanFrameQuality(base64);
+      if (!assessment.ok) {
+        statusEl.innerHTML = `<p class="error-box">${escapeHtml(assessment.reason || "Qualidade insuficiente.")} Capture novamente.</p>`;
+        return;
+      }
+      trainingCaptures.push({ angleKey: step.key, base64 });
+      statusEl.innerHTML = `<p class="hint-text" style="color:var(--go-success-600, green)">${Icon.checkCircle} Foto aceita.</p>`;
+      advanceTrainingStep(body);
+    } catch (err) {
+      statusEl.innerHTML = `<div class="error-box">Erro: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+function advanceTrainingStep(body: HTMLElement): void {
+  trainingStepIndex++;
+  if (trainingStepIndex >= ANGLE_STEPS.length) {
+    teardownTraining();
+    trainingPhase = "select_product";
+  }
+  void renderTrainingView(body);
+}
+
+function renderTrainingProductSelect(body: HTMLElement): void {
+  body.innerHTML = `
+    <div class="card">
+      <h2>Selecione o produto</h2>
+      <p class="hint-text">${trainingCaptures.length} foto(s) prontas. Vincule a um produto já existente no catálogo — não é possível criar um SKU novo aqui.</p>
+      <input type="text" id="trainProductSearch" placeholder="Buscar por SKU, nome, categoria, família ou capacidade…" />
+      <div id="trainProductResults" class="scan-manual-results"></div>
+    </div>`;
+
+  const input = body.querySelector<HTMLInputElement>("#trainProductSearch")!;
+  const results = body.querySelector("#trainProductResults")!;
+  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  input.addEventListener("input", () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(async () => {
+      const rows = input.value.trim() ? await searchSkuForPicker(input.value, 15) : [];
+      renderTrainingProductResults(results, rows, body);
+    }, 300);
+  });
+}
+
+function renderTrainingProductResults(resultsEl: Element, rows: CatalogRow[], body: HTMLElement): void {
+  if (rows.length === 0) {
+    resultsEl.innerHTML = `<p class="hint-text">Nenhum SKU encontrado.</p>`;
+    return;
+  }
+  resultsEl.innerHTML = rows
+    .map(
+      (r) =>
+        `<button type="button" class="sku-picker-item" data-variant="${r.variant_id}">${escapeHtml(r.produto)} — ${escapeHtml(r.cor || "")} <span class="sku-code">${escapeHtml(r.sku_code)}</span></button>`
+    )
+    .join("");
+  resultsEl.querySelectorAll<HTMLButtonElement>(".sku-picker-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const row = rows.find((r) => r.variant_id === btn.dataset.variant)!;
+      trainingSelectedVariant = row;
+      trainingPhase = "submitting";
+      void renderTrainingView(body);
+    });
+  });
+}
+
+function renderTrainingSubmitting(body: HTMLElement): void {
+  body.innerHTML = `
+    <div class="card">
+      <h2>Enviando referências…</h2>
+      <p class="hint-text">${escapeHtml(trainingSelectedVariant?.produto ?? "")} <span class="sku-code">${escapeHtml(trainingSelectedVariant?.sku_code ?? "")}</span></p>
+      <div class="progress-bar-track"><div class="progress-bar-fill" id="trainProgressFill" style="width:0%"></div></div>
+      <p class="hint-text" id="trainProgressText">Iniciando…</p>
+    </div>`;
+  void submitTrainingCaptures(body);
+}
+
+async function submitTrainingCaptures(body: HTMLElement): Promise<void> {
+  const variant = trainingSelectedVariant;
+  if (!variant) return;
+  trainingSubmitResults = [];
+  for (let i = 0; i < trainingCaptures.length; i++) {
+    const capture = trainingCaptures[i];
+    try {
+      const result = await recordAdminReference({ variant_id: variant.variant_id, image_base64: capture.base64, view_angle: capture.angleKey });
+      trainingSubmitResults.push({ angleKey: capture.angleKey, saved: result.saved, reinforced: result.reinforcedExisting, reason: result.reason });
+    } catch (err) {
+      trainingSubmitResults.push({ angleKey: capture.angleKey, saved: false, reinforced: false, reason: err instanceof Error ? err.message : String(err) });
+    }
+    const fill = body.querySelector<HTMLElement>("#trainProgressFill");
+    const text = body.querySelector("#trainProgressText");
+    if (fill) fill.style.width = `${Math.round(((i + 1) / trainingCaptures.length) * 100)}%`;
+    if (text) text.textContent = `${i + 1} de ${trainingCaptures.length} processada(s)…`;
+  }
+  trainingPhase = "done";
+  void renderTrainingView(body);
+}
+
+function renderTrainingDone(body: HTMLElement): void {
+  const saved = trainingSubmitResults.filter((r) => r.saved).length;
+  const reinforced = trainingSubmitResults.filter((r) => r.reinforced).length;
+  const rejected = trainingSubmitResults.filter((r) => !r.saved && !r.reinforced).length;
+
+  body.innerHTML = `
+    <div class="card success">
+      <h2>${Icon.checkCircle} Reconhecimento criado</h2>
+      <p>${escapeHtml(trainingSelectedVariant?.produto ?? "")} <span class="sku-code">${escapeHtml(trainingSelectedVariant?.sku_code ?? "")}</span></p>
+      <div class="summary-grid">
+        <div class="summary-stat"><strong>${saved}</strong><span>Novas referências</span></div>
+        <div class="summary-stat"><strong>${reinforced}</strong><span>Reforçaram referência existente</span></div>
+        <div class="summary-stat ${rejected ? "warn" : ""}"><strong>${rejected}</strong><span>Rejeitadas (qualidade)</span></div>
+      </div>
+      ${
+        rejected > 0
+          ? `<p class="hint-text">Fotos rejeitadas: ${trainingSubmitResults
+              .filter((r) => !r.saved && !r.reinforced)
+              .map((r) => `${escapeHtml(r.angleKey)} (${escapeHtml(r.reason ?? "")})`)
+              .join(", ")}</p>`
+          : ""
+      }
+      <p class="hint-text">Essas referências já participam do próximo escaneamento — sem precisar reiniciar nada.</p>
+      <div class="scan-actions">
+        <button class="btn-primary btn-block" id="trainAgain">Treinar outro produto</button>
+        <button class="btn-secondary btn-block" id="trainBackToList">Voltar ao catálogo</button>
+      </div>
+    </div>`;
+
+  body.querySelector("#trainAgain")!.addEventListener("click", () => {
+    resetTrainingState();
+    void renderCurrentSubView(body);
+  });
+  body.querySelector("#trainBackToList")!.addEventListener("click", () => {
+    resetTrainingState();
+    subView = "list";
+    void renderCurrentSubView(body);
+  });
 }

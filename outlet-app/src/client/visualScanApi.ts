@@ -7,6 +7,7 @@ export interface VisualClassificationRow {
   product_id: string;
   product_name: string;
   model_code: string | null;
+  category: string | null;
   visual_family_key: string | null;
   capacity_ml: number | null;
   recognition_group: string | null;
@@ -38,7 +39,7 @@ export async function listVisualClassification(
 
   let builder = supabase
     .from("products")
-    .select("id, name, model_code, visual_family_key, capacity_ml, recognition_group, active, product_variants(id, sku_code, color, variant_key, active, product_images(recognition_enabled, is_active))", {
+    .select("id, name, model_code, category, visual_family_key, capacity_ml, recognition_group, active, product_variants(id, sku_code, color, variant_key, active, product_images(recognition_enabled, is_active))", {
       count: "exact",
     })
     .order("model_code", { ascending: true })
@@ -57,6 +58,7 @@ export async function listVisualClassification(
     product_id: p.id,
     product_name: p.name,
     model_code: p.model_code,
+    category: p.category,
     visual_family_key: p.visual_family_key,
     capacity_ml: p.capacity_ml,
     recognition_group: p.recognition_group,
@@ -76,7 +78,7 @@ export async function listVisualClassification(
 
 export async function updateProductClassification(
   productId: string,
-  patch: { visual_family_key?: string | null; capacity_ml?: number | null; recognition_group?: string | null }
+  patch: { category?: string | null; visual_family_key?: string | null; capacity_ml?: number | null; recognition_group?: string | null }
 ): Promise<void> {
   const supabase = getSupabase();
   const { error } = await supabase.from("products").update(patch).eq("id", productId);

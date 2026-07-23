@@ -11,7 +11,7 @@
     "preview": "node run-local.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "node --test tests/",
+    "test": "node --test tests/*.test.mjs",
     "generate-seed-sql": "node scripts/generate-seed-sql.mjs"
   },
   "dependencies": {

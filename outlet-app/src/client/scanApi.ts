@@ -13,6 +13,7 @@ export interface RecognizeCandidate {
   imagem: string | null;
   storage_path: string | null;
   capacity_ml: number | null;
+  category: string | null;
   visual_family_key: string | null;
   variant_key: string | null;
   score: number;
@@ -27,9 +28,12 @@ export interface RecognizeResult {
   candidates: RecognizeCandidate[];
   visual_family: string | null;
   variant: string | null;
+  detected_category: string | null;
+  detected_family: string | null;
   requires_capacity_selection: boolean;
   processing_time_ms: number;
   used_pgvector: boolean;
+  code?: "NO_EMBEDDINGS_FOUND" | "NO_MATCH_ABOVE_THRESHOLD" | "CATEGORY_MISMATCH" | "CATEGORY_UNCERTAIN" | "FAMILY_MISMATCH";
 }
 
 export function recognizeFrame(conferenceId: string, imageBase64: string): Promise<RecognizeResult> {

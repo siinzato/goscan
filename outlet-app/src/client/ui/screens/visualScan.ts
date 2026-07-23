@@ -21,11 +21,13 @@ import {
   testQueryByUpload,
   type SimilarityMatch,
 } from "../../visualScanBackendClient.ts";
+import { listLearningSamples, updateLearningSampleStatus, getLearningSampleSignedUrl, type LearningSampleRow } from "../../visualLearningApi.ts";
 
 let classificationPage = 0;
 const PAGE_SIZE = 20;
 let onlyUnclassified = false;
 let classificationQuery = "";
+let learningStatusFilter = "pending";
 
 export async function renderVisualScanSection(root: HTMLElement): Promise<void> {
   root.innerHTML = `
@@ -47,6 +49,18 @@ export async function renderVisualScanSection(root: HTMLElement): Promise<void> 
         <input type="text" id="vsClassQuery" placeholder="Buscar produto ou código do modelo…" />
         <label class="checkbox-label"><input type="checkbox" id="vsOnlyUnclassified" /> Só não classificados</label>
       </div>
+      <datalist id="scanCategoryOptions">
+        <option value="copo"></option>
+        <option value="garrafa"></option>
+        <option value="mochila"></option>
+        <option value="bolsa"></option>
+        <option value="mala"></option>
+        <option value="case"></option>
+        <option value="lancheira"></option>
+        <option value="acessorio"></option>
+        <option value="pet"></option>
+        <option value="outros"></option>
+      </datalist>
       <div id="vsClassificationWrap"><p class="hint-text">Carregando…</p></div>
       <div class="pagination">
         <button class="icon-btn" id="vsPrevPage" disabled aria-label="Página anterior">${Icon.chevronLeft}</button>
@@ -60,11 +74,26 @@ export async function renderVisualScanSection(root: HTMLElement): Promise<void> 
       <p class="hint-text">Sem câmera — usa uma imagem já do catálogo ou um upload manual como consulta e mostra os produtos mais parecidos. O score nunca usa nome/SKU, só o vetor visual.</p>
       <div id="vsTestPanel"><p class="hint-text">Carregando imagens disponíveis…</p></div>
       <div id="vsTestResults"></div>
+    </div>
+
+    <div class="card">
+      <h2>${Icon.layers}Memória visual (aprendizado com scans reais)</h2>
+      <p class="hint-text">Capturas de câmera confirmadas ou corrigidas por operadores. Só entram na comparação de reconhecimento quando aprovadas aqui. Fotos oficiais do catálogo continuam com prioridade — isso é só um complemento.</p>
+      <div class="search-row">
+        <select id="vsLearningStatus" aria-label="Filtrar por status">
+          <option value="pending">Pendentes</option>
+          <option value="validated">Validadas (em uso)</option>
+          <option value="rejected">Rejeitadas</option>
+          <option value="disabled">Desativadas</option>
+        </select>
+      </div>
+      <div id="vsLearningWrap"><p class="hint-text">Carregando…</p></div>
     </div>`;
 
   await loadSummary(root);
   await loadClassification(root);
   await loadTestPanel(root);
+  await loadLearningSamples(root);
 
   root.querySelector("#vsBtnProcess")!.addEventListener("click", () => void runProcessLoop(root));
   root.querySelector("#vsBtnResetErrors")!.addEventListener("click", async () => {
@@ -96,6 +125,13 @@ export async function renderVisualScanSection(root: HTMLElement): Promise<void> 
   root.querySelector("#vsNextPage")!.addEventListener("click", () => {
     classificationPage++;
     void loadClassification(root);
+  });
+
+  const learningSelect = root.querySelector<HTMLSelectElement>("#vsLearningStatus")!;
+  learningSelect.value = learningStatusFilter;
+  learningSelect.addEventListener("change", () => {
+    learningStatusFilter = learningSelect.value;
+    void loadLearningSamples(root);
   });
 }
 
@@ -179,6 +215,9 @@ function renderClassificationRows(wrap: Element, rows: VisualClassificationRow[]
           <span class="sku-code">${escapeHtml(p.model_code || "-")}</span>
         </div>
         <div class="classification-fields">
+          <label>Categoria
+            <input type="text" data-field="category" data-product="${p.product_id}" value="${escapeHtml(p.category || "")}" placeholder="ex.: copo, garrafa" list="scanCategoryOptions" />
+          </label>
           <label>Família visual
             <input type="text" data-field="visual_family_key" data-product="${p.product_id}" value="${escapeHtml(p.visual_family_key || "")}" placeholder="ex.: copo-life" />
           </label>
@@ -214,12 +253,14 @@ function renderClassificationRows(wrap: Element, rows: VisualClassificationRow[]
     btn.addEventListener("click", async () => {
       const productId = btn.dataset.saveClassification!;
       const card = wrap.querySelector(`[data-product-row="${productId}"]`)!;
+      const categoryEl = card.querySelector<HTMLInputElement>('[data-field="category"]')!;
       const familyEl = card.querySelector<HTMLInputElement>('[data-field="visual_family_key"]')!;
       const capacityEl = card.querySelector<HTMLInputElement>('[data-field="capacity_ml"]')!;
       const groupEl = card.querySelector<HTMLInputElement>('[data-field="recognition_group"]')!;
 
       try {
         await updateProductClassification(productId, {
+          category: categoryEl.value.trim() || null,
           visual_family_key: familyEl.value.trim() || null,
           capacity_ml: capacityEl.value.trim() ? Number(capacityEl.value) : null,
           recognition_group: groupEl.value.trim() || null,
@@ -327,11 +368,12 @@ async function runTest(root: HTMLElement, run: () => Promise<{ query_source: str
           </div>
           <div class="product-card-meta">
             <span class="sku-code">${escapeHtml(m.sku_code)}</span>
+            <span>${escapeHtml(m.category || "-")}</span>
             <span>${escapeHtml(m.visual_family_key || "-")}</span>
             <span>${escapeHtml(m.variant_key || "-")}</span>
             <span>${m.capacity_ml ? m.capacity_ml + "ml" : "-"}</span>
           </div>
-          <p class="hint-text">score bruto: ${m.score_raw.toFixed(4)} · score normalizado: ${(m.score_normalized * 100).toFixed(1)}%</p>
+          <p class="hint-text">distância: ${m.distance.toFixed(4)} · score bruto: ${m.score_raw.toFixed(4)} · score normalizado: ${(m.score_normalized * 100).toFixed(1)}%</p>
         </div>`;
       })
     );
@@ -339,4 +381,74 @@ async function runTest(root: HTMLElement, run: () => Promise<{ query_source: str
   } catch (err) {
     wrap.innerHTML = `<div class="error-box">Erro no teste: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
   }
+}
+
+const SOURCE_TYPE_LABEL: Record<string, string> = {
+  official_catalog: "Foto oficial",
+  confirmed_scan: "Scan confirmado",
+  corrected_scan: "Scan corrigido",
+  admin_upload: "Upload manual (admin)",
+};
+
+async function loadLearningSamples(root: HTMLElement): Promise<void> {
+  const wrap = root.querySelector("#vsLearningWrap")!;
+  wrap.innerHTML = `<p class="hint-text">Carregando…</p>`;
+  try {
+    const { rows, total } = await listLearningSamples({ status: learningStatusFilter, pageSize: 30 });
+    if (rows.length === 0) {
+      wrap.innerHTML = `<p class="hint-text">Nenhuma referência ${learningStatusFilter === "pending" ? "pendente" : "neste status"}.</p>`;
+      return;
+    }
+
+    const cardsHtml = await Promise.all(
+      rows.map(async (s) => {
+        const url = await getLearningSampleSignedUrl(s.storage_path, 300);
+        return renderLearningSampleCard(s, url);
+      })
+    );
+    wrap.innerHTML = `<p class="hint-text">${total} referência(s) neste status.</p>${cardsHtml.join("")}`;
+
+    wrap.querySelectorAll<HTMLButtonElement>("[data-learning-action]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const sampleId = btn.dataset.sampleId!;
+        const status = btn.dataset.learningAction as "validated" | "rejected" | "disabled";
+        try {
+          await updateLearningSampleStatus(sampleId, status);
+          showToast("Status da referência atualizado.", "success");
+          await loadLearningSamples(root);
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : String(err), "error");
+        }
+      });
+    });
+  } catch (err) {
+    wrap.innerHTML = `<div class="error-box">Erro ao carregar memória visual: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+  }
+}
+
+function renderLearningSampleCard(s: LearningSampleRow, imgUrl: string | null): string {
+  const correctedInfo = s.corrected_by ? `<span class="hint-text">Corrigido por operador em ${new Date(s.corrected_at || s.created_at).toLocaleString("pt-BR")}</span>` : "";
+  return `
+    <div class="product-card">
+      <div class="product-card-top">
+        ${imgUrl ? `<img class="thumb-img" src="${imgUrl}" alt="" />` : `<span class="thumb-placeholder">${Icon.imageOff}</span>`}
+        <p class="product-card-name">${escapeHtml(s.product_name ?? "")}</p>
+      </div>
+      <div class="product-card-meta">
+        <span class="sku-code">${escapeHtml(s.sku_code ?? "")}</span>
+        <span>${escapeHtml(s.category || "-")}</span>
+        <span>${escapeHtml(s.family || "-")}</span>
+        <span>${s.capacity_ml ? s.capacity_ml + "ml" : "-"}</span>
+      </div>
+      <p class="hint-text">
+        ${SOURCE_TYPE_LABEL[s.source_type] ?? s.source_type} · confirmações: ${s.confirmation_count} · qualidade: ${s.quality_score != null ? (s.quality_score * 100).toFixed(0) + "%" : "-"}
+        ${s.original_confidence != null ? ` · confiança original: ${(s.original_confidence * 100).toFixed(0)}%` : ""}
+      </p>
+      ${correctedInfo}
+      <div class="review-actions">
+        ${s.validation_status !== "validated" ? `<button class="btn-secondary" data-learning-action="validated" data-sample-id="${s.id}">Aprovar</button>` : ""}
+        ${s.validation_status !== "rejected" ? `<button class="btn-secondary" data-learning-action="rejected" data-sample-id="${s.id}">Rejeitar</button>` : ""}
+        ${s.validation_status !== "disabled" ? `<button class="btn-secondary" data-learning-action="disabled" data-sample-id="${s.id}">Desativar</button>` : ""}
+      </div>
+    </div>`;
 }

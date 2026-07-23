@@ -285,9 +285,99 @@ export interface SimilarityMatch {
   storage_path: string | null;
   sku_code: string;
   product_name: string;
+  category: string | null;
   visual_family_key: string | null;
   variant_key: string | null;
   capacity_ml: number | null;
+  /** "catalog": foto oficial (product_images). "learned": referência da memória visual (visual_learning_samples, migration 0016) — ver visualLearning.ts. */
+  source: "catalog" | "learned";
+}
+
+interface LearningSampleJoinRow {
+  id: string;
+  product_id: string;
+  variant_id: string;
+  storage_path: string;
+  category: string | null;
+  family: string | null;
+  capacity_ml: number | null;
+  color: string | null;
+  sku_code: string;
+  product_name: string;
+}
+
+/**
+ * Busca nas referências APRENDIDAS (scans confirmados/corrigidos por
+ * operadores, migration 0016) — mesmo padrão de findSimilarImages: tenta
+ * pgvector primeiro, cai para JS se indisponível. Só "validated"+"active"
+ * participam; nunca inclui pending/rejected/disabled.
+ */
+async function findSimilarLearningSamples(
+  admin: SupabaseClient,
+  queryVector: number[],
+  limit: number
+): Promise<SimilarityMatch[]> {
+  const { data: rpcData, error: rpcError } = await admin.rpc("match_visual_learning_samples", {
+    query_embedding: queryVector,
+    match_model: MODEL_NAME,
+    match_model_version: MODEL_VERSION,
+    match_count: limit,
+  });
+
+  let ranked: { sample_id: string; distance: number }[];
+  if (!rpcError && rpcData) {
+    ranked = (rpcData as { sample_id: string; distance: number }[]).map((r) => ({ sample_id: r.sample_id, distance: r.distance }));
+  } else {
+    const { data: rows, error: rowsError } = await admin
+      .from("visual_learning_samples")
+      .select("id, embedding")
+      .eq("model_name", MODEL_NAME)
+      .eq("model_version", MODEL_VERSION)
+      .eq("validation_status", "validated")
+      .eq("active", true)
+      .not("embedding", "is", null);
+    if (rowsError) throw rowsError; // função pode não existir se 0016 não foi aplicada — erro real, não silencia
+    ranked = ((rows as { id: string; embedding: number[] }[]) || [])
+      .map((r) => ({ sample_id: r.id, distance: 1 - cosineSimilarity(queryVector, r.embedding) }))
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, limit);
+  }
+  if (ranked.length === 0) return [];
+
+  // Refiltra pelo estado ATUAL — mesmo princípio de findSimilarImages: uma
+  // amostra pode ter sido desativada pelo admin depois de "ready".
+  const sampleIds = ranked.map((r) => r.sample_id);
+  const { data: samplesData, error: samplesError } = await admin
+    .from("visual_learning_samples")
+    .select("id, product_id, variant_id, storage_path, category, family, capacity_ml, color, sku_code, product_name")
+    .in("id", sampleIds)
+    .eq("validation_status", "validated")
+    .eq("active", true);
+  if (samplesError) throw samplesError;
+
+  const byId = new Map((samplesData as LearningSampleJoinRow[]).map((row) => [row.id, row]));
+  return ranked
+    .map((r): SimilarityMatch | null => {
+      const row = byId.get(r.sample_id);
+      if (!row) return null;
+      return {
+        product_image_id: row.id, // amostra aprendida não tem product_image_id real — usa o próprio id da amostra
+        product_id: row.product_id,
+        variant_id: row.variant_id,
+        distance: r.distance,
+        score_raw: 1 - r.distance,
+        score_normalized: 0, // recalculado depois do merge com o pool completo
+        storage_path: row.storage_path,
+        sku_code: row.sku_code,
+        product_name: row.product_name,
+        category: row.category,
+        visual_family_key: row.family,
+        variant_key: row.color,
+        capacity_ml: row.capacity_ml,
+        source: "learned",
+      };
+    })
+    .filter((m): m is SimilarityMatch => m !== null);
 }
 
 /**
@@ -340,7 +430,7 @@ export async function findSimilarImages(
       id: string;
       sku_code: string;
       variant_key: string | null;
-      products: { id: string; name: string; visual_family_key: string | null; capacity_ml: number | null };
+      products: { id: string; name: string; category: string | null; visual_family_key: string | null; capacity_ml: number | null };
     } | null;
   }
 
@@ -350,7 +440,7 @@ export async function findSimilarImages(
   const imageIds = ranked.map((r) => r.product_image_id);
   const { data: imagesData, error: imagesError } = await admin
     .from("product_images")
-    .select("id, storage_path, product_variants!inner(id, sku_code, variant_key, products!inner(id, name, visual_family_key, capacity_ml))")
+    .select("id, storage_path, product_variants!inner(id, sku_code, variant_key, products!inner(id, name, category, visual_family_key, capacity_ml))")
     .in("id", imageIds)
     .eq("is_active", true)
     .is("archived_at", null)
@@ -364,7 +454,7 @@ export async function findSimilarImages(
   const maxDistance = Math.max(...ranked.map((r) => r.distance), 1e-9);
 
   const matches: SimilarityMatch[] = ranked
-    .map((r) => {
+    .map((r): SimilarityMatch | null => {
       const row = byId.get(r.product_image_id);
       if (!row) return null;
       const variant = row.product_variants;
@@ -381,12 +471,31 @@ export async function findSimilarImages(
         storage_path: row.storage_path,
         sku_code: variant?.sku_code ?? "",
         product_name: product?.name ?? "",
+        category: product?.category ?? null,
         visual_family_key: product?.visual_family_key ?? null,
         variant_key: variant?.variant_key ?? null,
         capacity_ml: product?.capacity_ml ?? null,
+        source: "catalog" as const,
       };
     })
     .filter((m): m is SimilarityMatch => m !== null);
 
-  return { matches, usedPgvector };
+  // Memória visual (migration 0016): referências de scans reais confirmados/
+  // corrigidos por operadores participam do MESMO pool de busca, não de uma
+  // lista separada — mesclado aqui e reordenado por distância antes de
+  // devolver, pra que groupByProduct (scanRecognize.ts) trate as duas fontes
+  // igual. Erro ao buscar aprendizado não derruba o reconhecimento normal —
+  // fotos oficiais continuam funcionando mesmo se a memória visual falhar.
+  let learned: SimilarityMatch[] = [];
+  try {
+    learned = await findSimilarLearningSamples(admin, queryVector, limit);
+  } catch (err) {
+    console.warn("[visualEmbeddings] falha ao buscar memória visual (seguindo só com catálogo oficial):", err instanceof Error ? err.message : err);
+  }
+
+  const merged = [...matches, ...learned].sort((a, b) => a.distance - b.distance).slice(0, limit);
+  const mergedMaxDistance = Math.max(...merged.map((m) => m.distance), 1e-9);
+  const normalized = merged.map((m) => ({ ...m, score_normalized: Math.max(0, 1 - m.distance / mergedMaxDistance) }));
+
+  return { matches: normalized, usedPgvector };
 }

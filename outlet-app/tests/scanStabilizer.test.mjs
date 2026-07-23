@@ -12,9 +12,10 @@ test("stabilityKeyFor uses family+variant when capacity selection is required", 
     requires_capacity_selection: true,
     visual_family: "copo-life",
     variant: "pink",
+    detected_category: "copo",
     candidates: [{ product_id: "p1" }],
   });
-  assert.equal(key, "family:copo-life:pink");
+  assert.equal(key, "cat:copo:family:copo-life:pink");
 });
 
 test("stabilityKeyFor uses top candidate product_id when matched", () => {
@@ -23,9 +24,20 @@ test("stabilityKeyFor uses top candidate product_id when matched", () => {
     requires_capacity_selection: false,
     visual_family: "copo-life",
     variant: "pink",
+    detected_category: "copo",
     candidates: [{ product_id: "p1" }, { product_id: "p2" }],
   });
-  assert.equal(key, "p1");
+  assert.equal(key, "cat:copo:p1");
+});
+
+test("stabilityKeyFor reinicia a estabilidade quando a categoria detectada muda, mesmo com o mesmo produto/família", () => {
+  // BUG REAL: em teste físico, o mesmo objeto parado oscilava entre
+  // categoria "garrafa" e "copo" de ciclo a ciclo (ruído de frame). A chave
+  // precisa refletir essa mudança pra nunca estabilizar por acaso.
+  const base = { status: "matched", requires_capacity_selection: false, visual_family: null, variant: null, candidates: [{ product_id: "p1" }] };
+  const keyAsGarrafa = stabilityKeyFor({ ...base, detected_category: "garrafa" });
+  const keyAsCopo = stabilityKeyFor({ ...base, detected_category: "copo" });
+  assert.notEqual(keyAsGarrafa, keyAsCopo);
 });
 
 test("Stabilizer only reports stable after N consecutive identical keys", () => {

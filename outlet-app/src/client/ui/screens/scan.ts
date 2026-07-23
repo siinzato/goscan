@@ -15,6 +15,7 @@ import { recognizeFrame, type RecognizeResult, type RecognizeCandidate } from ".
 import { Stabilizer, stabilityKeyFor } from "../../scanStabilizer.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
 import { getSignedImageUrl } from "../../visualScanApi.ts";
+import { recordScanLearning, reportUnclassifiedProduct } from "../../visualLearningApi.ts";
 import { startOrResumeConference, addItem, subscribeSession, type Session } from "../../conferenceSession.ts";
 
 type ScanState =
@@ -33,7 +34,12 @@ type ScanState =
   | "offline";
 
 const TICK_INTERVAL_MS = 1000;
-const STABLE_CONSECUTIVE = 2;
+// BUG REAL corrigido: teste físico no iPhone mostrou a categoria detectada
+// pelo backend (garrafa vs copo) oscilando de ciclo a ciclo pro MESMO objeto
+// parado — 2 leituras seguidas por acaso na categoria errada já bastavam
+// pra "estabilizar" (ver stabilityKeyFor). Subir pra 3 dá mais defesa contra
+// esse ruído real, com custo de ~1s a mais até a primeira sugestão.
+const STABLE_CONSECUTIVE = 3;
 const NO_RESULT_STREAK_TO_SHOW = 3;
 const COOLDOWN_MIN_MS = 2000;
 // Calibrado na Parte 5: 480px/0.7 preservava mal detalhes finos (logo, brilho
@@ -52,6 +58,14 @@ let selectedCandidate: RecognizeCandidate | null = null;
 let selectedViaManualSearch = false;
 let quantity = 1;
 let errorMessage = "";
+
+// Memória visual: o frame + resultado da ÚLTIMA tentativa de reconhecimento
+// (independente de ter estabilizado ou não), usados pra alimentar o
+// aprendizado quando o operador confirma/corrige — precisam sobreviver a
+// entrar em "manual_search" (o loop de análise para, mas o contexto da
+// última tentativa real continua sendo o certo pra registrar).
+let lastAnalyzedFrameBase64: string | null = null;
+let lastRecognitionAttempt: RecognizeResult | null = null;
 
 let stabilizer = new Stabilizer(STABLE_CONSECUTIVE, 6);
 let noResultStreak = 0;
@@ -265,6 +279,11 @@ async function tick(): Promise<void> {
     if (mySeq !== requestSeq) return; // uma requisição mais nova já foi disparada
     const result = await recognizeFrame(currentSession.conference.id, base64);
     if (mySeq !== requestSeq) return; // resposta obsoleta — descarta
+    // Sempre atualiza, independente de a leitura ter estabilizado — é o
+    // contexto usado pra registrar aprendizado (recognition_id/confiança da
+    // TENTATIVA real, não só das que viraram sugestão na tela).
+    lastAnalyzedFrameBase64 = base64;
+    lastRecognitionAttempt = result;
     handleResult(result);
   } catch (err) {
     if (mySeq !== requestSeq) return;
@@ -348,15 +367,37 @@ function renderOverlay(): void {
       sheet.querySelector("#scanManualFromError")!.addEventListener("click", () => setState("manual_search"));
       break;
 
-    case "no_result":
+    case "no_result": {
+      // BUG REAL corrigido: esta checagem usava `currentResult`, que
+      // handleResult() nunca atualiza no caminho de no_result (key===null
+      // retorna cedo) — ficava com o código de uma leitura ESTÁVEL antiga,
+      // não da tentativa atual. `lastRecognitionAttempt` é atualizado a
+      // cada tick, sem depender de estabilização — reflete a tentativa real
+      // que gerou este "não reconhecido".
+      //
+      // CATEGORY_MISMATCH/CATEGORY_UNCERTAIN: categoria não pôde ser
+      // confirmada com segurança. FAMILY_MISMATCH: categoria certa, mas
+      // nenhum candidato da família detectada sobrou. ASPECT_RATIO_MISMATCH:
+      // a proporção altura/largura medida do objeto é incompatível com a
+      // categoria (ex.: embedding achou "garrafa", mas o objeto medido é
+      // visivelmente baixo/largo, formato de copo). Mensagem diferente da
+      // genérica "não reconhecido" pra deixar claro que foi uma rejeição de
+      // segurança, não falta de nitidez.
+      const safetyRejectCodes = ["CATEGORY_MISMATCH", "CATEGORY_UNCERTAIN", "FAMILY_MISMATCH", "ASPECT_RATIO_MISMATCH"];
+      const isCategorySafetyReject = !!lastRecognitionAttempt?.code && safetyRejectCodes.includes(lastRecognitionAttempt.code);
       sheet.innerHTML = `
         <div class="scan-card">
-          <p>Produto não reconhecido.</p>
-          <p class="hint-text">Aproxime mais o produto da câmera ou busque manualmente.</p>
+          <p>${isCategorySafetyReject ? "Não foi possível reconhecer este produto com segurança." : "Produto não reconhecido."}</p>
+          <p class="hint-text">${
+            isCategorySafetyReject
+              ? "Não há evidência visual suficiente pra confirmar a categoria do produto (garrafa, copo, etc.) com segurança — por precaução, nada foi sugerido. Aproxime mais o produto, melhore a iluminação ou busque manualmente."
+              : "Aproxime mais o produto da câmera ou busque manualmente."
+          }</p>
           <button class="btn-primary btn-block" id="scanManual">${Icon.search}Buscar manualmente</button>
         </div>`;
       sheet.querySelector("#scanManual")!.addEventListener("click", () => setState("manual_search"));
       break;
+    }
 
     case "product_found":
     case "low_confidence":
@@ -398,6 +439,14 @@ function renderOverlay(): void {
   }
 }
 
+/** "garrafa-fresh" → "Garrafa Fresh" — só formatação, nunca inventa família nova. */
+function friendlyFamilyLabel(familyKey: string): string {
+  return familyKey
+    .split("-")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
 async function renderProductFound(sheet: Element): Promise<void> {
   const result = currentResult;
   const candidate = result?.candidates[0];
@@ -410,9 +459,21 @@ async function renderProductFound(sheet: Element): Promise<void> {
 
   const confidenceLabel: Record<string, string> = { high: "Confiança alta", medium: "Confiança média", low: "Confiança baixa", none: "" };
 
+  // Estágio de família (Categoria → Família → SKU/cor): quando a FAMÍLIA já
+  // foi confirmada com segurança mas a confiança final não é alta e existe
+  // mais de um candidato, o mais provável é que a incerteza seja só de
+  // COR/capacidade dentro da família certa — não do produto em si. Mensagem
+  // diferente pra deixar isso claro e empurrar o operador pra "ver outras
+  // opções" em vez de confirmar uma cor no escuro.
+  const colorUncertain = scanState === "low_confidence" && !!result?.detected_family && (result?.candidates.length ?? 0) > 1;
+  const familyLabel = result?.detected_family ? friendlyFamilyLabel(result.detected_family) : null;
+
   sheet.innerHTML = `
     <div class="scan-card">
-      <p class="scan-found-title">${scanState === "low_confidence" ? "Talvez seja este produto" : "Produto encontrado"}</p>
+      <p class="scan-found-title">${
+        colorUncertain ? `Família identificada: ${escapeHtml(familyLabel ?? "")}` : scanState === "low_confidence" ? "Talvez seja este produto" : "Produto encontrado"
+      }</p>
+      ${colorUncertain ? `<p class="hint-text">A cor/variante exata não está confirmada — confira as opções abaixo antes de confirmar.</p>` : ""}
       <div class="scan-product-row">
         ${imgUrl ? `<img class="thumb-img-lg" src="${imgUrl}" alt="" style="max-width:96px" />` : `<span class="thumb-placeholder">${Icon.imageOff}</span>`}
         <div>
@@ -425,19 +486,19 @@ async function renderProductFound(sheet: Element): Promise<void> {
       <div class="scan-actions">
         <button class="btn-primary btn-block" id="scanConfirmProduct">Confirmar</button>
         ${(result?.candidates.length ?? 0) > 1 ? `<button class="btn-secondary btn-block" id="scanSeeOthers">Ver outras opções</button>` : ""}
+        <button class="btn-secondary btn-block" id="scanNoneOfThese">${Icon.search}Nenhuma dessas opções</button>
         <button class="btn-secondary btn-block" id="scanNotThis">Não é este produto</button>
-        <button class="btn-secondary btn-block" id="scanManualFromFound">${Icon.search}Buscar manualmente</button>
       </div>
     </div>`;
 
   sheet.querySelector("#scanConfirmProduct")!.addEventListener("click", () => selectCandidateAndConfirm(candidate));
   sheet.querySelector("#scanSeeOthers")?.addEventListener("click", () => renderOtherOptions(sheet, result!.candidates));
+  sheet.querySelector("#scanNoneOfThese")!.addEventListener("click", () => setState("manual_search"));
   sheet.querySelector("#scanNotThis")!.addEventListener("click", () => {
     stabilizer.reset();
     currentResult = null;
     setState("analyzing");
   });
-  sheet.querySelector("#scanManualFromFound")!.addEventListener("click", () => setState("manual_search"));
 }
 
 function renderOtherOptions(sheet: Element, candidates: RecognizeCandidate[]): void {
@@ -485,13 +546,13 @@ async function renderMultipleCapacities(sheet: Element): Promise<void> {
           )
           .join("")}
       </div>
-      <button class="btn-secondary btn-block" id="scanManualFromCapacity">${Icon.search}Buscar manualmente</button>
+      <button class="btn-secondary btn-block" id="scanNoneOfTheseCapacity">${Icon.search}Nenhuma dessas opções</button>
     </div>`;
 
   sheet.querySelectorAll<HTMLButtonElement>("[data-capacity-idx]").forEach((btn) => {
     btn.addEventListener("click", () => selectCandidateAndConfirm(sortedByCapacity[Number(btn.dataset.capacityIdx)]));
   });
-  sheet.querySelector("#scanManualFromCapacity")!.addEventListener("click", () => setState("manual_search"));
+  sheet.querySelector("#scanNoneOfTheseCapacity")!.addEventListener("click", () => setState("manual_search"));
 }
 
 function selectCandidateAndConfirm(candidate: RecognizeCandidate): void {
@@ -509,6 +570,7 @@ function renderConfirmingQuantity(sheet: Element): void {
   }
   sheet.innerHTML = `
     <div class="scan-card">
+      ${selectedViaManualSearch ? `<p class="scan-found-title">Você confirma que este produto é:</p>` : ""}
       <p class="scan-found-title">${escapeHtml(candidate.nome)}</p>
       <p class="sku-code">${escapeHtml(candidate.sku_outlet)}</p>
       <p>Qual é a quantidade?</p>
@@ -518,7 +580,7 @@ function renderConfirmingQuantity(sheet: Element): void {
         <button type="button" id="scanQtyInc" aria-label="Aumentar quantidade">${Icon.plus}</button>
       </div>
       <div class="scan-actions">
-        <button class="btn-primary btn-block" id="scanConfirmItem">Confirmar item</button>
+        <button class="btn-primary btn-block" id="scanConfirmItem">${selectedViaManualSearch ? `${Icon.checkCircle}Confirmar e ensinar ao GoScan` : "Confirmar item"}</button>
         <button class="btn-secondary btn-block" id="scanCancelConfirm">Cancelar</button>
       </div>
     </div>`;
@@ -565,6 +627,8 @@ async function confirmItem(): Promise<void> {
     showToast(`${candidate.sku_outlet} adicionado à conferência.`, "success");
     setState("item_added");
 
+    void submitVisualLearning(candidate);
+
     if (!selectedViaManualSearch) {
       const confirmedKey = candidate.variant_key
         ? `family:${candidate.visual_family_key ?? ""}:${candidate.variant_key}`
@@ -583,6 +647,39 @@ async function confirmItem(): Promise<void> {
   }
 }
 
+/**
+ * Memória visual: registra a captura que gerou esta confirmação como
+ * referência validada (ver visualLearning.ts) — só roda DEPOIS do item já
+ * ter sido adicionado à conferência (nunca bloqueia a ação principal). Se o
+ * operador confirmou uma sugestão da IA, é "confirmed_scan"; se veio da
+ * busca manual (a sugestão original estava errada, ou não houve sugestão
+ * nenhuma), é "corrected_scan". Falha aqui nunca aparece como erro pro
+ * operador — a conferência já foi feita, o aprendizado é só um bônus.
+ */
+async function submitVisualLearning(candidate: RecognizeCandidate): Promise<void> {
+  if (!lastAnalyzedFrameBase64 || !candidate.variant_id) return;
+  const wasCorrection = selectedViaManualSearch;
+  try {
+    const result = await recordScanLearning({
+      variant_id: candidate.variant_id,
+      image_base64: lastAnalyzedFrameBase64,
+      source_type: wasCorrection ? "corrected_scan" : "confirmed_scan",
+      original_prediction_id: lastRecognitionAttempt?.recognition_id ?? null,
+      original_confidence: wasCorrection ? (lastRecognitionAttempt?.candidates[0]?.score ?? null) : candidate.score,
+      recognition_status: lastRecognitionAttempt?.status ?? null,
+    });
+    if (result.saved) {
+      showToast("Correção registrada. Esta imagem ajudará o GoScan a reconhecer este produto nos próximos escaneamentos.", "success");
+    } else if (result.reinforcedExisting) {
+      showToast("Produto confirmado. Esta captura reforçou uma referência já existente.", "default");
+    } else if (result.reason) {
+      showToast("Produto confirmado, mas a imagem não foi adicionada à memória visual porque sua qualidade é insuficiente. Faça um novo scan para melhorar o aprendizado.", "default");
+    }
+  } catch (err) {
+    console.warn("[scan] falha ao registrar aprendizado visual (item já foi confirmado normalmente):", err instanceof Error ? err.message : err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Busca manual (fallback)
 // ---------------------------------------------------------------------------
@@ -590,9 +687,10 @@ async function confirmItem(): Promise<void> {
 function renderManualSearch(sheet: Element): void {
   sheet.innerHTML = `
     <div class="scan-card">
-      <p class="scan-found-title">Buscar manualmente</p>
-      <input type="text" id="scanManualInput" placeholder="Buscar por SKU ou nome…" aria-label="Buscar por SKU ou nome" />
+      <p class="scan-found-title">Qual é o SKU correto deste produto?</p>
+      <input type="text" id="scanManualInput" placeholder="Buscar por SKU, nome, categoria, família ou capacidade…" aria-label="Buscar por SKU, nome, categoria, família ou capacidade" />
       <div id="scanManualResults" class="scan-manual-results"></div>
+      <button class="btn-secondary btn-block" id="scanReportUnclassified">${Icon.imagePlus}Produto ainda não cadastrado</button>
       <button class="btn-secondary btn-block" id="scanBackFromManual">Voltar para a câmera</button>
     </div>`;
 
@@ -605,6 +703,7 @@ function renderManualSearch(sheet: Element): void {
     debounceTimer = setTimeout(() => void runManualSearch(input.value, results), 300);
   });
 
+  sheet.querySelector("#scanReportUnclassified")!.addEventListener("click", () => renderReportUnclassifiedForm(sheet));
   sheet.querySelector("#scanBackFromManual")!.addEventListener("click", () => {
     stabilizer.reset();
     setState("analyzing");
@@ -622,19 +721,26 @@ async function runManualSearch(query: string, resultsEl: Element): Promise<void>
 
 function renderManualResults(resultsEl: Element, rows: CatalogRow[]): void {
   if (rows.length === 0) {
-    resultsEl.innerHTML = `<p class="hint-text">Nenhum SKU encontrado.</p>`;
+    resultsEl.innerHTML = `<p class="hint-text">Nenhum SKU encontrado — se o produto realmente não existe no catálogo, use "Produto ainda não cadastrado" abaixo.</p>`;
     return;
   }
   resultsEl.innerHTML = rows
     .map(
-      (r) =>
-        `<button type="button" class="sku-picker-item" data-variant="${r.variant_id}" data-product="${r.product_id}" data-sku="${escapeHtml(
-          r.sku_code
-        )}" data-produto="${escapeHtml(r.produto)}">${escapeHtml(r.produto)} — ${escapeHtml(r.cor || "")} <span class="sku-code">${escapeHtml(
-          r.sku_code
-        )}</span></button>`
+      (r) => `
+      <button type="button" class="sku-picker-item" data-variant="${r.variant_id}" data-product="${r.product_id}" data-sku="${escapeHtml(
+        r.sku_code
+      )}" data-produto="${escapeHtml(r.produto)}" data-category="${escapeHtml(r.category || "")}" data-family="${escapeHtml(
+        r.visual_family_key || ""
+      )}" data-capacity="${r.capacity_ml ?? ""}" data-color="${escapeHtml(r.cor || "")}">
+        ${r.thumbnail_path ? `<img class="thumb-img" data-storage-path="${escapeHtml(r.thumbnail_path)}" alt="" />` : `<span class="thumb-placeholder">${Icon.imageOff}</span>`}
+        <span class="sku-picker-item-info">
+          <span class="product-card-name">${escapeHtml(r.produto)} — ${escapeHtml(r.cor || "")}</span>
+          <span class="sku-code">${escapeHtml(r.sku_code)}</span>
+        </span>
+      </button>`
     )
     .join("");
+  void hydrateManualResultThumbnails(resultsEl);
   resultsEl.querySelectorAll<HTMLButtonElement>(".sku-picker-item").forEach((btn) => {
     btn.addEventListener("click", () => {
       selectedCandidate = {
@@ -644,9 +750,10 @@ function renderManualResults(resultsEl: Element, rows: CatalogRow[]): void {
         nome: btn.dataset.produto!,
         imagem: null,
         storage_path: null,
-        capacity_ml: null,
-        visual_family_key: null,
-        variant_key: null,
+        capacity_ml: btn.dataset.capacity ? Number(btn.dataset.capacity) : null,
+        category: btn.dataset.category || null,
+        visual_family_key: btn.dataset.family || null,
+        variant_key: btn.dataset.color || null,
         score: 0,
         confidence_level: "none",
         from_family_expansion: false,
@@ -656,4 +763,57 @@ function renderManualResults(resultsEl: Element, rows: CatalogRow[]): void {
       setState("confirming");
     });
   });
+}
+
+async function hydrateManualResultThumbnails(resultsEl: Element): Promise<void> {
+  const imgs = [...resultsEl.querySelectorAll<HTMLImageElement>("img.thumb-img[data-storage-path]")];
+  await Promise.all(
+    imgs.map(async (img) => {
+      const path = img.dataset.storagePath;
+      if (!path) return;
+      const url = await getSignedImageUrl(path, 300);
+      if (url) img.src = url;
+    })
+  );
+}
+
+/**
+ * "Produto ainda não cadastrado": abre uma pendência (foto + observação) em
+ * vez de forçar um vínculo com um SKU errado — nenhum SKU é criado aqui.
+ */
+function renderReportUnclassifiedForm(sheet: Element): void {
+  sheet.innerHTML = `
+    <div class="scan-card">
+      <p class="scan-found-title">Produto ainda não cadastrado</p>
+      <p class="hint-text">A foto atual será salva para um manager/admin cadastrar este produto no catálogo. Descreva o que é, se possível.</p>
+      <textarea id="scanUnclassifiedObservation" rows="3" placeholder="Observação (opcional): nome do produto, cor, onde encontrar mais informações…" aria-label="Observação"></textarea>
+      <div class="scan-actions">
+        <button class="btn-primary btn-block" id="scanSubmitUnclassified">Enviar pendência</button>
+        <button class="btn-secondary btn-block" id="scanCancelUnclassified">Cancelar</button>
+      </div>
+    </div>`;
+
+  sheet.querySelector("#scanCancelUnclassified")!.addEventListener("click", () => setState("manual_search"));
+  sheet.querySelector("#scanSubmitUnclassified")!.addEventListener("click", () => void submitUnclassifiedReport(sheet));
+}
+
+async function submitUnclassifiedReport(sheet: Element): Promise<void> {
+  if (!lastAnalyzedFrameBase64) {
+    showToast("Nenhuma imagem capturada ainda — aponte a câmera para o produto antes de reportar.", "error");
+    return;
+  }
+  const observation = sheet.querySelector<HTMLTextAreaElement>("#scanUnclassifiedObservation")?.value ?? "";
+  const submitBtn = sheet.querySelector<HTMLButtonElement>("#scanSubmitUnclassified")!;
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Enviando…";
+  try {
+    await reportUnclassifiedProduct({ image_base64: lastAnalyzedFrameBase64, observation: observation.trim() || null });
+    showToast("Pendência registrada. Um manager/admin vai cadastrar este produto.", "success");
+    stabilizer.reset();
+    setState("analyzing");
+  } catch (err) {
+    showToast("Erro ao registrar pendência: " + (err instanceof Error ? err.message : String(err)), "error");
+    submitBtn.disabled = false;
+    submitBtn.textContent = "Enviar pendência";
+  }
 }
