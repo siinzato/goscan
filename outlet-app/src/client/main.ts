@@ -3,26 +3,33 @@ import { initAuth, subscribeAuth, getAuthState } from "./auth.ts";
 import { mountShell } from "./ui/shell.ts";
 import { renderLogin } from "./ui/screens/login.ts";
 import { renderConfigError } from "./ui/configError.ts";
+import { goGroupMarqueeHtml } from "./ui/gogroupMarquee.ts";
 
 const root = document.getElementById("app-root")!;
 
 function renderBootLoading(step: string): void {
   root.innerHTML = `
     <div class="boot-loading" role="status" aria-live="polite">
-      <img class="boot-loading-logo" src="/brand/goscan-wordmark.png" alt="GoScan" />
-      <p>${step}</p>
+      <div class="boot-loading-content">
+        <img class="boot-loading-logo" src="/brand/goscan-wordmark.png" alt="GoScan" />
+        <p>${step}</p>
+      </div>
+      ${goGroupMarqueeHtml()}
     </div>`;
 }
 
 function renderBootError(message: string): void {
   root.innerHTML = `
     <div class="boot-loading" role="alert">
-      <img class="boot-loading-logo" src="/brand/goscan-wordmark.png" alt="GoScan" />
-      <p>${message}</p>
-      <div class="boot-loading-actions">
-        <button class="btn-primary" id="boot-retry">Tentar novamente</button>
-        <button class="btn-secondary" id="boot-back-to-login">Voltar ao login</button>
+      <div class="boot-loading-content">
+        <img class="boot-loading-logo" src="/brand/goscan-wordmark.png" alt="GoScan" />
+        <p>${message}</p>
+        <div class="boot-loading-actions">
+          <button class="btn-primary" id="boot-retry">Tentar novamente</button>
+          <button class="btn-secondary" id="boot-back-to-login">Voltar ao login</button>
+        </div>
       </div>
+      ${goGroupMarqueeHtml()}
     </div>`;
   document.getElementById("boot-retry")!.addEventListener("click", () => void boot());
   document.getElementById("boot-back-to-login")!.addEventListener("click", () => {
@@ -61,7 +68,10 @@ async function boot() {
     if (state.status === "inactive") {
       root.innerHTML = `
         <div class="boot-loading" role="alert">
-          <p>Sua conta está desativada. Fale com um administrador para reativá-la.</p>
+          <div class="boot-loading-content">
+            <p>Sua conta está desativada. Fale com um administrador para reativá-la.</p>
+          </div>
+          ${goGroupMarqueeHtml()}
         </div>`;
       return;
     }

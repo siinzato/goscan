@@ -95,12 +95,18 @@ h1, h2, h3 { font-family: var(--font-ui); font-weight: 700; color: var(--text-pr
   min-height: 100dvh;
   display: flex;
   flex-direction: column;
+  background: var(--bg-page);
+}
+.boot-loading-content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   text-align: center;
   padding: 24px;
   gap: 8px;
-  background: var(--bg-page);
 }
 
 .config-error h1 { font-size: 20px; }
@@ -329,18 +335,58 @@ textarea { font-family: var(--font-ui); font-size: 15px; resize: vertical; }
 .auth-screen {
   min-height: 100dvh;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px 16px;
+  flex-direction: column;
   position: relative;
   z-index: 1;
   background: var(--white);
+}
+.auth-screen-content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
 }
 .auth-card { width: 100%; max-width: 380px; text-align: center; }
 .auth-logo { width: 200px; max-width: 60vw; height: auto; object-fit: contain; margin: 0 auto 18px; display: block; }
 .auth-tagline { font-size: 15px; font-weight: 500; color: var(--text-primary); margin: 0 0 2px; }
 .auth-subtagline { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 20px; }
 .auth-card form { text-align: left; margin-top: 8px; }
+
+/* ---------------------------------------------------------------------- */
+/* Letreiro institucional "gogroup" (rodapé de login/boot)                 */
+/* ---------------------------------------------------------------------- */
+.gogroup-marquee {
+  width: 100%;
+  height: 130px;
+  overflow: hidden;
+  flex-shrink: 0;
+  /* aproxima o amarelo-limão da imagem — evita frestas brancas antes dela carregar */
+  background: #e2e400;
+}
+.gogroup-track {
+  display: flex;
+  width: max-content;
+  height: 100%;
+  animation: gogroup-scroll 20s linear infinite;
+  will-change: transform;
+}
+.gogroup-group { display: flex; flex-shrink: 0; height: 100%; }
+.gogroup-track img { height: 100%; width: auto; flex-shrink: 0; display: block; }
+
+@keyframes gogroup-scroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gogroup-track { animation: none; transform: none; }
+}
+
+@media (max-width: 720px) {
+  .gogroup-marquee { height: 76px; }
+}
 
 .notice-box, .error-box, .warning-box {
   font-size: 13px;
@@ -356,6 +402,127 @@ textarea { font-family: var(--font-ui); font-size: 15px; resize: vertical; }
 
 .quality-recommendations { margin: 0; padding-left: 18px; font-size: 13px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 6px; }
 .quality-recommendations li { line-height: 1.4; }
+
+/* ---------------------------------------------------------------------- */
+/* Botão + modal "Como instalar no iOS/Android" (login)                    */
+/* ---------------------------------------------------------------------- */
+.install-guide-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  min-height: 44px;
+}
+.install-guide-btn svg { width: 18px; height: 18px; stroke: currentColor; flex-shrink: 0; }
+.install-guide-btn:hover { border-color: var(--go-blue-600); color: var(--go-blue-700); }
+
+body.pwa-modal-open { overflow: hidden; }
+body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
+
+.pwa-install-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(24, 24, 27, 0.55);
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+.pwa-install-overlay.pwa-open { opacity: 1; }
+
+.pwa-install-panel {
+  background: var(--white);
+  width: calc(100% - 24px);
+  max-width: 640px;
+  max-height: 90vh;
+  overflow-y: auto;
+  border-radius: var(--radius-lg);
+  padding: 24px 20px calc(20px + var(--safe-bottom));
+  position: relative;
+  transform: translateY(12px) scale(0.95);
+  opacity: 0;
+  transition: transform 0.25s ease, opacity 0.25s ease;
+}
+.pwa-install-overlay.pwa-open .pwa-install-panel { transform: translateY(0) scale(1); opacity: 1; }
+
+.pwa-install-close { position: absolute; top: 14px; right: 14px; }
+
+.pwa-install-body h2 { font-size: 18px; margin: 0 26px 4px 0; }
+.pwa-install-body > .hint-text:first-of-type { margin-top: 0; }
+
+.pwa-tabs { display: flex; gap: 8px; margin: 18px 0 16px; border-bottom: 1px solid var(--border-subtle); }
+.pwa-tab {
+  flex: 1;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 10px 8px;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  min-height: 44px;
+}
+.pwa-tab.active { color: var(--go-blue-700); border-bottom-color: var(--go-blue-700); }
+
+#pwa-tabpanel .warning-box { margin-bottom: 12px; }
+#pwa-tabpanel > .btn-secondary.btn-block { margin-bottom: 16px; }
+
+.pwa-steps { display: flex; flex-direction: column; gap: 12px; margin: 16px 0; }
+.pwa-step-card {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  background: var(--neutral-100);
+  border-radius: var(--radius-md);
+}
+.pwa-step-number {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--go-blue-700);
+  color: var(--white);
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.pwa-step-icon { color: var(--go-blue-700); flex-shrink: 0; }
+.pwa-step-icon svg { width: 20px; height: 20px; stroke: currentColor; }
+.pwa-step-text strong { display: block; font-size: 13.5px; margin-bottom: 2px; }
+.pwa-step-text p { margin: 0; font-size: 12.5px; color: var(--text-secondary); line-height: 1.4; }
+
+.pwa-install-footer { display: flex; gap: 10px; margin-top: 18px; }
+.pwa-install-footer .btn-primary, .pwa-install-footer .btn-secondary { flex: 1; }
+
+@media (min-width: 720px) {
+  .pwa-steps { flex-direction: row; flex-wrap: wrap; }
+  .pwa-step-card { flex: 1 1 calc(50% - 6px); min-width: 220px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pwa-install-overlay, .pwa-install-panel { transition: none; }
+}
 
 .error-box-retry { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
 .error-box-retry .btn-secondary { min-width: 160px; }
@@ -472,6 +639,8 @@ textarea { font-family: var(--font-ui); font-size: 15px; resize: vertical; }
   padding: 4px 9px;
   border-radius: 20px;
   white-space: nowrap;
+  max-width: 100%;
+  min-width: 0;
 }
 .status-badge svg { width: 12px; height: 12px; }
 .status-badge.success { color: var(--status-success); background: var(--status-success-bg); }
@@ -607,19 +776,41 @@ textarea { font-family: var(--font-ui); font-size: 15px; resize: vertical; }
 /* ---------------------------------------------------------------------- */
 /* Product cards (mobile) — conferência e catálogo                        */
 /* ---------------------------------------------------------------------- */
-.product-card-list { display: flex; flex-direction: column; gap: 10px; }
+.product-card-list { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .product-card {
   background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   padding: 14px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
-.product-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
+.product-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 8px; min-width: 0; }
 .product-card-name { font-size: 14px; font-weight: 600; color: var(--text-primary); margin: 0; }
 .product-card-meta { font-size: 12px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 4px 10px; margin: 4px 0 10px; }
 .product-card-meta .sku-code { color: var(--go-blue-700); }
-.product-card-bottom { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.product-card-actions { display: flex; gap: 4px; }
+.product-card-bottom { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.product-card-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+
+/* Quando o rodapé do card só tem badges (catálogo visual), empilha em telas
+   pequenas em vez de confiar só no wrap — o par "Pronta p/ reconhecimento" +
+   "NN% Faixa (estimado)" é longo o bastante pra sobrar só um badge por linha
+   mesmo com wrap, então empilhar fica mais previsível que depender da ordem
+   de quebra do flex. Não afeta rodapés com stepper/botões (sem essa classe). */
+.product-card-bottom.badges-only {
+  justify-content: flex-start;
+}
+@media (max-width: 640px) {
+  .product-card-bottom.badges-only {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .product-card-bottom.badges-only .status-badge {
+    width: fit-content;
+    max-width: 100%;
+  }
+}
 
 /* ---------------------------------------------------------------------- */
 /* Tabelas (desktop) — sempre com rolagem horizontal própria               */

@@ -301,7 +301,7 @@ function renderQualityCards(wrap: Element, rows: RecognitionQualityListRow[]): v
               </div>
             </div>
           </div>
-          <div class="product-card-bottom">
+          <div class="product-card-bottom badges-only">
             <span class="status-badge ${css}">${Icon.gauge}${q.score_percent}% ${escapeHtml(label)}${q.estimated_only ? " (estimado)" : ""}</span>
           </div>
         </div>`;
@@ -412,7 +412,7 @@ function renderProductCards(wrap: Element, rows: CatalogVisualProduct[]): void {
               </div>
             </div>
           </div>
-          <div class="product-card-bottom">${productStatusBadges(p)}${qualityBadgeHtml(p.variant_id)}</div>
+          <div class="product-card-bottom badges-only">${productStatusBadges(p)}${qualityBadgeHtml(p.variant_id)}</div>
         </div>`
         )
         .join("")}
