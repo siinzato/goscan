@@ -19,6 +19,8 @@ export interface RecognizeCandidate {
   score: number;
   confidence_level: ConfidenceLevel;
   from_family_expansion: boolean;
+  /** Cor cadastrada da variação exata do SKU (product_variants.color) — null quando não cadastrada. */
+  cor: string | null;
 }
 
 export interface RecognizeResult {

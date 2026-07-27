@@ -1,13 +1,26 @@
 import type { Session } from "@supabase/supabase-js";
 import { getSupabase } from "./supabaseClient.ts";
 
-export type Role = "admin" | "manager" | "operator";
+// EXPANSÃO GOSCAN — 4 papéis reais pós-migration 0027: "admin" (antigo) virou
+// "super_admin", "manager" (antigo) virou "admin" — ver
+// supabase/migrations/0027_profile_role_expansion.sql pro remapeamento de
+// dados sem regressão (mesmos usuários reais continuam nos mesmos dois
+// níveis de privilégio, is_admin()/is_manager_or_admin() em nome idêntico).
+export type Role = "super_admin" | "admin" | "operator" | "viewer";
 
 export interface Profile {
   id: string;
   full_name: string | null;
   role: Role;
   active: boolean;
+  job_title: string | null;
+  work_group: string | null;
+  phone: string | null;
+  recovery_email: string | null;
+  recovery_email_verified: boolean;
+  theme: "light" | "dark";
+  must_change_password: boolean;
+  last_login_at: string | null;
 }
 
 // "initializing": validando sessão/perfil no boot — nunca dura mais que
@@ -61,9 +74,12 @@ function logAuthEvent(event: string, meta?: Record<string, unknown>): void {
  * falha de refresh do token (que dispara o mesmo evento no supabase-js). */
 let manualSignOutInFlight = false;
 
+const PROFILE_COLUMNS =
+  "id, full_name, role, active, job_title, work_group, phone, recovery_email, recovery_email_verified, theme, must_change_password, last_login_at";
+
 async function loadProfile(userId: string): Promise<Profile | null> {
   const supabase = getSupabase();
-  const { data, error } = await supabase.from("profiles").select("id, full_name, role, active").eq("id", userId).maybeSingle();
+  const { data, error } = await supabase.from("profiles").select(PROFILE_COLUMNS).eq("id", userId).maybeSingle();
   if (error) {
     console.error("Falha ao carregar perfil:", error.message);
     return null;
@@ -71,7 +87,7 @@ async function loadProfile(userId: string): Promise<Profile | null> {
   return data as Profile | null;
 }
 
-async function applySession(session: Session | null, opts: { expired?: boolean } = {}): Promise<void> {
+async function applySession(session: Session | null, opts: { expired?: boolean; recordLastLogin?: boolean } = {}): Promise<void> {
   if (!session) {
     const expired = !!opts.expired && !manualSignOutInFlight;
     if (expired) logAuthEvent("session_expired");
@@ -96,7 +112,32 @@ async function applySession(session: Session | null, opts: { expired?: boolean }
     setState({ status: "inactive", session, profile, error: null, sessionExpired: false });
     return;
   }
+  // "Últimos acessos" do painel administrativo — só grava numa sessão nova
+  // de verdade (boot ou SIGNED_IN explícito), nunca a cada renovação
+  // silenciosa de token (TOKEN_REFRESHED dispararia isto várias vezes por
+  // hora à toa). Fire-and-forget: nunca atrasa nem derruba o login por causa
+  // disso — é só exibição, não uma trilha de auditoria de segurança.
+  if (opts.recordLastLogin) {
+    void getSupabase()
+      .from("profiles")
+      .update({ last_login_at: new Date().toISOString() })
+      .eq("id", session.user.id)
+      .then(({ error: e }) => {
+        if (e) console.error("Falha ao registrar last_login_at:", e.message);
+      });
+  }
   setState({ status: "signed_in", session, profile, error: null, sessionExpired: false });
+}
+
+/**
+ * Recarrega o perfil do usuário logado e notifica os assinantes — usado
+ * depois de uma edição em "Minha conta"/troca de senha pra refletir a
+ * mudança na UI sem precisar de F5 (ver regra explícita do pedido).
+ */
+export async function refreshProfile(): Promise<void> {
+  if (!state.session) return;
+  const profile = await loadProfile(state.session.user.id);
+  if (profile) setState({ profile });
 }
 
 const BOOT_TIMEOUT_MS = 10_000;
@@ -132,7 +173,7 @@ export async function initAuth(): Promise<void> {
   try {
     const { data } = await withBootTimeout(supabase.auth.getSession());
     logAuthEvent("session_recovered", { hasSession: !!data.session });
-    await withBootTimeout(applySession(data.session));
+    await withBootTimeout(applySession(data.session, { recordLastLogin: true }));
   } catch (err) {
     const isTimeout = err instanceof Error && err.message === "BOOT_TIMEOUT";
     logAuthEvent("auth_initialize_failed", { timeout: isTimeout, message: err instanceof Error ? err.message : String(err) });
@@ -154,7 +195,7 @@ export async function initAuth(): Promise<void> {
       // event "SIGNED_OUT" cobre tanto logout explícito quanto falha de
       // refresh do token (sessão expirada/revogada) — applySession(null)
       // usa manualSignOutInFlight pra diferenciar a mensagem certa.
-      void applySession(session, { expired: event === "SIGNED_OUT" });
+      void applySession(session, { expired: event === "SIGNED_OUT", recordLastLogin: event === "SIGNED_IN" });
     });
 
     // Mobile/PWA em segundo plano: o timer interno do supabase-js que agenda
@@ -179,6 +220,28 @@ export async function signIn(email: string, password: string): Promise<string | 
   return null;
 }
 
+/**
+ * Garante que o access_token da sessão atual não expira nos próximos
+ * segundos — chamado antes de operações que usam o cliente Supabase
+ * diretamente (Storage, tabelas), que não passam pelo retry-com-refresh do
+ * backendAuthClient.ts. Sem isso, uma ação que começa logo depois da aba
+ * voltar do segundo plano (ex.: escolher uma foto pra upload) pode correr em
+ * paralelo com o refresh silencioso do visibilitychange (mais abaixo) e
+ * perder a corrida, batendo num token já expirado no meio da operação —
+ * exatamente o "exp claim timestamp check failed" visto no upload manual.
+ */
+export async function ensureFreshSession(): Promise<void> {
+  const supabase = getSupabase();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session) return;
+  const expiresInMs = (session.expires_at ?? 0) * 1000 - Date.now();
+  if (expiresInMs < 60_000) {
+    await supabase.auth.refreshSession();
+  }
+}
+
 export async function signOut(): Promise<void> {
   manualSignOutInFlight = true;
   const supabase = getSupabase();
@@ -194,19 +257,32 @@ export async function sendPasswordReset(email: string): Promise<string | null> {
   return null;
 }
 
+/**
+ * Toda troca de senha bem-sucedida (tanto pelo link de recuperação em
+ * login.ts quanto pelo formulário "Segurança" em Configurações) também
+ * limpa must_change_password automaticamente — é o ÚNICO caminho real pra
+ * esse flag sair de true (ver clear_own_must_change_password() na migration
+ * 0028: só mexe na própria linha do chamador, nunca na de outro usuário).
+ * Best-effort: uma falha aqui não desfaz a troca de senha, que já aconteceu.
+ */
 export async function updatePassword(newPassword: string): Promise<string | null> {
   const supabase = getSupabase();
   const { error } = await supabase.auth.updateUser({ password: newPassword });
   if (error) return translateAuthError(error.message);
+
+  const { error: clearError } = await supabase.rpc("clear_own_must_change_password");
+  if (clearError) console.error("Falha ao limpar must_change_password:", clearError.message);
+  await refreshProfile();
+
   return null;
 }
 
 export function isManagerOrAdmin(profile: Profile | null): boolean {
-  return !!profile && (profile.role === "admin" || profile.role === "manager");
+  return !!profile && (profile.role === "super_admin" || profile.role === "admin");
 }
 
 export function isAdmin(profile: Profile | null): boolean {
-  return !!profile && profile.role === "admin";
+  return !!profile && profile.role === "super_admin";
 }
 
 function translateAuthError(message: string): string {

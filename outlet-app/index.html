@@ -4,8 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1" />
 <!-- Nome/descrição espelham src/client/brand.ts (APP_NAME/APP_DESCRIPTION) — HTML estático não pode importar TS. -->
-<title>GoScan · Conferência Inteligente de Produtos de Outlet</title>
-<meta name="description" content="GoScan — Conferência Inteligente de Produtos de Outlet. Uma ferramenta GoGroup." />
+<title>GoScan · Conferência Inteligente de Produtos GoCase</title>
+<meta name="description" content="GoScan — Conferência Inteligente de Produtos GoCase. Uma ferramenta GoGroup." />
 <meta name="theme-color" content="#123F78" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -15,6 +15,17 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/style.css" />
+<script>
+  // EXPANSÃO GOSCAN — aplica o tema ANTES do primeiro paint, síncrono, sem
+  // esperar o boot assíncrono do Supabase (auth.ts/theme.ts) — evita o flash
+  // do tema claro por cima do escuro. localStorage é só cache/fallback aqui;
+  // depois do login, profiles.theme (fonte de verdade) pode corrigir isto.
+  try {
+    if (localStorage.getItem("goscan:theme") === "dark") {
+      document.documentElement.setAttribute("data-theme", "dark");
+    }
+  } catch (e) {}
+</script>
 </head>
 <body>
   <div id="app-root"></div>

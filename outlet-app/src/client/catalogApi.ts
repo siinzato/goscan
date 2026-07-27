@@ -1,4 +1,7 @@
 import { getSupabase } from "./supabaseClient.ts";
+import { normalize } from "./utils.ts";
+
+export type ProductType = "outlet" | "normal";
 
 export interface CatalogRow {
   variant_id: string;
@@ -13,6 +16,7 @@ export interface CatalogRow {
   capacity_ml: number | null;
   /** storage_path da foto principal do catálogo (product-images) — null quando o produto ainda não tem imagem. */
   thumbnail_path: string | null;
+  product_type: ProductType;
 }
 
 export interface CatalogPage {
@@ -27,6 +31,7 @@ interface ProductJoin {
   category: string | null;
   visual_family_key: string | null;
   capacity_ml: number | null;
+  product_type: ProductType;
 }
 
 interface VariantJoinRow {
@@ -40,7 +45,7 @@ interface VariantJoinRow {
 
 function productJoin(row: VariantJoinRow): ProductJoin {
   const p = row.products;
-  const empty: ProductJoin = { name: "", category: null, visual_family_key: null, capacity_ml: null };
+  const empty: ProductJoin = { name: "", category: null, visual_family_key: null, capacity_ml: null, product_type: "outlet" };
   if (!p) return empty;
   return Array.isArray(p) ? p[0] ?? empty : p;
 }
@@ -52,17 +57,21 @@ function productJoin(row: VariantJoinRow): ProductJoin {
  * usado tanto pela tela de importação quanto pela correção manual do Modo Scan
  * ("Nenhuma dessas opções"), onde o operador pode não lembrar o nome exato do produto.
  */
-export async function searchCatalog(query: string, page = 0, pageSize = 50): Promise<CatalogPage> {
+export async function searchCatalog(query: string, page = 0, pageSize = 50, productType?: ProductType): Promise<CatalogPage> {
   const supabase = getSupabase();
   const from = page * pageSize;
   const to = from + pageSize - 1;
 
   let builder = supabase
     .from("product_variants")
-    .select("id, product_id, sku_code, color, gtin, products(name, category, visual_family_key, capacity_ml)", { count: "exact" })
+    .select("id, product_id, sku_code, color, gtin, products!inner(name, category, visual_family_key, capacity_ml, product_type)", { count: "exact" })
     .eq("active", true)
     .order("sku_code", { ascending: true })
     .range(from, to);
+
+  if (productType) {
+    builder = builder.eq("products.product_type", productType);
+  }
 
   const q = query.trim();
   if (q) {
@@ -73,11 +82,24 @@ export async function searchCatalog(query: string, page = 0, pageSize = 50): Pro
     // removidos de "q" antes de compor o .or() — nunca interpolamos texto do
     // usuário sem neutralizar esses separadores.
     const safeQ = q.replace(/[,()%]/g, "");
-    const lowerQ = safeQ.toLowerCase();
+    // BUG REAL corrigido: normalized_name é gravado via normalize() no import
+    // (remove acento, pontuação, deixa minúsculo) — comparar com apenas
+    // .toLowerCase() aqui fazia "Térmica" (digitado) nunca bater com
+    // "termica" (gravado), mesmo sendo o mesmo produto. Normaliza a busca
+    // exatamente do mesmo jeito que os dados foram normalizados.
+    const lowerQ = normalize(safeQ);
     const digitsOnly = safeQ.match(/\d+/)?.[0];
 
+    // Busca por nome é por PALAVRA-CHAVE, não frase exata: cada palavra
+    // digitada precisa aparecer em algum lugar do nome (em qualquer ordem) —
+    // "termica bolsa" e "bolsa termica" encontram o mesmo produto. Cada
+    // .ilike() encadeado no mesmo builder vira AND no PostgREST.
+    const nameWords = lowerQ.split(" ").filter(Boolean);
+    let byNameBuilder = supabase.from("products").select("id").limit(200);
+    for (const word of nameWords) byNameBuilder = byNameBuilder.ilike("normalized_name", `%${word}%`);
+
     const [byName, byCategory, byFamily, byCapacity] = await Promise.all([
-      supabase.from("products").select("id").ilike("normalized_name", `%${lowerQ}%`).limit(200),
+      nameWords.length > 0 ? byNameBuilder : Promise.resolve({ data: [] as { id: string }[] }),
       supabase.from("products").select("id").ilike("category", `%${lowerQ}%`).limit(200),
       supabase.from("products").select("id").ilike("visual_family_key", `%${lowerQ}%`).limit(200),
       digitsOnly ? supabase.from("products").select("id").eq("capacity_ml", Number(digitsOnly)).limit(200) : Promise.resolve({ data: [] as { id: string }[] }),
@@ -119,6 +141,7 @@ export async function searchCatalog(query: string, page = 0, pageSize = 50): Pro
       visual_family_key: product.visual_family_key,
       capacity_ml: product.capacity_ml,
       thumbnail_path: thumbnails.get(r.id) ?? null,
+      product_type: product.product_type,
     };
   });
 
@@ -143,7 +166,7 @@ async function fetchPrimaryThumbnails(supabase: ReturnType<typeof getSupabase>, 
 }
 
 /** Combobox de SKU com busca — nunca renderiza milhares de <option>. Usado na revisão manual. */
-export async function searchSkuForPicker(query: string, limit = 20): Promise<CatalogRow[]> {
-  const page = await searchCatalog(query, 0, limit);
+export async function searchSkuForPicker(query: string, limit = 20, productType?: ProductType): Promise<CatalogRow[]> {
+  const page = await searchCatalog(query, 0, limit, productType);
   return page.rows;
 }

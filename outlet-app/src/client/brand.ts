@@ -3,7 +3,10 @@
 // perfil, nomes de arquivo de exportação e documentação.
 export const APP_NAME = "GoScan";
 export const APP_SHORT_NAME = "GoScan";
-export const APP_DESCRIPTION = "Conferência Inteligente de Produtos de Outlet";
+// EXPANSÃO GOSCAN: o app deixou de ser exclusivo de Outlet (agora também
+// cobre Produtos Normais + Conferência por Nota Fiscal) — subtítulo atualizado
+// pra refletir isso em qualquer lugar que já use esta constante única.
+export const APP_DESCRIPTION = "Conferência Inteligente de Produtos GoCase";
 export const APP_COMPANY = "GoGroup";
 
 export const BRAND_ASSETS = {

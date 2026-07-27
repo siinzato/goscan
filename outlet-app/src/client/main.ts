@@ -4,6 +4,8 @@ import { mountShell } from "./ui/shell.ts";
 import { renderLogin } from "./ui/screens/login.ts";
 import { renderConfigError } from "./ui/configError.ts";
 import { goGroupMarqueeHtml } from "./ui/gogroupMarquee.ts";
+import { syncThemeFromProfile } from "./theme.ts";
+import { renderForcePasswordChange } from "./ui/screens/forcePasswordChange.ts";
 
 const root = document.getElementById("app-root")!;
 
@@ -76,6 +78,23 @@ async function boot() {
       return;
     }
     if (state.status === "signed_in") {
+      // profiles.theme é a fonte de verdade entre dispositivos — sincroniza o
+      // cache local (localStorage) se divergir, sem esperar isso pra montar a tela.
+      if (state.profile) syncThemeFromProfile(state.profile.theme);
+
+      // EXPANSÃO GOSCAN — troca obrigatória de senha (definida por um admin
+      // ao criar/resetar credenciais de outro usuário): bloqueia o app
+      // normal até a troca real acontecer, mesmo padrão de gate já usado
+      // pelo status "inactive" acima. shellMountedOnce fica false aqui de
+      // propósito — se o flag for limpo depois (updatePassword() já chama
+      // refreshProfile()), esta mesma notificação re-executa o listener e
+      // cai no mountShell() abaixo sem precisar de F5.
+      if (state.profile?.must_change_password) {
+        shellMountedOnce = false;
+        renderForcePasswordChange(root);
+        return;
+      }
+
       // mountShell() já é idempotente (shellMounted interno), mas evita até
       // recriar a subscrição de estado à toa se signed_in disparar de novo
       // (ex.: token refresh) sem ter saído de signed_in nesse meio-tempo.

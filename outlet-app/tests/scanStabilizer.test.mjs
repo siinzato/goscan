@@ -72,3 +72,27 @@ test("Stabilizer.reset clears the history", () => {
   s.reset();
   assert.equal(s.push("p1").isStable, false);
 });
+
+test("Stabilizer tolera UM ciclo de ruído isolado sem reiniciar a contagem do zero", () => {
+  // BUG REAL corrigido: ruído real de câmera (autofocus, tremor leve,
+  // oscilação momentânea de categoria) fazia uma leitura diferente reiniciar
+  // tudo do zero — em produção isso multiplicava o tempo de "Estabilizando..."
+  // pra dezenas de segundos mesmo com o produto parado e bem reconhecido.
+  const s = new Stabilizer(3, 6);
+  assert.equal(s.push("p1").isStable, false);
+  assert.equal(s.push("p1").isStable, false);
+  assert.equal(s.push("p2").isStable, false); // ruído isolado — não deve zerar o progresso de p1
+  const fourth = s.push("p1");
+  assert.equal(fourth.isStable, true);
+  assert.equal(fourth.stableKey, "p1");
+});
+
+test("Stabilizer NÃO estabiliza quando o ruído é persistente (sem maioria clara pra nenhuma chave)", () => {
+  const s = new Stabilizer(3, 6);
+  s.push("p1");
+  s.push("p2");
+  s.push("p1");
+  s.push("p2");
+  const result = s.push("p1"); // janela recente (últimas 4): p2,p1,p2,p1 — no máximo 2 de "p1"
+  assert.equal(result.isStable, false);
+});

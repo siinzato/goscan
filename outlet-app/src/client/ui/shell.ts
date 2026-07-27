@@ -16,9 +16,15 @@ const TABS: { route: Route; label: string; icon: string }[] = [
   { route: "perfil", label: "Perfil", icon: Icon.user },
 ];
 
+// EXPANSÃO GOSCAN — Central de Perfil: sub-rotas internas
+// (#/perfil/configuracoes, #/perfil/ajuda, #/perfil/sobre,
+// #/perfil/configuracoes/administracao). O shell só decide a ABA ativa
+// (primeiro segmento do hash) — profile.ts é quem olha o hash completo e
+// decide qual sub-tela desenhar, com seu próprio "voltar". Nenhum router
+// novo: mesmo hashchange já existente disparando renderCurrentScreen().
 function currentRoute(): Route {
-  const hash = window.location.hash.replace(/^#\/?/, "") as Route;
-  return (TABS.some((t) => t.route === hash) ? hash : "inicio") as Route;
+  const first = window.location.hash.replace(/^#\/?/, "").split("/")[0] as Route;
+  return (TABS.some((t) => t.route === first) ? first : "inicio") as Route;
 }
 
 // Lazy loading por rota (nunca baixa código que a rota atual não precisa):
@@ -59,9 +65,17 @@ const ROUTE_SKELETON = `<div class="skeleton skeleton-card"></div><div class="sk
 let shellMounted = false;
 
 export function mountShell(root: HTMLElement): void {
-  if (!shellMounted) {
-    const { profile } = getAuthState();
-    root.innerHTML = `
+  // Idempotente de propósito: subscribeAuth (main.ts) chama mountShell() de
+  // novo toda vez que o estado de auth notifica "signed_in" — inclusive numa
+  // renovação silenciosa de token depois que a aba volta do segundo plano
+  // (ver visibilitychange em auth.ts). Sem esse guard, cada uma dessas
+  // notificações redundantes forçava renderCurrentScreen() de novo, e isso
+  // era o "reset" real: tela atual recarregada do zero, scroll voltando pro
+  // topo e filtros/página perdidos, mesmo sem o usuário ter navegado.
+  if (shellMounted) return;
+
+  const { profile } = getAuthState();
+  root.innerHTML = `
       <div class="app-shell">
         <header class="app-header">
           <img class="app-header-logo" src="/brand/goscan-wordmark.png" alt="${APP_NAME}" />
@@ -81,21 +95,20 @@ export function mountShell(root: HTMLElement): void {
         </nav>
       </div>`;
 
-    root.querySelectorAll<HTMLButtonElement>(".bottom-nav-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        // Precisa acontecer dentro deste clique (gesto real do usuário) — é a
-        // única chance de "destravar" o áudio do beep de reconhecimento antes
-        // do primeiro achado, já que o navegador bloqueia play() assíncrono
-        // sem gesto (ver unlockScanSound). scan.ts nunca é lazy-loaded — ver
-        // comentário acima — exatamente para essa chamada poder ser síncrona.
-        if (btn.dataset.route === "escanear") unlockScanSound();
-        window.location.hash = `/${btn.dataset.route}`;
-      });
+  root.querySelectorAll<HTMLButtonElement>(".bottom-nav-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      // Precisa acontecer dentro deste clique (gesto real do usuário) — é a
+      // única chance de "destravar" o áudio do beep de reconhecimento antes
+      // do primeiro achado, já que o navegador bloqueia play() assíncrono
+      // sem gesto (ver unlockScanSound). scan.ts nunca é lazy-loaded — ver
+      // comentário acima — exatamente para essa chamada poder ser síncrona.
+      if (btn.dataset.route === "escanear") unlockScanSound();
+      window.location.hash = `/${btn.dataset.route}`;
     });
+  });
 
-    window.addEventListener("hashchange", renderCurrentScreen);
-    shellMounted = true;
-  }
+  window.addEventListener("hashchange", renderCurrentScreen);
+  shellMounted = true;
   renderCurrentScreen();
 }
 

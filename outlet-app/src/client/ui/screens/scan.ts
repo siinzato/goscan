@@ -17,6 +17,7 @@ import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
 import { getSignedImageUrl } from "../../visualScanApi.ts";
 import { recordScanLearning, reportUnclassifiedProduct } from "../../visualLearningApi.ts";
 import { startOrResumeConference, addItem, subscribeSession, type Session } from "../../conferenceSession.ts";
+import { getAuthState, isAdmin } from "../../auth.ts";
 
 type ScanState =
   | "requesting_permission"
@@ -40,6 +41,14 @@ const TICK_INTERVAL_MS = 1000;
 // pra "estabilizar" (ver stabilityKeyFor). Subir pra 3 dá mais defesa contra
 // esse ruído real, com custo de ~1s a mais até a primeira sugestão.
 const STABLE_CONSECUTIVE = 3;
+// BUG REAL corrigido (30-40s presos em "Estabilizando..."): Stabilizer agora
+// tolera ruído isolado (ver scanStabilizer.ts), mas ruído PERSISTENTE (sem
+// maioria clara) ainda podia deixar o operador esperando indefinidamente.
+// Depois desse tempo tentando estabilizar o MESMO produto, usa o resultado
+// mais recente mesmo sem 3 leituras concordantes — nunca fica preso pra
+// sempre. Não muda confidence_level/threshold algum, só decide não esperar
+// mais por confirmação repetida do que o algoritmo já está vendo agora.
+const STABILIZATION_TIMEOUT_MS = 3000;
 const NO_RESULT_STREAK_TO_SHOW = 3;
 const COOLDOWN_MIN_MS = 2000;
 // Calibrado na Parte 5: 480px/0.7 preservava mal detalhes finos (logo, brilho
@@ -68,7 +77,18 @@ let lastAnalyzedFrameBase64: string | null = null;
 let lastRecognitionAttempt: RecognizeResult | null = null;
 
 let stabilizer = new Stabilizer(STABLE_CONSECUTIVE, 6);
+// Marca QUANDO entramos em "stabilizing" pela última vez (não a cada ciclo,
+// só na transição) — gerenciado inteiramente dentro de setState(), nunca
+// precisa ser sincronizado manualmente com os vários stabilizer.reset()
+// espalhados pelo arquivo (sair de "stabilizing" pra qualquer outro estado
+// já limpa isso sozinho).
+let stabilizingEnteredAt: number | null = null;
 let noResultStreak = 0;
+
+// Diagnóstico (só admin, ver renderDiagnosticPanel) — dados reais medidos
+// nesta sessão de scan, nunca inventados/estimados.
+let diagTickCount = 0;
+let diagLastCycleMs = 0;
 let loopTimer: ReturnType<typeof setInterval> | null = null;
 let isRequesting = false;
 let requestSeq = 0;
@@ -115,6 +135,15 @@ export function unlockScanSound(): void {
 
 function setState(next: ScanState): void {
   const isNewFind = FOUND_SOUND_STATES.includes(next) && !FOUND_SOUND_STATES.includes(scanState);
+  // Só marca a ENTRADA em "stabilizing" (não a cada ciclo que continua nele)
+  // — usado pra saber há quanto tempo estamos tentando estabilizar o mesmo
+  // produto, sem precisar sincronizar isso com os vários stabilizer.reset()
+  // espalhados pelo arquivo (sair de "stabilizing" já limpa isso sozinho).
+  if (next === "stabilizing") {
+    if (scanState !== "stabilizing") stabilizingEnteredAt = Date.now();
+  } else {
+    stabilizingEnteredAt = null;
+  }
   scanState = next;
   if (isNewFind) {
     const sound = getFoundSound();
@@ -140,6 +169,9 @@ export async function renderScan(root: HTMLElement): Promise<void> {
   stabilizer = new Stabilizer(STABLE_CONSECUTIVE, 6);
   noResultStreak = 0;
   cooldownProductKey = null;
+  stabilizingEnteredAt = null;
+  diagTickCount = 0;
+  diagLastCycleMs = 0;
 
   root.innerHTML = `
     <section class="scan-screen">
@@ -155,6 +187,7 @@ export async function renderScan(root: HTMLElement): Promise<void> {
         </div>
         <div id="scanStatusBadge" class="scan-status-badge"></div>
       </div>
+      <div id="scanDiagPanel"></div>
       <div id="scanBottomSheet" class="scan-bottom-sheet"></div>
     </section>`;
 
@@ -272,6 +305,8 @@ async function tick(): Promise<void> {
 
   const mySeq = ++requestSeq;
   isRequesting = true;
+  diagTickCount++;
+  const cycleStartedAt = performance.now();
   try {
     const blob = await camera.captureFrameBlob(FRAME_MAX_DIMENSION, FRAME_QUALITY);
     if (!blob) return;
@@ -279,6 +314,7 @@ async function tick(): Promise<void> {
     if (mySeq !== requestSeq) return; // uma requisição mais nova já foi disparada
     const result = await recognizeFrame(currentSession.conference.id, base64);
     if (mySeq !== requestSeq) return; // resposta obsoleta — descarta
+    diagLastCycleMs = Math.round(performance.now() - cycleStartedAt);
     // Sempre atualiza, independente de a leitura ter estabilizado — é o
     // contexto usado pra registrar aprendizado (recognition_id/confiança da
     // TENTATIVA real, não só das que viraram sugestão na tela).
@@ -322,8 +358,16 @@ function handleResult(result: RecognizeResult): void {
   currentResult = result;
 
   if (!isStable) {
-    setState("stabilizing");
-    return;
+    const elapsedStabilizing = stabilizingEnteredAt ? Date.now() - stabilizingEnteredAt : 0;
+    if (elapsedStabilizing < STABILIZATION_TIMEOUT_MS) {
+      setState("stabilizing");
+      return;
+    }
+    // Timeout: tentamos estabilizar o mesmo produto por tempo suficiente sem
+    // 3 leituras concordantes (ruído persistente, não só um blip isolado).
+    // Segue com o resultado MAIS RECENTE em vez de esperar pra sempre — usa
+    // exatamente a mesma confidence_level/requires_capacity_selection que o
+    // algoritmo já calculou, nunca afrouxa o critério de confiança.
   }
 
   if (result.requires_capacity_selection) {
@@ -354,6 +398,9 @@ function renderOverlay(): void {
   };
   badge.textContent = badges[scanState] ?? "";
   badge.className = `scan-status-badge${scanState === "offline" ? " warning" : ""}`;
+
+  const diagPanel = rootEl.querySelector("#scanDiagPanel");
+  if (diagPanel) diagPanel.innerHTML = renderDiagnosticPanelHtml();
 
   switch (scanState) {
     case "error":
@@ -450,12 +497,56 @@ function renderOverlay(): void {
   }
 }
 
+/**
+ * Diagnóstico temporário (só admin) do gargalo de estabilização — mostra
+ * exclusivamente dados REAIS medidos nesta sessão de scan (nunca motion
+ * score/sharpness estimados, já que o app não calcula isso hoje). Ajuda a
+ * ver AO VIVO por que o scanner ainda não estabilizou: quantos ciclos já
+ * rodaram, quanto tempo o ciclo mais recente levou, e a janela real de
+ * chaves que o Stabilizer está comparando.
+ */
+function renderDiagnosticPanelHtml(): string {
+  if (!isAdmin(getAuthState().profile)) return "";
+  const result = lastRecognitionAttempt;
+  const elapsedStabilizing = stabilizingEnteredAt ? Date.now() - stabilizingEnteredAt : 0;
+  const window = stabilizer.getHistory();
+
+  return `
+    <details class="scan-diag-panel">
+      <summary>Diagnóstico</summary>
+      <dl>
+        <dt>Estado</dt><dd>${escapeHtml(scanState)}</dd>
+        <dt>Ciclos avaliados nesta sessão</dt><dd>${diagTickCount}</dd>
+        <dt>Tempo do último ciclo (captura + reconhecimento)</dt><dd>${diagLastCycleMs} ms</dd>
+        <dt>Tempo tentando estabilizar</dt><dd>${scanState === "stabilizing" ? `${elapsedStabilizing} ms (limite ${STABILIZATION_TIMEOUT_MS} ms)` : "-"}</dd>
+        <dt>Janela do estabilizador (mais recente por último)</dt><dd>${window.length ? escapeHtml(window.map((k) => k ?? "∅").join(" → ")) : "-"}</dd>
+        <dt>Status do último resultado</dt><dd>${escapeHtml(result?.status ?? "-")}</dd>
+        <dt>Confiança do último resultado</dt><dd>${escapeHtml(result?.confidence_level ?? "-")}</dd>
+        <dt>Categoria detectada</dt><dd>${escapeHtml(result?.detected_category ?? "-")}</dd>
+        <dt>Família detectada</dt><dd>${escapeHtml(result?.detected_family ?? "-")}</dd>
+        <dt>Exige escolha de capacidade</dt><dd>${result?.requires_capacity_selection ? "sim" : "não"}</dd>
+      </dl>
+    </details>`;
+}
+
 /** "garrafa-fresh" → "Garrafa Fresh" — só formatação, nunca inventa família nova. */
 function friendlyFamilyLabel(familyKey: string): string {
   return familyKey
     .split("-")
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
     .join(" ");
+}
+
+/**
+ * Cor cadastrada da variação EXATA do SKU (nunca inferida da família ou da
+ * imagem) — texto sempre visível; nunca inventa cor quando não cadastrada.
+ * Não existe campo de cor hexadecimal confiável no catálogo hoje, então não
+ * há bolinha colorida — só o texto, que já é a informação obrigatória.
+ */
+function colorBadgeHtml(cor: string | null): string {
+  const trimmed = (cor || "").trim();
+  if (!trimmed) return `<span class="scan-color-badge unknown">Cor não informada</span>`;
+  return `<span class="scan-color-badge">${escapeHtml(trimmed)}</span>`;
 }
 
 async function renderProductFound(sheet: Element): Promise<void> {
@@ -487,10 +578,11 @@ async function renderProductFound(sheet: Element): Promise<void> {
       ${colorUncertain ? `<p class="hint-text">A cor/variante exata não está confirmada — confira as opções abaixo antes de confirmar.</p>` : ""}
       <div class="scan-product-row">
         ${imgUrl ? `<img class="thumb-img-lg" src="${imgUrl}" alt="" style="max-width:96px" />` : `<span class="thumb-placeholder">${Icon.imageOff}</span>`}
-        <div>
+        <div class="scan-product-info">
+          ${candidate.capacity_ml ? `<p class="hint-text" style="margin:0">${candidate.capacity_ml}ml</p>` : ""}
+          ${colorBadgeHtml(candidate.cor)}
           <p class="product-card-name">${escapeHtml(candidate.nome)}</p>
           <p class="sku-code">${escapeHtml(candidate.sku_outlet)}</p>
-          ${candidate.capacity_ml ? `<p class="hint-text">${candidate.capacity_ml}ml</p>` : ""}
           <span class="status-badge ${candidate.confidence_level === "high" ? "success" : "warning"}">${confidenceLabel[candidate.confidence_level]}</span>
         </div>
       </div>
@@ -519,10 +611,13 @@ function renderOtherOptions(sheet: Element, candidates: RecognizeCandidate[]): v
       <div class="ambiguous-suggestions">
         ${candidates
           .map(
-            (c, idx) =>
-              `<button type="button" class="btn-secondary" data-option-idx="${idx}">${escapeHtml(c.nome)}${
-                c.capacity_ml ? " — " + c.capacity_ml + "ml" : ""
-              } <span class="sku-code">${escapeHtml(c.sku_outlet)}</span></button>`
+            (c, idx) => `
+          <button type="button" class="scan-capacity-card" data-option-idx="${idx}">
+            ${c.capacity_ml ? `<strong>${c.capacity_ml}ml</strong>` : ""}
+            ${colorBadgeHtml(c.cor)}
+            <span>${escapeHtml(c.nome)}</span>
+            <span class="sku-code">${escapeHtml(c.sku_outlet)}</span>
+          </button>`
           )
           .join("")}
       </div>
@@ -551,6 +646,7 @@ async function renderMultipleCapacities(sheet: Element): Promise<void> {
             (c, idx) => `
           <button type="button" class="scan-capacity-card" data-capacity-idx="${idx}">
             <strong>${c.capacity_ml ? c.capacity_ml + "ml" : "?"}</strong>
+            ${colorBadgeHtml(c.cor)}
             <span>${escapeHtml(c.nome)}</span>
             <span class="sku-code">${escapeHtml(c.sku_outlet)}</span>
           </button>`
@@ -582,6 +678,8 @@ function renderConfirmingQuantity(sheet: Element): void {
   sheet.innerHTML = `
     <div class="scan-card">
       ${selectedViaManualSearch ? `<p class="scan-found-title">Você confirma que este produto é:</p>` : ""}
+      ${candidate.capacity_ml ? `<p class="hint-text" style="margin:0">${candidate.capacity_ml}ml</p>` : ""}
+      ${colorBadgeHtml(candidate.cor)}
       <p class="scan-found-title">${escapeHtml(candidate.nome)}</p>
       <p class="sku-code">${escapeHtml(candidate.sku_outlet)}</p>
       <p>Qual é a quantidade?</p>
@@ -626,7 +724,7 @@ async function confirmItem(): Promise<void> {
     await addItem({
       product_variant_id: candidate.variant_id,
       raw_model: candidate.nome,
-      raw_color: candidate.variant_key || "",
+      raw_color: candidate.cor || "",
       quantity,
       match_status: selectedViaManualSearch ? "manual" : candidate.confidence_level === "high" ? "matched" : "partial",
       source: selectedViaManualSearch ? "manual" : "camera_scan",
@@ -726,7 +824,7 @@ async function runManualSearch(query: string, resultsEl: Element): Promise<void>
     resultsEl.innerHTML = "";
     return;
   }
-  const rows = await searchSkuForPicker(query, 15);
+  const rows = await searchSkuForPicker(query, 15, "outlet");
   renderManualResults(resultsEl, rows);
 }
 
@@ -745,7 +843,9 @@ function renderManualResults(resultsEl: Element, rows: CatalogRow[]): void {
       )}" data-capacity="${r.capacity_ml ?? ""}" data-color="${escapeHtml(r.cor || "")}">
         ${r.thumbnail_path ? `<img class="thumb-img" data-storage-path="${escapeHtml(r.thumbnail_path)}" alt="" />` : `<span class="thumb-placeholder">${Icon.imageOff}</span>`}
         <span class="sku-picker-item-info">
-          <span class="product-card-name">${escapeHtml(r.produto)} — ${escapeHtml(r.cor || "")}</span>
+          ${r.capacity_ml ? `<span class="hint-text" style="margin:0">${r.capacity_ml}ml</span>` : ""}
+          ${colorBadgeHtml(r.cor)}
+          <span class="product-card-name">${escapeHtml(r.produto)}</span>
           <span class="sku-code">${escapeHtml(r.sku_code)}</span>
         </span>
       </button>`
@@ -764,10 +864,11 @@ function renderManualResults(resultsEl: Element, rows: CatalogRow[]): void {
         capacity_ml: btn.dataset.capacity ? Number(btn.dataset.capacity) : null,
         category: btn.dataset.category || null,
         visual_family_key: btn.dataset.family || null,
-        variant_key: btn.dataset.color || null,
+        variant_key: null,
         score: 0,
         confidence_level: "none",
         from_family_expansion: false,
+        cor: btn.dataset.color || null,
       };
       selectedViaManualSearch = true;
       quantity = 1;

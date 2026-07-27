@@ -25,6 +25,8 @@ export interface RecognizeCandidate {
   confidence_level: ConfidenceLevel;
   /** true quando este candidato foi incluído por expansão de família (capacidade irmã), não por match visual direto. */
   from_family_expansion: boolean;
+  /** Cor cadastrada da variação EXATA (product_variants.color) — nunca inferida da família/embedding. null = não cadastrada. */
+  cor: string | null;
 }
 
 // Códigos internos de diagnóstico — nunca mostrados ao operador como estão
@@ -71,6 +73,86 @@ export interface RecognizeTimings {
  * extras por scan) e hoje serve só para calibração manual, nunca para decidir o resultado
  * (ver isAspectRatioInconsistentWithCategory: sempre false abaixo). */
 const SCAN_DEBUG = process.env.SCAN_DEBUG === "1";
+
+// ---------------------------------------------------------------------------
+// Resolução de cor do candidato — fonte única de verdade é o cadastro real
+// (product_variants.color, o MESMO campo usado pela seção de SKUs). O
+// mapa de código-de-sufixo é só um FALLBACK/validação, calculado a partir
+// dos dados reais já cadastrados (nunca hardcoded) — usado só quando a
+// variante não tem cor cadastrada.
+// ---------------------------------------------------------------------------
+interface ColorRow {
+  sku_code: string;
+  color: string | null;
+  products: { capacity_ml: number | null } | { capacity_ml: number | null }[] | null;
+}
+
+let colorCodeMapCache: Map<string, string> | null = null;
+
+/** Segmento numérico após o ÚLTIMO hífen do SKU (ex.: "GFGCM13OUT-20" → "20"). null se o SKU não terminar em número. */
+export function extractSkuColorCode(skuCode: string): string | null {
+  const m = skuCode.trim().match(/-(\d+)$/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Calcula (e cacheia pra vida do processo — cadastro de cor não muda com
+ * frequência o bastante pra justificar recalcular a cada scan) o mapa
+ * código-de-sufixo → cor mais comum, varrendo o cadastro real de
+ * product_variants. Exclui qualquer sufixo que coincida com a capacidade
+ * (capacity_ml) do próprio produto — isso é capacidade vazando no SKU
+ * ("...-650", "...-950"), nunca um código de cor real.
+ */
+export async function getColorCodeMap(admin: SupabaseClient): Promise<Map<string, string>> {
+  if (colorCodeMapCache) return colorCodeMapCache;
+  const { data, error } = await admin.from("product_variants").select("sku_code, color, products(capacity_ml)").eq("active", true);
+  const map = new Map<string, string>();
+  if (!error && data) {
+    const tally = new Map<string, Map<string, number>>();
+    for (const row of data as unknown as ColorRow[]) {
+      const code = extractSkuColorCode(row.sku_code);
+      const color = (row.color || "").trim();
+      if (!code || !color) continue;
+      const product = Array.isArray(row.products) ? row.products[0] : row.products;
+      if (product?.capacity_ml != null && String(product.capacity_ml) === code) continue;
+      if (!tally.has(code)) tally.set(code, new Map());
+      const colorCounts = tally.get(code)!;
+      colorCounts.set(color, (colorCounts.get(color) ?? 0) + 1);
+    }
+    for (const [code, colorCounts] of tally) {
+      const [bestColor] = [...colorCounts.entries()].sort((a, b) => b[1] - a[1])[0];
+      map.set(code, bestColor);
+    }
+  }
+  colorCodeMapCache = map;
+  return map;
+}
+
+interface ResolvedColor {
+  cor: string | null;
+  source: "cadastro" | "codigo_sufixo" | "nenhuma";
+}
+
+/**
+ * Prioridade: 1) cor cadastrada NA VARIANTE EXATA (nunca família/produto
+ * base); 2) código de cor no sufixo do SKU, mapeado a partir do cadastro
+ * real; 3) "Cor não informada" (null aqui — a UI decide o texto). Loga
+ * (nunca corrige sozinho) quando as duas fontes discordam.
+ */
+export function resolveSkuColor(skuCode: string, registeredColor: string | null, codeMap: Map<string, string>): ResolvedColor {
+  const trimmedRegistered = (registeredColor || "").trim();
+  const code = extractSkuColorCode(skuCode);
+  const mappedColor = code ? (codeMap.get(code) ?? null) : null;
+
+  if (trimmedRegistered) {
+    if (mappedColor && mappedColor.toLowerCase() !== trimmedRegistered.toLowerCase()) {
+      console.warn(`[scan/color] Inconsistência de cor detectada no SKU ${skuCode}: cadastro="${trimmedRegistered}" vs. código de sufixo(-${code})="${mappedColor}".`);
+    }
+    return { cor: trimmedRegistered, source: "cadastro" };
+  }
+  if (mappedColor) return { cor: mappedColor, source: "codigo_sufixo" };
+  return { cor: null, source: "nenhuma" };
+}
 
 /** Agrupa matches de imagens por produto, usando a MELHOR imagem (menor distância) por
  * produto — nunca soma/conta imagens, exatamente para que um produto com muitas fotos
@@ -353,6 +435,7 @@ async function expandFamilySiblings(admin: SupabaseClient, best: SimilarityMatch
       score: best.score_raw, // mesma variante/estampa — herda o score do candidato visualmente confirmado
       confidence_level: computeConfidence(best, undefined),
       from_family_expansion: true,
+      cor: null, // preenchido em lote logo antes da resposta (ver recognizeFrame)
     };
   });
 }
@@ -441,6 +524,7 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
     score: m.score_raw,
     confidence_level: computeConfidence(m, undefined),
     from_family_expansion: false,
+    cor: null, // preenchido em lote logo antes da resposta (ver recognizeFrame)
   }));
 
   let requiresCapacitySelection = false;
@@ -495,6 +579,33 @@ export async function recognizeFrame(admin: SupabaseClient, imageBuffer: Buffer)
                 : "CATEGORY_MISMATCH"
       : undefined;
   if (status === "no_result") candidates = [];
+
+  // Cor: fonte primária é o cadastro da variação EXATA (product_variants.color
+  // — o MESMO campo que a seção de SKUs usa), nunca inferida da família/
+  // embedding nem do variant_key (que já é usado com outro sentido no
+  // pipeline de família/capacidades-irmãs, ver expandFamilySiblings). Uma
+  // única consulta em lote pros candidatos desta resposta + o mapa de
+  // código-de-sufixo (cacheado, calculado uma vez por processo) como
+  // fallback — ver resolveSkuColor. Não altera nenhuma lógica de
+  // ranking/reconhecimento.
+  const variantIdsForColor = [...new Set(candidates.map((c) => c.variant_id).filter((id): id is string => !!id))];
+  if (variantIdsForColor.length > 0) {
+    const [{ data: colorRows }, codeMap] = await Promise.all([
+      admin.from("product_variants").select("id, color").in("id", variantIdsForColor),
+      getColorCodeMap(admin),
+    ]);
+    const colorByVariant = new Map(((colorRows as { id: string; color: string | null }[]) || []).map((r) => [r.id, r.color]));
+    candidates = candidates.map((c) => {
+      const registered = c.variant_id ? (colorByVariant.get(c.variant_id) ?? null) : null;
+      const resolved = resolveSkuColor(c.sku_outlet, registered, codeMap);
+      if (SCAN_DEBUG) {
+        console.log(
+          `[scan/color] SKU=${c.sku_outlet} busca_cadastral=${c.variant_id && colorByVariant.has(c.variant_id) ? "SIM" : "NAO"} cor_cadastrada=${registered ?? "-"} fonte=${resolved.source} cor_enviada_ui=${resolved.cor ?? "Cor não informada"}`
+        );
+      }
+      return { ...c, cor: resolved.cor };
+    });
+  }
 
   // Diagnóstico opt-in (SCAN_DEBUG=1): os 5 melhores candidatos brutos
   // (globais, sem filtro) + categoria e família decididas, nunca a

@@ -48,6 +48,21 @@ import iconSquarePlus from "lucide-static/icons/square-plus.svg?raw";
 import iconSmartphone from "lucide-static/icons/smartphone.svg?raw";
 import iconDownload from "lucide-static/icons/download.svg?raw";
 import iconCopy from "lucide-static/icons/copy.svg?raw";
+import iconFileText from "lucide-static/icons/file-text.svg?raw";
+import iconReceipt from "lucide-static/icons/receipt.svg?raw";
+import iconBarcode from "lucide-static/icons/barcode.svg?raw";
+import iconLink from "lucide-static/icons/link.svg?raw";
+import iconListChecks from "lucide-static/icons/list-checks.svg?raw";
+import iconSettings from "lucide-static/icons/settings.svg?raw";
+import iconHelpCircle from "lucide-static/icons/help-circle.svg?raw";
+import iconBookOpen from "lucide-static/icons/book-open.svg?raw";
+import iconLock from "lucide-static/icons/lock.svg?raw";
+import iconShield from "lucide-static/icons/shield.svg?raw";
+import iconChevronDown from "lucide-static/icons/chevron-down.svg?raw";
+import iconPhone from "lucide-static/icons/phone.svg?raw";
+import iconMail from "lucide-static/icons/mail.svg?raw";
+import iconSun from "lucide-static/icons/sun.svg?raw";
+import iconMoon from "lucide-static/icons/moon.svg?raw";
 
 export const Icon = {
   camera: iconCamera,
@@ -98,6 +113,21 @@ export const Icon = {
   smartphone: iconSmartphone,
   download: iconDownload,
   copy: iconCopy,
+  fileText: iconFileText,
+  receipt: iconReceipt,
+  barcode: iconBarcode,
+  link: iconLink,
+  listChecks: iconListChecks,
+  settings: iconSettings,
+  helpCircle: iconHelpCircle,
+  bookOpen: iconBookOpen,
+  lock: iconLock,
+  shield: iconShield,
+  chevronDown: iconChevronDown,
+  phone: iconPhone,
+  mail: iconMail,
+  sun: iconSun,
+  moon: iconMoon,
 } as const;
 
 export type IconName = keyof typeof Icon;

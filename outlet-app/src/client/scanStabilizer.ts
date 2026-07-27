@@ -38,26 +38,51 @@ export function stabilityKeyFor(result: StabilizableResult): string | null {
 
 export class Stabilizer {
   private history: (string | null)[] = [];
-  private requiredConsecutive: number;
+  private requiredMatches: number;
   private windowSize: number;
 
-  constructor(requiredConsecutive = 2, windowSize = 6) {
-    this.requiredConsecutive = requiredConsecutive;
+  constructor(requiredMatches = 2, windowSize = 6) {
+    this.requiredMatches = requiredMatches;
     this.windowSize = windowSize;
   }
 
-  /** Registra uma leitura e diz se ela já estabilizou (mesma chave nas últimas `requiredConsecutive` leituras). */
+  /**
+   * Registra uma leitura e diz se ela já estabilizou.
+   *
+   * BUG REAL corrigido (30-40s presos em "Estabilizando..."): a versão
+   * anterior exigia as últimas `requiredConsecutive` leituras IDÊNTICAS, sem
+   * nenhuma tolerância — ruído real de câmera (autofocus, tremor leve da
+   * mão, exposição ajustando, e a oscilação de categoria já documentada em
+   * stabilityKeyFor) fazia UMA leitura diferente reiniciar a contagem
+   * inteira do zero. Cada reinício custava outro ciclo completo de
+   * reconhecimento — em produção isso multiplicava poucos "ruídos" isolados
+   * em dezenas de segundos, mesmo com o produto parado e corretamente
+   * identificado na maior parte das leituras.
+   *
+   * Agora conta quantas vezes a MESMA chave aparece dentro de uma janela
+   * recente pequena (`requiredMatches + 1` leituras) — um único ciclo
+   * discordante não zera o progresso, mas ruído PERSISTENTE (sem maioria
+   * clara pra nenhuma chave) continua não estabilizando. O limiar de
+   * concordância (`requiredMatches`) não muda — só a tolerância a UMA
+   * interrupção isolada dentro da janela.
+   */
   push(key: string | null): { stableKey: string | null; isStable: boolean } {
     this.history.push(key);
     if (this.history.length > this.windowSize) this.history.shift();
     if (!key) return { stableKey: null, isStable: false };
 
-    const tail = this.history.slice(-this.requiredConsecutive);
-    const isStable = tail.length === this.requiredConsecutive && tail.every((k) => k === key);
+    const recentWindow = this.history.slice(-(this.requiredMatches + 1));
+    const matches = recentWindow.filter((k) => k === key).length;
+    const isStable = matches >= this.requiredMatches;
     return { stableKey: isStable ? key : null, isStable };
   }
 
   reset(): void {
     this.history = [];
+  }
+
+  /** Só leitura — usado pelo painel de diagnóstico (nunca inventa dados, mostra a janela real). */
+  getHistory(): (string | null)[] {
+    return [...this.history];
   }
 }

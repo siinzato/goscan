@@ -5,5 +5,6 @@ dist/
 outlet-app/.env
 outlet-app/data.db
 outlet-app/server.log
+outlet-app/supabase/.temp/
 *.log
 .DS_Store

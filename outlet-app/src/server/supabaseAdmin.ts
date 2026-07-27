@@ -24,9 +24,13 @@ export function getSupabaseAdmin(env: AdminEnv): SupabaseClient {
   return cached;
 }
 
+// EXPANSÃO GOSCAN — 4 papéis reais pós-migration 0027 (ver
+// 0027_profile_role_expansion.sql): "admin" (antigo) virou "super_admin",
+// "manager" (antigo) virou "admin" — nomes de função mantidos
+// (requireManagerOrAdmin etc.), só o que eles verificam mudou.
 export interface CallerProfile {
   id: string;
-  role: "admin" | "manager" | "operator";
+  role: "super_admin" | "admin" | "operator" | "viewer";
   active: boolean;
 }
 
@@ -69,8 +73,18 @@ async function requireAuthenticatedProfile(request: Request, env: AdminEnv): Pro
 export async function requireManagerOrAdmin(request: Request, env: AdminEnv): Promise<AuthCheckResult> {
   const result = await requireAuthenticatedProfile(request, env);
   if (!result.ok) return result;
-  if (result.profile.role !== "admin" && result.profile.role !== "manager") {
-    return { ok: false, status: 403, error: "Ação restrita a manager ou admin." };
+  if (result.profile.role !== "super_admin" && result.profile.role !== "admin") {
+    return { ok: false, status: 403, error: "Ação restrita a administradores." };
+  }
+  return result;
+}
+
+/** Exige super_admin — topo da hierarquia (ver migration 0027). */
+export async function requireSuperAdmin(request: Request, env: AdminEnv): Promise<AuthCheckResult> {
+  const result = await requireAuthenticatedProfile(request, env);
+  if (!result.ok) return result;
+  if (result.profile.role !== "super_admin") {
+    return { ok: false, status: 403, error: "Ação restrita ao super administrador." };
   }
   return result;
 }

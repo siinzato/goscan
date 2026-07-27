@@ -228,6 +228,9 @@ export default {
 
         // Autorização: mesma regra da RLS de conferences (operador dono ou manager/admin)
         // — replicada manualmente aqui porque o service_role ignora RLS.
+        // "super_admin"/"admin" são os papéis reais pós-migration 0027 (ver
+        // comentário em supabaseAdmin.ts) — nunca comparar contra os nomes
+        // antigos "admin"/"manager" aqui.
         const { data: conference, error: conferenceError } = await admin
           .from("conferences")
           .select("id, operator_id")
@@ -235,7 +238,7 @@ export default {
           .maybeSingle();
         if (conferenceError || !conference) return json({ error: "Conferência não encontrada." }, 404);
         const isOwner = conference.operator_id === auth.profile.id;
-        const isPrivileged = auth.profile.role === "admin" || auth.profile.role === "manager";
+        const isPrivileged = auth.profile.role === "super_admin" || auth.profile.role === "admin";
         if (!isOwner && !isPrivileged) return json({ error: "Você não tem acesso a esta conferência." }, 403);
 
         let rawBuffer: Buffer;

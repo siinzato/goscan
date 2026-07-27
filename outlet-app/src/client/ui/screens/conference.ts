@@ -79,6 +79,10 @@ function syncStamp(state: string): string {
 
 export async function renderConference(root: HTMLElement): Promise<void> {
   unsubscribeSession?.();
+  // root.innerHTML é reconstruído do zero aqui — qualquer nó montado na vez
+  // anterior (ex.: #nfeConferenceRoot) deixou de existir, então o guard de
+  // "já montado" tem que valer só pra ESTA instância do DOM.
+  nfeConferenceMounted = false;
   root.innerHTML = `<div class="screen-loading">Carregando conferência…</div>`;
 
   let session: Session;
@@ -92,10 +96,11 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   root.innerHTML = `
     <section class="conference-screen">
       <div class="card">
-        <h2>1. Envie os prints ou cole o texto</h2>
+        <h2>1. Como você quer conferir?</h2>
         <div class="input-mode-switch">
           <button class="mode-btn active" data-mode="imagens">${Icon.camera}Prints (imagens)</button>
           <button class="mode-btn" data-mode="texto">${Icon.type}Colar texto</button>
+          <button class="mode-btn" data-mode="nfe">${Icon.receipt}Nota Fiscal</button>
         </div>
 
         <div class="mode-panel active" id="mode-imagens">
@@ -116,27 +121,33 @@ export async function renderConference(root: HTMLElement): Promise<void> {
           <textarea id="textInput" rows="6" placeholder="Tote Mini - Preto - 3&#10;Joy Pro - Marrom - 1"></textarea>
           <button class="btn-primary btn-block" id="btnParseText">Gerar itens do texto</button>
         </div>
-      </div>
 
-      <div class="card">
-        <h2>2. Revise antes de adicionar</h2>
-        <div id="candidatesWrap"><p class="hint-text">Nenhum item gerado ainda.</p></div>
-        <div class="review-actions">
-          <button class="btn-secondary" id="btnAddManualRow">+ Linha manual</button>
-          <button class="btn-primary" id="btnConfirmAll" disabled>Adicionar tudo à conferência</button>
+        <div class="mode-panel" id="mode-nfe">
+          <div id="nfeConferenceRoot"></div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="product-card-top">
-          <h2 style="margin:0">3. Itens da conferência</h2>
-          <span id="syncSummary"></span>
+      <div id="outletExtraCards">
+        <div class="card">
+          <h2>2. Revise antes de adicionar</h2>
+          <div id="candidatesWrap"><p class="hint-text">Nenhum item gerado ainda.</p></div>
+          <div class="review-actions">
+            <button class="btn-secondary" id="btnAddManualRow">+ Linha manual</button>
+            <button class="btn-primary" id="btnConfirmAll" disabled>Adicionar tudo à conferência</button>
+          </div>
         </div>
-        <div id="sessionWrap"></div>
-        <div class="review-actions">
-          <button class="btn-secondary" id="btnReprocessEmpty">${Icon.refresh}Reprocessar SKUs vazios</button>
-          <button class="btn-secondary" id="btnExport">${Icon.fileSpreadsheet}Exportar Excel</button>
-          <button class="btn-accent" id="btnFinalize">Finalizar conferência</button>
+
+        <div class="card">
+          <div class="product-card-top">
+            <h2 style="margin:0">3. Itens da conferência</h2>
+            <span id="syncSummary"></span>
+          </div>
+          <div id="sessionWrap"></div>
+          <div class="review-actions">
+            <button class="btn-secondary" id="btnReprocessEmpty">${Icon.refresh}Reprocessar SKUs vazios</button>
+            <button class="btn-secondary" id="btnExport">${Icon.fileSpreadsheet}Exportar Excel</button>
+            <button class="btn-accent" id="btnFinalize">Finalizar conferência</button>
+          </div>
         </div>
       </div>
     </section>`;
@@ -229,13 +240,39 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   }
 }
 
+// EXPANSÃO GOSCAN — módulo da Conferência por Nota Fiscal, montado uma única
+// vez dentro de #nfeConferenceRoot (mesmo container reaproveitado toda vez
+// que o operador volta pro modo "Nota Fiscal" — preserva o estado em
+// andamento, igual já acontece hoje entre os modos imagens/texto).
+let nfeConferenceModule: typeof import("./nfeConference.ts") | null = null;
+let nfeConferenceMounted = false;
+
 function wireInputModeSwitch(root: HTMLElement): void {
+  const extraCards = root.querySelector<HTMLElement>("#outletExtraCards")!;
   root.querySelectorAll<HTMLButtonElement>(".mode-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       root.querySelectorAll(".mode-btn").forEach((b) => b.classList.remove("active"));
       root.querySelectorAll(".mode-panel").forEach((p) => p.classList.remove("active"));
       btn.classList.add("active");
       root.querySelector(`#mode-${btn.dataset.mode}`)?.classList.add("active");
+
+      const isNfe = btn.dataset.mode === "nfe";
+      // Cards "2. Revise antes de adicionar" e "3. Itens da conferência" são
+      // específicos do fluxo de correspondência por texto/print (Outlet) —
+      // não fazem sentido na Conferência por Nota Fiscal, que tem seu
+      // próprio fluxo de preparação/contagem/resultado dentro do módulo nfe.
+      extraCards.hidden = isNfe;
+
+      if (isNfe) {
+        const container = root.querySelector<HTMLElement>("#nfeConferenceRoot")!;
+        if (!nfeConferenceMounted) {
+          nfeConferenceMounted = true;
+          void (nfeConferenceModule ? Promise.resolve(nfeConferenceModule) : import("./nfeConference.ts")).then((m) => {
+            nfeConferenceModule = m;
+            void m.renderNfeConference(container);
+          });
+        }
+      }
     });
   });
 }
@@ -491,7 +528,7 @@ function wireSkuPickers(wrap: Element): void {
         resultsBox.hidden = true;
         return;
       }
-      const rows = await searchSkuForPicker(query, 15);
+      const rows = await searchSkuForPicker(query, 15, "outlet");
       renderResults(rows);
     }, 300);
 
@@ -650,7 +687,7 @@ function wireItemSkuFix(wrap: Element): void {
         resultsBox.hidden = true;
         return;
       }
-      const rows = await searchSkuForPicker(query, 15);
+      const rows = await searchSkuForPicker(query, 15, "outlet");
       renderResults(rows);
     }, 300);
 

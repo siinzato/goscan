@@ -6,6 +6,7 @@ import { getSupabase } from "./supabaseClient.ts";
 import { getAuthState, isManagerOrAdmin } from "./auth.ts";
 import { normalize } from "./utils.ts";
 import { invalidateAliasCache } from "./matching.ts";
+import { buildColorCodeMap, resolveColorFromSuffix, type ColorCodeMapRow } from "./skuColorResolver.ts";
 
 export interface ImportRowInput {
   produto?: string;
@@ -113,6 +114,8 @@ export interface UpsertVariantRow {
   cor: string;
   gtin: string;
   model_code: string;
+  /** 'outlet' (default, preserva o comportamento atual) ou 'normal' — ver 0022_product_type_and_normal_products.sql. */
+  product_type?: "outlet" | "normal";
 }
 
 export interface UpsertVariantsResult {
@@ -130,19 +133,28 @@ export interface UpsertVariantsResult {
 export async function upsertProductsAndVariants(rows: UpsertVariantRow[]): Promise<UpsertVariantsResult> {
   const supabase = getSupabase();
 
-  const productsByCode = new Map<string, { name: string; normalized_name: string; model_code: string }>();
+  // Chave composta (model_code + product_type): "TCGCM42-1" (Normal) e
+  // "OUT-TCGCM42-1" (Outlet) derivam o MESMO model_code ("TCGCM42") —
+  // sem o product_type na chave, o upsert de um tipo sobrescreveria o
+  // registro do outro (ver comentário na migration 0022). Nunca funde as
+  // duas famílias mesmo quando o texto do model_code coincide.
+  const productKey = (modelCode: string, productType: string) => `${modelCode}::${productType}`;
+
+  const productsByCode = new Map<string, { name: string; normalized_name: string; model_code: string; product_type: string }>();
   for (const row of rows) {
-    if (!productsByCode.has(row.model_code)) {
-      productsByCode.set(row.model_code, { name: row.base, normalized_name: normalize(row.base), model_code: row.model_code });
+    const product_type = row.product_type || "outlet";
+    const key = productKey(row.model_code, product_type);
+    if (!productsByCode.has(key)) {
+      productsByCode.set(key, { name: row.base, normalized_name: normalize(row.base), model_code: row.model_code, product_type });
     }
   }
 
   const productIdByCode = new Map<string, string>();
   for (const batch of chunk(Array.from(productsByCode.values()), 500)) {
-    const { data, error } = await supabase.from("products").upsert(batch, { onConflict: "model_code" }).select("id, model_code");
+    const { data, error } = await supabase.from("products").upsert(batch, { onConflict: "model_code,product_type" }).select("id, model_code, product_type");
     if (error) throw error;
-    for (const row of data as { id: string; model_code: string }[]) {
-      productIdByCode.set(row.model_code, row.id);
+    for (const row of data as { id: string; model_code: string; product_type: string }[]) {
+      productIdByCode.set(productKey(row.model_code, row.product_type), row.id);
     }
   }
 
@@ -156,7 +168,7 @@ export async function upsertProductsAndVariants(rows: UpsertVariantRow[]): Promi
 
   const variantRows = rows
     .map((row) => {
-      const productId = productIdByCode.get(row.model_code);
+      const productId = productIdByCode.get(productKey(row.model_code, row.product_type || "outlet"));
       if (!productId) return null;
       return {
         product_id: productId,
@@ -226,6 +238,207 @@ export async function importCatalog(fileName: string, rawRows: Record<string, un
       .eq("id", importRow.id);
 
     invalidateAliasCache();
+
+    return { total_rows: rawRows.length, inserted_rows, updated_rows, rejected_rows, errors };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await supabase
+      .from("catalog_imports")
+      .update({ status: "failed", error_summary: { fatal: message }, finished_at: new Date().toISOString() })
+      .eq("id", importRow.id);
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Produtos Normais — EXPANSÃO GOSCAN: planilha só com Nome/SKU/EAN, sem cor/
+// imagem/treinamento. Reaproveita o MESMO upsert de products/product_variants
+// (upsertProductsAndVariants), só marcando product_type='normal' — nunca cria
+// tabela paralela (ver 0022_product_type_and_normal_products.sql).
+// ---------------------------------------------------------------------------
+export interface NormalImportRowInput {
+  nome?: string;
+  sku_code?: string;
+  ean?: string;
+}
+
+const NORMAL_HEADER_ALIASES: Record<string, keyof NormalImportRowInput> = {
+  nome: "nome",
+  produto: "nome",
+  descricao: "nome",
+  "descrição": "nome",
+  sku: "sku_code",
+  "codigo sku": "sku_code",
+  codigo: "sku_code",
+  ean: "ean",
+  gtin: "ean",
+  "gtin ean": "ean",
+  "gtin/ean": "ean",
+};
+
+export function mapNormalProductRows(rawRows: Record<string, unknown>[]): NormalImportRowInput[] {
+  return rawRows.map((raw) => {
+    const mapped: NormalImportRowInput = {};
+    for (const [key, value] of Object.entries(raw)) {
+      const normalizedKey = normalize(key);
+      const field = NORMAL_HEADER_ALIASES[normalizedKey];
+      if (field && value !== undefined && value !== null && String(value).trim() !== "") {
+        mapped[field] = String(value).trim();
+      }
+    }
+    return mapped;
+  });
+}
+
+export function validateAndNormalizeNormalRows(rows: NormalImportRowInput[]): { valid: UpsertVariantRow[]; errors: { row: number; reason: string }[] } {
+  const valid: UpsertVariantRow[] = [];
+  const errors: { row: number; reason: string }[] = [];
+
+  rows.forEach((r, idx) => {
+    const rowIndex = idx + 2;
+    const nome = (r.nome || "").trim();
+    const sku_code = (r.sku_code || "").trim();
+    if (!nome || !sku_code) {
+      errors.push({ row: rowIndex, reason: "Nome e SKU são obrigatórios." });
+      return;
+    }
+    // BUG REAL corrigido: sem isso, "Nome" completo (ex.: "Bolsa de Viagem
+    // GoCase Joy - Off White") virava o nome da FAMÍLIA inteira em
+    // products.name — como vários SKUs da mesma família (mesmo model_code)
+    // compartilham essa mesma linha de products, só o nome do PRIMEIRO SKU
+    // processado "vencia" e ficava colado em todas as cores da família.
+    // Removendo o sufixo " - Cor" do nome (mesma convenção já usada no
+    // import Outlet), a família agrupa com um nome limpo e consistente — a
+    // cor de cada SKU vem separadamente do código de sufixo do SKU (ver
+    // applySkuSuffixColors), não mais do texto livre do nome.
+    let base = nome;
+    if (nome.includes(" - ")) {
+      const lastDash = nome.lastIndexOf(" - ");
+      base = nome.slice(0, lastDash).trim();
+    }
+    // Mesma convenção de agrupamento por família do import Outlet (remove
+    // sufixo -N de variação) — reaproveitada de propósito para permitir que
+    // cores/variações do mesmo produto normal fiquem sob o mesmo "products".
+    const model_code = deriveModelCode(sku_code);
+    valid.push({ sku_code, base, cor: "", gtin: (r.ean || "").trim(), model_code, product_type: "normal" });
+  });
+
+  return { valid, errors };
+}
+
+interface ProductVariantRow {
+  id: string;
+  sku_code: string;
+  color: string | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Resolve e grava a cor dos SKUs informados pelo código de sufixo (mesma
+ * regra do Modo Scan Outlet) — NUNCA sobrescreve uma cor já cadastrada
+ * (fonte cadastral sempre vence, só preenche quando ainda está vazia).
+ * Paginado em blocos de 1000 (limite real do Supabase por requisição — ver
+ * bug já corrigido em fetchAllNormalProducts/nfeApi.ts) e faz upsert com a
+ * linha INTEIRA (nunca um objeto parcial — ver bug real já corrigido em
+ * finalizeReceipt/nfeApi.ts: upsert parcial viola colunas NOT NULL omitidas).
+ */
+async function applySkuSuffixColors(skuCodes: string[]): Promise<void> {
+  const supabase = getSupabase();
+  const uniqueSkus = Array.from(new Set(skuCodes.filter(Boolean)));
+  if (uniqueSkus.length === 0) return;
+
+  const codeMapRows: ColorCodeMapRow[] = [];
+  const PAGE_SIZE = 1000;
+  for (let page = 0; ; page++) {
+    const from = page * PAGE_SIZE;
+    const to = from + PAGE_SIZE - 1;
+    const { data, error } = await supabase
+      .from("product_variants")
+      .select("sku_code, color, products(capacity_ml)")
+      .not("color", "is", null)
+      .eq("active", true)
+      // BUG REAL corrigido: sem order(), o Postgres não garante linhas
+      // estáveis entre chamadas .range() separadas — order() por uma coluna
+      // que já vem no select (sku_code) torna a paginação determinística.
+      .order("sku_code")
+      .range(from, to);
+    if (error) throw error;
+    const batch = (data as unknown as { sku_code: string; color: string | null; products: { capacity_ml: number | null } | { capacity_ml: number | null }[] | null }[]) || [];
+    for (const row of batch) {
+      const product = Array.isArray(row.products) ? row.products[0] : row.products;
+      codeMapRows.push({ sku_code: row.sku_code, color: row.color, capacity_ml: product?.capacity_ml ?? null });
+    }
+    if (batch.length < PAGE_SIZE) break;
+  }
+
+  const codeMap = buildColorCodeMap(codeMapRows);
+  if (codeMap.size === 0) return;
+
+  for (const batch of chunk(uniqueSkus, 500)) {
+    const { data, error } = await supabase.from("product_variants").select("*").in("sku_code", batch);
+    if (error) throw error;
+
+    const updates: ProductVariantRow[] = [];
+    for (const row of (data as ProductVariantRow[]) || []) {
+      if (row.color) continue;
+      const resolvedColor = resolveColorFromSuffix(row.sku_code, codeMap);
+      if (!resolvedColor) continue;
+      updates.push({ ...row, color: resolvedColor, normalized_color: normalize(resolvedColor) });
+    }
+    if (updates.length > 0) {
+      const { error: updateError } = await supabase.from("product_variants").upsert(updates, { onConflict: "id" });
+      if (updateError) throw updateError;
+    }
+  }
+}
+
+export async function importNormalProducts(fileName: string, rawRows: Record<string, unknown>[]): Promise<ImportSummary> {
+  const { profile } = getAuthState();
+  if (!isManagerOrAdmin(profile)) {
+    throw new Error("Apenas manager ou admin podem importar produtos normais.");
+  }
+
+  const supabase = getSupabase();
+  const mapped = mapNormalProductRows(rawRows);
+  const { valid, errors } = validateAndNormalizeNormalRows(mapped);
+
+  const { data: importRow, error: importInsertError } = await supabase
+    .from("catalog_imports")
+    .insert({
+      file_name: fileName,
+      imported_by: profile!.id,
+      total_rows: rawRows.length,
+      status: "processing",
+      product_type: "normal",
+    })
+    .select()
+    .single();
+  if (importInsertError) throw importInsertError;
+
+  try {
+    const { insertedSkus, updatedSkus } = await upsertProductsAndVariants(valid);
+    const inserted_rows = insertedSkus.size;
+    const updated_rows = updatedSkus.size;
+    const rejected_rows = errors.length;
+
+    // EXPANSÃO GOSCAN — mesma lógica de resolução de cor pelo sufixo do SKU
+    // já usada no Modo Scan Outlet (ver skuColorResolver.ts), aplicada aos
+    // produtos normais recém-importados: Produtos Normais não têm coluna de
+    // Cor própria, então a cor vem do código de sufixo do SKU (nunca do
+    // texto livre do Nome, que não é confiável pra isso).
+    await applySkuSuffixColors(valid.map((v) => v.sku_code));
+
+    await supabase
+      .from("catalog_imports")
+      .update({
+        inserted_rows,
+        updated_rows,
+        rejected_rows,
+        status: "completed",
+        error_summary: errors.length ? { errors: errors.slice(0, 200), truncated: errors.length > 200 } : null,
+        finished_at: new Date().toISOString(),
+      })
+      .eq("id", importRow.id);
 
     return { total_rows: rawRows.length, inserted_rows, updated_rows, rejected_rows, errors };
   } catch (err) {

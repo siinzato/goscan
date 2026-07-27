@@ -2,7 +2,7 @@
 // product_variants (= SKU Outlet, a mesma tabela já usada pelo catálogo de
 // SKUs da Fase 1 — não duplicamos "produto" numa tabela nova).
 import { getSupabase } from "./supabaseClient.ts";
-import { getAuthState } from "./auth.ts";
+import { getAuthState, ensureFreshSession } from "./auth.ts";
 import { normalize } from "./utils.ts";
 
 export type ImageType = "catalogo" | "frontal" | "lateral" | "traseira" | "detalhe" | "embalagem";
@@ -259,6 +259,24 @@ export async function getSignedImageUrl(storagePath: string, expiresInSeconds = 
   return data.signedUrl;
 }
 
+/**
+ * Versão em lote de getSignedImageUrl — uma única chamada de rede pro Storage
+ * pra N caminhos, em vez de N chamadas paralelas (era o principal N+1 da
+ * listagem: cada thumbnail da página disparava sua própria requisição).
+ */
+export async function getSignedImageUrls(storagePaths: string[], expiresInSeconds = 600): Promise<Map<string, string>> {
+  const uniquePaths = [...new Set(storagePaths)];
+  const result = new Map<string, string>();
+  if (uniquePaths.length === 0) return result;
+  const supabase = getSupabase();
+  const { data, error } = await supabase.storage.from("product-images").createSignedUrls(uniquePaths, expiresInSeconds);
+  if (error || !data) return result;
+  for (const entry of data) {
+    if (entry.path && entry.signedUrl) result.set(entry.path, entry.signedUrl);
+  }
+  return result;
+}
+
 export interface ImageHistoryEntry {
   id: string;
   action: string;
@@ -401,6 +419,13 @@ export async function getImportItems(importId: string): Promise<CatalogImageImpo
 export async function uploadManualImage(input: ManualUploadInput): Promise<ProductImage> {
   const { profile } = getAuthState();
   const supabase = getSupabase();
+
+  // Escolher/tirar a foto pode levar a aba pro segundo plano (câmera, seletor
+  // de arquivos) tempo suficiente pra sessão precisar de refresh — garantir
+  // isso ANTES do upload evita perder a corrida com o refresh silencioso do
+  // visibilitychange (auth.ts) e bater num token já expirado no meio da
+  // operação.
+  await ensureFreshSession();
 
   const { blob, width, height } = await normalizeToWebp(input.file);
   const arrayBuffer = await blob.arrayBuffer();

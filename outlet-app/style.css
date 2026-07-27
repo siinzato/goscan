@@ -46,6 +46,14 @@
   --text-secondary: var(--neutral-600);
   --border-subtle: var(--neutral-200);
   --focus-ring: var(--go-blue-600);
+  /* Fundo tingido sutil (hover de linha/ícone, placeholder de miniatura, skeleton) —
+     distinto de --bg-surface (cor "de cartão") e --bg-page (cor "de página"). */
+  --bg-subtle: var(--neutral-100);
+  --bg-skeleton: var(--neutral-200);
+  /* Par "destaque suave": fundo tingido de azul + texto/ícone em azul por cima
+     (badge de cor do SKU, dropzone, chip de papel, estatística de resumo). */
+  --accent-soft-bg: var(--go-sky-100);
+  --accent-on-soft: var(--go-blue-700);
 
   --radius-sm: 10px;
   --radius-md: 14px;
@@ -57,6 +65,41 @@
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --bottom-nav-height: 64px;
+}
+
+/* ---------------------------------------------------------------------- */
+/* EXPANSÃO GOSCAN — Tema escuro. O tema claro acima é o padrão oficial e   */
+/* fica byte-a-byte como estava; este bloco só redefine os PAPÉIS          */
+/* semânticos (nunca a paleta --go- / --neutral- crua) — como todo         */
+/* componente do app já resolve cor através desses papéis (ver auditoria   */
+/* desta tarefa), o tema se propaga pra header/nav/cards/tabelas/modais/   */
+/* dropdowns/formulários automaticamente, sem editar nenhum arquivo de     */
+/* tela. Nunca aplicado dentro de @media print — relatório exportado/      */
+/* impresso continua sempre com fundo branco.                             */
+/* ---------------------------------------------------------------------- */
+:root[data-theme="dark"] {
+  --bg-page: #0D1420;
+  --bg-surface: #16202F;
+  --bg-subtle: #1C2839;
+  --bg-skeleton: #22304380;
+  --text-primary: #F2F4F8;
+  --text-secondary: #A7B0C0;
+  --border-subtle: #29354A;
+  --focus-ring: #4FA8E8;
+
+  --accent-soft-bg: #16283D;
+  --accent-on-soft: #7DC4F2;
+
+  --status-success: #34D399;
+  --status-success-bg: #103B2A;
+  --status-warning: #FBBF24;
+  --status-warning-bg: #3A2E0A;
+  --status-error: #F87171;
+  --status-error-bg: #3B1418;
+  --status-info: #7DC4F2;
+  --status-info-bg: #16283D;
+  --status-offline: #94A3B8;
+  --status-offline-bg: #1E2733;
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -233,7 +276,7 @@ h1, h2, h3 { font-family: var(--font-ui); font-weight: 700; color: var(--text-pr
 
 .hint-text code, .warning-box code, .notice-box code {
   font-family: var(--font-mono);
-  background: var(--neutral-100);
+  background: var(--bg-subtle);
   padding: 1px 5px;
   border-radius: 3px;
   font-size: 12px;
@@ -290,15 +333,15 @@ textarea { font-family: var(--font-ui); font-size: 15px; resize: vertical; }
 
 .btn-primary { background: var(--go-blue-700); color: var(--white); }
 .btn-primary:hover { background: var(--go-blue-800); }
-.btn-primary:disabled { background: var(--neutral-200); color: var(--text-secondary); cursor: not-allowed; }
+.btn-primary:disabled { background: var(--bg-skeleton); color: var(--text-secondary); cursor: not-allowed; }
 
 .btn-accent { background: var(--go-pink-600); color: var(--white); }
 .btn-accent:hover { background: var(--go-pink-500); }
 
-.btn-secondary { background: var(--white); border: 1px solid var(--border-subtle); color: var(--text-primary); }
+.btn-secondary { background: var(--bg-surface); border: 1px solid var(--border-subtle); color: var(--text-primary); }
 .btn-secondary:hover { border-color: var(--go-blue-600); color: var(--go-blue-700); }
 
-.btn-danger { background: var(--white); border: 1px solid var(--status-error); color: var(--status-error); }
+.btn-danger { background: var(--bg-surface); border: 1px solid var(--status-error); color: var(--status-error); }
 
 .btn-block { width: 100%; display: flex; }
 .btn-large { font-size: 15px; padding: 16px; }
@@ -325,7 +368,7 @@ textarea { font-family: var(--font-ui); font-size: 15px; resize: vertical; }
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
 }
-.icon-btn:hover { background: var(--neutral-100); color: var(--text-primary); }
+.icon-btn:hover { background: var(--bg-subtle); color: var(--text-primary); }
 .icon-btn.danger { color: var(--status-error); }
 .icon-btn svg { width: 20px; height: 20px; stroke: currentColor; }
 
@@ -338,7 +381,7 @@ textarea { font-family: var(--font-ui); font-size: 15px; resize: vertical; }
   flex-direction: column;
   position: relative;
   z-index: 1;
-  background: var(--white);
+  background: var(--bg-page);
 }
 .auth-screen-content {
   flex: 1;
@@ -445,7 +488,7 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
 .pwa-install-overlay.pwa-open { opacity: 1; }
 
 .pwa-install-panel {
-  background: var(--white);
+  background: var(--bg-surface);
   width: calc(100% - 24px);
   max-width: 640px;
   max-height: 90vh;
@@ -490,7 +533,7 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   align-items: flex-start;
   gap: 10px;
   padding: 12px;
-  background: var(--neutral-100);
+  background: var(--bg-subtle);
   border-radius: var(--radius-md);
 }
 .pwa-step-number {
@@ -561,8 +604,8 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.02em;
-  color: var(--go-blue-700);
-  background: var(--go-sky-100);
+  color: var(--accent-on-soft);
+  background: var(--accent-soft-bg);
   padding: 2px 8px;
   border-radius: 20px;
   margin-top: 2px;
@@ -624,7 +667,7 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   padding: 32px 16px;
   color: var(--text-secondary);
 }
-.empty-state svg { width: 40px; height: 40px; stroke: var(--neutral-400); margin-bottom: 10px; }
+.empty-state svg { width: 40px; height: 40px; stroke: var(--text-secondary); margin-bottom: 10px; }
 .empty-state p { margin: 0; font-size: 13px; }
 
 /* ---------------------------------------------------------------------- */
@@ -666,7 +709,7 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   padding: 8px 14px;
   border-radius: 20px;
   border: 1px solid var(--border-subtle);
-  background: var(--white);
+  background: var(--bg-surface);
   color: var(--text-secondary);
   cursor: pointer;
   min-height: 36px;
@@ -695,7 +738,7 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   font-size: 13px;
   padding: 10px 8px;
   border: 1px solid var(--border-subtle);
-  background: var(--white);
+  background: var(--bg-surface);
   border-radius: var(--radius-sm);
   cursor: pointer;
   color: var(--text-secondary);
@@ -719,19 +762,19 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   justify-content: center;
   gap: 6px;
   border: 2px dashed var(--go-sky-500);
-  background: var(--go-sky-100);
+  background: var(--accent-soft-bg);
   border-radius: var(--radius-md);
   padding: 28px 16px;
   cursor: pointer;
   text-align: center;
-  color: var(--go-blue-700);
+  color: var(--accent-on-soft);
   font-size: 13px;
   min-height: 96px;
 }
 
 .dropzone.small { padding: 16px; min-height: 64px; }
 .dz-icon { display: flex; }
-.dz-icon svg { width: 26px; height: 26px; stroke: var(--go-blue-700); }
+.dz-icon svg { width: 26px; height: 26px; stroke: var(--accent-on-soft); }
 .dz-hint { font-size: 11px; color: var(--text-secondary); }
 
 .image-preview-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
@@ -749,19 +792,19 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   overflow: hidden;
 }
 .qty-stepper button {
-  background: var(--neutral-100);
+  background: var(--bg-subtle);
   border: none;
   width: 36px;
   height: 36px;
   font-size: 16px;
   font-weight: 700;
-  color: var(--go-blue-700);
+  color: var(--accent-on-soft);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
 }
-.qty-stepper button:hover { background: var(--go-sky-100); }
+.qty-stepper button:hover { background: var(--accent-soft-bg); }
 .qty-stepper input {
   width: 44px;
   text-align: center;
@@ -843,7 +886,7 @@ thead th {
 }
 
 tbody td { padding: 8px 10px; border-bottom: 1px solid var(--border-subtle); vertical-align: middle; }
-tbody tr:hover { background: var(--neutral-100); }
+tbody tr:hover { background: var(--bg-subtle); }
 
 td input, td select {
   width: 100%;
@@ -855,7 +898,7 @@ td input, td select {
   background: transparent;
   margin-bottom: 0;
 }
-td input:hover, td select:hover, td input:focus, td select:focus { border-color: var(--border-subtle); background: var(--white); }
+td input:hover, td select:hover, td input:focus, td select:focus { border-color: var(--border-subtle); background: var(--bg-surface); }
 
 .sku-code { font-family: var(--font-mono); font-size: 11.5px; }
 
@@ -875,6 +918,20 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 }
 .row-remove svg { width: 16px; height: 16px; }
 
+/* Igual a .product-card, mas SEM overflow:hidden — usado só onde um
+   .sku-picker (dropdown position:absolute) vive dentro do card, porque
+   overflow:hidden do .product-card cortava o dropdown de resultados e
+   impedia rolar pra ver as opções (bug real reportado na tela "Resolver
+   pendências" da Conferência por NF). */
+.pending-item-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  min-width: 0;
+  max-width: 100%;
+}
+
 /* ---------------------------------------------------------------------- */
 /* SKU picker (autocomplete — nunca um <select> com milhares de options)   */
 /* ---------------------------------------------------------------------- */
@@ -886,7 +943,7 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   left: 0;
   right: 0;
   z-index: 30;
-  background: var(--white);
+  background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   max-height: 220px;
@@ -907,10 +964,10 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   cursor: pointer;
   min-height: 44px;
 }
-.sku-picker-item:hover { background: var(--go-sky-100); }
-.sku-picker-item-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.sku-picker-item-info .product-card-name { margin: 0; }
-.sku-picker-item-info .sku-code { margin: 0; }
+.sku-picker-item:hover { background: var(--accent-soft-bg); }
+.sku-picker-item-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; max-width: 100%; }
+.sku-picker-item-info .product-card-name { margin: 0; overflow-wrap: anywhere; }
+.sku-picker-item-info .sku-code { margin: 0; overflow-wrap: anywhere; }
 .sku-picker-empty { padding: 10px 12px; font-size: 12px; color: var(--text-secondary); }
 
 /* Correção de SKU de um item já adicionado ("Alterar produto") */
@@ -919,6 +976,14 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 /* Sugestões de produto quando o matcher encontra mais de uma opção compatível */
 .ambiguous-suggestions { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
 .ambiguous-suggestions button { text-align: left; }
+.ambiguous-suggestions .scan-capacity-card {
+  flex-direction: row;
+  align-items: center;
+  text-align: left;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.ambiguous-suggestions .scan-capacity-card strong { font-size: 14px; flex-shrink: 0; }
 
 /* ---------------------------------------------------------------------- */
 /* Catálogo / paginação                                                    */
@@ -940,7 +1005,7 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 /* ---------------------------------------------------------------------- */
 @keyframes skeleton-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 .skeleton {
-  background: var(--neutral-200);
+  background: var(--bg-skeleton);
   border-radius: var(--radius-sm);
   animation: skeleton-pulse 1.4s ease-in-out infinite;
 }
@@ -965,6 +1030,7 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 .toast {
   background: var(--neutral-950);
   color: var(--white);
+  border: 1px solid transparent;
   padding: 12px 16px;
   border-radius: var(--radius-sm);
   font-size: 13px;
@@ -994,7 +1060,7 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   justify-content: center;
 }
 .modal-sheet {
-  background: var(--white);
+  background: var(--bg-surface);
   width: 100%;
   max-width: 480px;
   border-radius: var(--radius-lg) var(--radius-lg) 0 0;
@@ -1020,13 +1086,13 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   border-radius: var(--radius-sm);
   object-fit: cover;
   flex-shrink: 0;
-  background: var(--neutral-100);
+  background: var(--bg-subtle);
 }
 .thumb-placeholder {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--neutral-400);
+  color: var(--text-secondary);
 }
 .thumb-placeholder svg { width: 20px; height: 20px; }
 
@@ -1035,7 +1101,7 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   max-width: 320px;
   aspect-ratio: 1;
   object-fit: contain;
-  background: var(--neutral-100);
+  background: var(--bg-subtle);
   border-radius: var(--radius-md);
   border: 1px solid var(--border-subtle);
   display: block;
@@ -1074,11 +1140,11 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   margin-bottom: 4px;
 }
 .summary-stat {
-  background: var(--go-sky-100);
+  background: var(--accent-soft-bg);
   border-radius: var(--radius-md);
   padding: 12px 14px;
 }
-.summary-stat strong { display: block; font-size: 22px; color: var(--go-blue-800); }
+.summary-stat strong { display: block; font-size: 22px; color: var(--accent-on-soft); }
 .summary-stat span { font-size: 11.5px; color: var(--text-secondary); }
 .summary-stat.warn { background: var(--status-warning-bg); }
 .summary-stat.warn strong { color: var(--status-warning); }
@@ -1104,7 +1170,7 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 
 .progress-bar-track {
   height: 8px;
-  background: var(--neutral-200);
+  background: var(--bg-skeleton);
   border-radius: 20px;
   overflow: hidden;
   margin: 10px 0;
@@ -1154,6 +1220,23 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   gap: 12px;
   margin: -16px -16px 0;
 }
+
+/* Diagnóstico temporário do gargalo de estabilização — só visível pra
+   admin (ver renderDiagnosticPanelHtml). Fica recolhido por padrão. */
+.scan-diag-panel {
+  margin: 0 16px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+.scan-diag-panel summary { cursor: pointer; font-weight: 600; }
+.scan-diag-panel dl { margin: 8px 0 0; display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; }
+.scan-diag-panel dt { color: var(--text-secondary); }
+.scan-diag-panel dd { margin: 0; text-align: right; color: var(--text-primary); overflow-wrap: anywhere; }
 .scan-camera-wrap {
   position: relative;
   width: 100%;
@@ -1214,7 +1297,7 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 
 .scan-bottom-sheet { padding: 0 16px; }
 .scan-card {
-  background: var(--white);
+  background: var(--bg-surface);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
   padding: 16px;
@@ -1224,8 +1307,33 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 }
 .scan-card.success { align-items: center; text-align: center; color: var(--status-success); }
 .scan-found-title { font-weight: 700; font-size: 15px; margin: 0; }
-.scan-product-row { display: flex; gap: 12px; align-items: center; }
+.scan-product-row { display: flex; gap: 12px; align-items: center; min-width: 0; max-width: 100%; }
+.scan-product-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.scan-product-info .product-card-name, .scan-product-info .sku-code { margin: 0; overflow-wrap: anywhere; }
 .scan-actions { display: flex; flex-direction: column; gap: 8px; }
+
+/* Cor da variação exata do SKU — sempre texto (nunca só a bolinha), com mais
+   destaque que o texto normal do produto. Sem cor cadastrada, fica visível
+   mas discreta ("Cor não informada"), nunca inventada. */
+.scan-color-badge {
+  display: inline-flex;
+  align-items: center;
+  font-weight: 700;
+  font-size: 12.5px;
+  color: var(--accent-on-soft);
+  background: var(--accent-soft-bg);
+  padding: 2px 9px;
+  border-radius: 20px;
+  width: fit-content;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.scan-color-badge.unknown {
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  font-weight: 500;
+  font-style: italic;
+}
 
 .scan-capacity-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .scan-capacity-card {
@@ -1237,12 +1345,15 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   padding: 16px 8px;
   border: 2px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  background: var(--white);
+  background: var(--bg-surface);
   min-height: 44px;
+  min-width: 0;
+  max-width: 100%;
 }
 .scan-capacity-card:hover, .scan-capacity-card:focus-visible { border-color: var(--go-blue-600); }
 .scan-capacity-card strong { font-size: 18px; }
-.scan-capacity-card .sku-code { font-size: 11px; }
+.scan-capacity-card span { max-width: 100%; overflow-wrap: anywhere; }
+.scan-capacity-card .sku-code { font-size: 11px; overflow-wrap: anywhere; }
 
 .scan-qty-stepper { justify-content: center; margin: 8px 0; }
 .scan-manual-results { max-height: 260px; overflow-y: auto; }
@@ -1250,4 +1361,244 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 @media (min-width: 720px) {
   .scan-screen { margin: -24px -24px 0; }
   .scan-camera-wrap { aspect-ratio: 16 / 9; max-height: 480px; }
+}
+
+/* ---------------------------------------------------------------------- */
+/* EXPANSÃO GOSCAN — Conferência por Nota Fiscal                          */
+/* ---------------------------------------------------------------------- */
+/* Linha do campo de EAN (bipagem/digitação) — ícone + input, reaproveita
+   o mesmo input de sempre, só adiciona o alinhamento em linha. */
+.search-row-icon { display: flex; align-items: center; gap: 8px; }
+.search-row-icon svg { width: 20px; height: 20px; flex-shrink: 0; color: var(--text-secondary); }
+.search-row-icon input { margin: 0; flex: 1; min-width: 0; }
+
+/* Contagem cega usa <input type="number"> dentro do stepper (o resto do app
+   usa readonly) — some com as setinhas nativas, os botões +/- já bastam. */
+.qty-stepper input[type="number"]::-webkit-outer-spin-button,
+.qty-stepper input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.qty-stepper input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+
+/* ---------------------------------------------------------------------- */
+/* EXPANSÃO GOSCAN — Central de Perfil: hub (Configurações/Ajuda/Sobre)    */
+/* ---------------------------------------------------------------------- */
+.profile-menu { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.profile-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  text-align: left;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  min-height: 44px;
+}
+.profile-menu-item:hover, .profile-menu-item:focus-visible { border-color: var(--go-blue-600); background: var(--bg-subtle); }
+.profile-menu-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft-bg);
+  color: var(--accent-on-soft);
+  flex-shrink: 0;
+}
+.profile-menu-icon svg { width: 20px; height: 20px; }
+.profile-menu-text { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+.profile-menu-text strong { font-size: 14.5px; color: var(--text-primary); }
+.profile-menu-text span { font-size: 12.5px; color: var(--text-secondary); line-height: 1.4; }
+.profile-menu-chevron { display: flex; color: var(--text-secondary); flex-shrink: 0; }
+.profile-menu-chevron svg { width: 18px; height: 18px; }
+
+@media (min-width: 720px) {
+  .profile-menu { flex-direction: row; flex-wrap: wrap; }
+  .profile-menu-item { flex: 1 1 calc(33.333% - 7px); flex-direction: column; align-items: flex-start; text-align: left; }
+  .profile-menu-item .profile-menu-chevron { display: none; }
+}
+
+/* ---------------------------------------------------------------------- */
+/* EXPANSÃO GOSCAN — Configurações: Aparência / Segurança                  */
+/* ---------------------------------------------------------------------- */
+.theme-switch { display: flex; gap: 10px; }
+.theme-option {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 16px 10px;
+  border: 2px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  min-height: 44px;
+}
+.theme-option svg { width: 22px; height: 22px; }
+.theme-option.active { border-color: var(--go-blue-600); color: var(--go-blue-700); background: var(--accent-soft-bg); }
+
+.password-field { position: relative; display: flex; align-items: center; }
+.password-field input { flex: 1; padding-right: 46px; }
+.password-field .icon-btn { position: absolute; right: 2px; }
+
+.password-requirements { list-style: none; margin: -6px 0 14px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.password-requirements li { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+.password-requirements li svg { width: 14px; height: 14px; flex-shrink: 0; }
+.password-requirements li.met { color: var(--status-success); }
+
+.force-password-card { max-width: 420px; width: 100%; }
+.force-password-icon { display: flex; justify-content: center; color: var(--go-blue-700); margin-bottom: 4px; }
+.force-password-icon svg { width: 32px; height: 32px; }
+.force-password-card #forcePwFormWrap { width: 100%; text-align: left; margin-top: 10px; }
+
+/* ---------------------------------------------------------------------- */
+/* EXPANSÃO GOSCAN — Central de Ajuda                                     */
+/* ---------------------------------------------------------------------- */
+.help-quicknav { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.help-quicknav .chip { padding: 6px 12px; font-size: 12px; min-height: 32px; }
+
+.help-accordion { padding: 6px; }
+.help-topic { border-bottom: 1px solid var(--border-subtle); }
+.help-topic:last-child { border-bottom: none; }
+.help-topic summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 10px;
+  cursor: pointer;
+  list-style: none;
+  min-height: 44px;
+}
+.help-topic summary::-webkit-details-marker { display: none; }
+.help-topic-icon { display: flex; color: var(--accent-on-soft); flex-shrink: 0; }
+.help-topic-icon svg { width: 18px; height: 18px; }
+.help-topic-title { flex: 1; font-weight: 600; font-size: 13.5px; color: var(--text-primary); }
+.help-topic-chevron { display: flex; color: var(--text-secondary); transition: transform 0.15s ease; flex-shrink: 0; }
+.help-topic-chevron svg { width: 18px; height: 18px; }
+.help-topic[open] .help-topic-chevron { transform: rotate(180deg); }
+.help-topic-body { padding: 0 10px 16px 42px; font-size: 13.5px; color: var(--text-secondary); line-height: 1.55; }
+.help-topic-body p { margin: 0 0 10px; }
+.help-topic-body ul, .help-topic-body ol { margin: 0 0 10px; padding-left: 20px; }
+.help-topic-body li { margin-bottom: 6px; }
+.help-topic-body strong { color: var(--text-primary); }
+.help-topic-body .notice-box, .help-topic-body .warning-box { margin: 6px 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .help-topic-chevron { transition: none; }
+}
+
+/* ---------------------------------------------------------------------- */
+/* EXPANSÃO GOSCAN — "Sobre o GoScan"                                     */
+/* ---------------------------------------------------------------------- */
+.about-story p { font-size: 14px; line-height: 1.65; color: var(--text-secondary); margin: 0 0 14px; }
+.about-story p:last-child { margin-bottom: 0; }
+
+.about-mission {
+  background: linear-gradient(135deg, var(--go-blue-800), var(--go-blue-700));
+  color: var(--white);
+}
+.about-mission h3 { color: var(--white); margin-bottom: 8px; }
+.about-mission p { font-size: 15px; font-style: italic; line-height: 1.6; margin: 0; opacity: 0.95; }
+
+.about-deliverables { display: flex; flex-direction: column; gap: 10px; }
+.about-deliverable-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px;
+  background: var(--bg-subtle);
+  border-radius: var(--radius-md);
+}
+.about-deliverable-icon { display: flex; color: var(--accent-on-soft); margin-bottom: 2px; }
+.about-deliverable-icon svg { width: 20px; height: 20px; }
+.about-deliverable-card strong { font-size: 13.5px; color: var(--text-primary); }
+.about-deliverable-card span { font-size: 12.5px; color: var(--text-secondary); line-height: 1.4; }
+
+@media (min-width: 720px) {
+  .about-deliverables { flex-direction: row; flex-wrap: wrap; }
+  .about-deliverable-card { flex: 1 1 calc(33.333% - 7px); min-width: 200px; }
+}
+
+.about-timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0; }
+.about-timeline li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-left: 2px solid var(--border-subtle);
+  padding-left: 16px;
+  margin-left: 13px;
+  font-size: 13.5px;
+  color: var(--text-primary);
+}
+.about-timeline li:last-child { border-left-color: transparent; }
+.about-timeline-index {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--go-blue-700);
+  color: var(--white);
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+  margin-left: -29px;
+}
+
+@media (min-width: 720px) {
+  .about-timeline { flex-direction: row; flex-wrap: wrap; gap: 12px; }
+  .about-timeline li { flex: 1 1 calc(25% - 12px); flex-direction: column; align-items: flex-start; border-left: none; border-top: 2px solid var(--border-subtle); padding-left: 0; padding-top: 14px; margin-left: 0; }
+  .about-timeline li:last-child { border-top-color: var(--border-subtle); }
+  .about-timeline-index { margin-left: 0; margin-bottom: 4px; }
+}
+
+.about-closing {
+  text-align: center;
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.about-closing strong { font-size: 14px; color: var(--text-primary); }
+.about-closing span { font-size: 12.5px; color: var(--text-secondary); }
+
+/* ---------------------------------------------------------------------- */
+/* "Exportar PDF" do Relatório de Conferência = window.print() — sem lib   */
+/* nova. Esconde a navegação/controles, força a versão em tabela (mesmo no */
+/* celular) e nunca corta colunas nem limita a altura da tabela.          */
+/* ---------------------------------------------------------------------- */
+@media print {
+  .bottom-nav,
+  .app-header,
+  .input-mode-switch,
+  #nfeReportSearch,
+  .review-actions,
+  #btnBackToUpload2,
+  [data-recount-start],
+  [data-recount-confirm],
+  [data-recount-input],
+  .row-remove {
+    display: none !important;
+  }
+  .product-card-list.mobile-only { display: none !important; }
+  .table-wrap.desktop-only {
+    display: block !important;
+    overflow: visible !important;
+    max-height: none !important;
+    border: none !important;
+  }
+  table { font-size: 11px; width: 100%; }
+  thead { display: table-header-group; }
+  tr { break-inside: avoid; }
+  .card { break-inside: avoid-page; border: none !important; box-shadow: none !important; padding: 8px 0 !important; }
 }

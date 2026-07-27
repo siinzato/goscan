@@ -11,7 +11,7 @@ import {
   getCatalogVisualSummary,
   listCatalogVisualProducts,
   getProductVisualDetail,
-  getSignedImageUrl,
+  getSignedImageUrls,
   getImageHistory,
   setPrimaryImage,
   archiveImage,
@@ -51,6 +51,9 @@ declare const XLSX: {
 type SubView = "list" | "detail" | "imports" | "training";
 let subView: SubView = "list";
 let selectedVariantId: string | null = null;
+// posição de scroll da lista, capturada ao abrir um produto — restaurada ao
+// voltar (ver "abre produto → volta pro catálogo" na tela de login/catálogo).
+let listScrollY = 0;
 
 // estado da lista
 let listQuery = "";
@@ -111,14 +114,17 @@ async function renderCurrentSubView(body: HTMLElement): Promise<void> {
 
 async function hydrateThumbnails(container: Element): Promise<void> {
   const imgs = [...container.querySelectorAll<HTMLImageElement>("img.thumb-img[data-storage-path], img.thumb-img-lg[data-storage-path], img.gallery-thumb[data-storage-path]")];
-  await Promise.all(
-    imgs.map(async (img) => {
-      const path = img.dataset.storagePath;
-      if (!path) return;
-      const url = await getSignedImageUrl(path);
-      if (url) img.src = url;
-    })
-  );
+  const paths = imgs.map((img) => img.dataset.storagePath).filter((p): p is string => !!p);
+  if (paths.length === 0) return;
+  // Uma única requisição em lote pro Storage pra todas as thumbnails visíveis
+  // — antes eram N requisições paralelas (uma por imagem), o principal N+1
+  // real encontrado na listagem do Catálogo Visual.
+  const urls = await getSignedImageUrls(paths);
+  for (const img of imgs) {
+    const path = img.dataset.storagePath;
+    const url = path && urls.get(path);
+    if (url) img.src = url;
+  }
 }
 
 function thumbHtml(image: ProductImage | null, extraClass = "thumb-img"): string {
@@ -311,6 +317,7 @@ function renderQualityCards(wrap: Element, rows: RecognitionQualityListRow[]): v
 
   wrap.querySelectorAll<HTMLElement>("[data-open-variant]").forEach((el) => {
     el.addEventListener("click", () => {
+      listScrollY = window.scrollY;
       selectedVariantId = el.dataset.openVariant!;
       subView = "detail";
       const body = wrap.closest("#catalogVisualBody") as HTMLElement;
@@ -420,6 +427,7 @@ function renderProductCards(wrap: Element, rows: CatalogVisualProduct[]): void {
 
   wrap.querySelectorAll<HTMLElement>("[data-open-variant]").forEach((el) => {
     el.addEventListener("click", () => {
+      listScrollY = window.scrollY;
       selectedVariantId = el.dataset.openVariant!;
       subView = "detail";
       const body = wrap.closest("#catalogVisualBody") as HTMLElement;
@@ -556,9 +564,10 @@ async function renderProductDetail(body: HTMLElement, variantId: string): Promis
 
   void hydrateThumbnails(body);
 
-  body.querySelector("#cvBackToList")!.addEventListener("click", () => {
+  body.querySelector("#cvBackToList")!.addEventListener("click", async () => {
     subView = "list";
-    void renderCurrentSubView(body);
+    await renderCurrentSubView(body);
+    window.scrollTo(0, listScrollY);
   });
 
   body.querySelectorAll<HTMLElement>("#cvGallery [data-image-id]").forEach((el) => {
@@ -997,54 +1006,81 @@ async function renderTrainingView(body: HTMLElement): Promise<void> {
 }
 
 async function renderTrainingCapture(body: HTMLElement): Promise<void> {
-  const step = ANGLE_STEPS[trainingStepIndex];
-  body.innerHTML = `
-    <button class="link-btn" id="trainCancel" style="text-align:left">${Icon.chevronLeft} Cancelar treinamento</button>
-    <div class="card">
-      <h2>Criar Reconhecimento</h2>
-      <p class="hint-text">Etapa ${trainingStepIndex + 1} de ${ANGLE_STEPS.length} — ${trainingCaptures.length} foto(s) capturada(s) até agora.</p>
-      <div class="scan-camera-wrap" style="position:relative;max-width:420px">
-        <video id="trainVideo" class="scan-video" playsinline muted></video>
-      </div>
-      <p class="scan-found-title" style="margin-top:12px">${escapeHtml(step.label)}</p>
-      <div id="trainCaptureStatus" role="status" aria-live="polite"></div>
-      <div class="scan-actions">
-        <button class="btn-primary btn-block" id="trainCaptureBtn">${Icon.camera}Capturar</button>
-        <button class="btn-secondary btn-block" id="trainSkipBtn">Pular esta etapa</button>
-      </div>
-    </div>`;
+  // O <video> (e a câmera por trás dele) só é criado UMA VEZ, na primeira
+  // etapa. Antes, essa função recriava todo o body.innerHTML — inclusive o
+  // <video> — a cada troca de etapa; a MediaStream continuava viva (nunca
+  // parada), mas ficava "órfã", ligada a um elemento de vídeo que não estava
+  // mais no DOM. O novo <video> nunca recebia o srcObject de volta (o código
+  // só chamava startCamera() quando trainingCamera ainda era null), e por
+  // isso a partir da 2ª etapa o preview ficava preto. Agora a estrutura com
+  // o <video> só é montada quando ainda não existe câmera; nas etapas
+  // seguintes, apenas o texto/botões são atualizados, sem tocar no <video>.
+  if (!trainingCamera) {
+    body.innerHTML = `
+      <button class="link-btn" id="trainCancel" style="text-align:left">${Icon.chevronLeft} Cancelar treinamento</button>
+      <div class="card">
+        <h2>Criar Reconhecimento</h2>
+        <p class="hint-text" id="trainStepInfo"></p>
+        <div class="scan-camera-wrap" style="position:relative;max-width:420px">
+          <video id="trainVideo" class="scan-video" playsinline autoplay muted></video>
+        </div>
+        <p class="scan-found-title" id="trainStepLabel" style="margin-top:12px"></p>
+        <div id="trainCaptureStatus" role="status" aria-live="polite"></div>
+        <div class="scan-actions">
+          <button class="btn-primary btn-block" id="trainCaptureBtn">${Icon.camera}Capturar</button>
+          <button class="btn-secondary btn-block" id="trainSkipBtn">Pular esta etapa</button>
+        </div>
+      </div>`;
 
-  body.querySelector("#trainCancel")!.addEventListener("click", () => {
-    teardownTraining();
-    subView = "list";
-    void renderCurrentSubView(body);
-  });
+    body.querySelector("#trainCancel")!.addEventListener("click", () => {
+      teardownTraining();
+      subView = "list";
+      void renderCurrentSubView(body);
+    });
 
-  const videoEl = body.querySelector<HTMLVideoElement>("#trainVideo")!;
-  try {
-    if (!trainingCamera) {
+    const videoEl = body.querySelector<HTMLVideoElement>("#trainVideo")!;
+    try {
       trainingCamera = await startCamera(videoEl, "environment");
+    } catch (err) {
+      const message =
+        err instanceof CameraPermissionDeniedError
+          ? "Permissão de câmera negada. Habilite o acesso à câmera nas configurações do navegador."
+          : err instanceof CameraUnavailableError
+            ? "Não foi possível acessar a câmera: " + err.message
+            : "Erro inesperado ao abrir a câmera.";
+      // Mostra o erro + "Reativar câmera" só dentro do status, sem apagar o
+      // botão "Cancelar treinamento" (o usuário sempre precisa de uma saída).
+      const statusEl = body.querySelector("#trainCaptureStatus")!;
+      statusEl.innerHTML = `
+        <div class="error-box-retry">
+          <p class="error-box">${escapeHtml(message)}</p>
+          <button type="button" class="btn-secondary" id="trainRetryCamera">Reativar câmera</button>
+        </div>`;
+      statusEl.querySelector("#trainRetryCamera")!.addEventListener("click", () => void renderTrainingCapture(body));
+      return;
     }
-  } catch (err) {
-    const statusEl = body.querySelector("#trainCaptureStatus")!;
-    const message =
-      err instanceof CameraPermissionDeniedError
-        ? "Permissão de câmera negada. Habilite o acesso à câmera nas configurações do navegador."
-        : err instanceof CameraUnavailableError
-          ? "Não foi possível acessar a câmera: " + err.message
-          : "Erro inesperado ao abrir a câmera.";
-    statusEl.innerHTML = `<p class="error-box">${escapeHtml(message)}</p>`;
-    return;
   }
 
-  body.querySelector("#trainSkipBtn")!.addEventListener("click", () => {
-    advanceTrainingStep(body);
-  });
+  updateTrainingStepUI(body);
+}
 
-  body.querySelector("#trainCaptureBtn")!.addEventListener("click", async () => {
-    const btn = body.querySelector<HTMLButtonElement>("#trainCaptureBtn")!;
+/** Atualiza só o texto/orientação/botões da etapa atual — nunca toca no <video>. */
+function updateTrainingStepUI(body: HTMLElement): void {
+  const step = ANGLE_STEPS[trainingStepIndex];
+  body.querySelector("#trainStepInfo")!.textContent =
+    `Etapa ${trainingStepIndex + 1} de ${ANGLE_STEPS.length} — ${trainingCaptures.length} foto(s) capturada(s) até agora.`;
+  body.querySelector("#trainStepLabel")!.textContent = step.label;
+  body.querySelector("#trainCaptureStatus")!.innerHTML = "";
+
+  // Atribuição direta (não addEventListener) de propósito: os botões
+  // persistem entre etapas, então addEventListener empilharia um handler
+  // novo (com o "step" antigo) a cada troca — .onclick sempre substitui.
+  body.querySelector<HTMLButtonElement>("#trainSkipBtn")!.onclick = () => advanceTrainingStep(body);
+
+  const captureBtn = body.querySelector<HTMLButtonElement>("#trainCaptureBtn")!;
+  captureBtn.onclick = async () => {
     const statusEl = body.querySelector("#trainCaptureStatus")!;
-    btn.disabled = true;
+    captureBtn.disabled = true;
     statusEl.innerHTML = `<p class="hint-text">Analisando qualidade da foto…</p>`;
     try {
       const blob = await trainingCamera!.captureFrameBlob(900, 0.9);
@@ -1064,9 +1100,9 @@ async function renderTrainingCapture(body: HTMLElement): Promise<void> {
     } catch (err) {
       statusEl.innerHTML = `<div class="error-box">Erro: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
     } finally {
-      btn.disabled = false;
+      captureBtn.disabled = false;
     }
-  });
+  };
 }
 
 function advanceTrainingStep(body: HTMLElement): void {
@@ -1093,7 +1129,7 @@ function renderTrainingProductSelect(body: HTMLElement): void {
   input.addEventListener("input", () => {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(async () => {
-      const rows = input.value.trim() ? await searchSkuForPicker(input.value, 15) : [];
+      const rows = input.value.trim() ? await searchSkuForPicker(input.value, 15, "outlet") : [];
       renderTrainingProductResults(results, rows, body);
     }, 300);
   });

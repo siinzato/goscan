@@ -46,6 +46,32 @@ export function formatDateTime(iso: string | null | undefined): string {
 
 export class ValidationError extends Error {}
 
+/**
+ * Extrai uma mensagem legível de QUALQUER erro capturado — não só
+ * instâncias de Error. Erros do Supabase/PostgREST (PostgrestError) são
+ * objetos simples ({message, code, details, hint}), não instâncias de
+ * Error: `err instanceof Error` dá false pra eles, e o fallback antigo
+ * `String(err)` virava literalmente o texto "[object Object]", escondendo
+ * a causa real (BUG REAL corrigido: mensagem de erro inútil ao vincular
+ * produto na Conferência por NF).
+ */
+export function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const obj = err as Record<string, unknown>;
+    if (typeof obj.message === "string" && obj.message) {
+      const code = typeof obj.code === "string" ? ` (${obj.code})` : "";
+      return obj.message + code;
+    }
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return String(err);
+    }
+  }
+  return String(err);
+}
+
 /** Iniciais para o avatar do operador (ex.: "Ana Souza" -> "AS"). */
 export function initials(name: string | null | undefined): string {
   const parts = (name || "").trim().split(/\s+/).filter(Boolean);
@@ -57,6 +83,41 @@ export function initials(name: string | null | undefined): string {
 /** Gera um id local temporário para itens ainda não persistidos no servidor. */
 export function localId(): string {
   return `local-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+// ---------------------------------------------------------------------------
+// EXPANSÃO GOSCAN — Central de Perfil: validações reais (Minha Conta/Segurança).
+// ---------------------------------------------------------------------------
+
+/** RFC-simplificado, suficiente pra pegar erro de digitação sem rejeitar e-mails válidos incomuns. */
+export function isValidEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+/** Telefone BR: aceita com/sem DDI (+55), com/sem DDD, fixo (10 dígitos) ou celular (11) — só valida a contagem de dígitos, não formata. */
+export function isValidBrPhone(value: string): boolean {
+  const digits = value.replace(/\D/g, "").replace(/^55/, "");
+  return digits.length === 10 || digits.length === 11;
+}
+
+export interface PasswordRequirement {
+  key: string;
+  label: string;
+  met: boolean;
+}
+
+/** Mesmo mínimo pedido: 8+ caracteres, maiúscula, minúscula, número. */
+export function passwordRequirements(password: string): PasswordRequirement[] {
+  return [
+    { key: "length", label: "Pelo menos 8 caracteres", met: password.length >= 8 },
+    { key: "upper", label: "Uma letra maiúscula", met: /[A-Z]/.test(password) },
+    { key: "lower", label: "Uma letra minúscula", met: /[a-z]/.test(password) },
+    { key: "number", label: "Um número", met: /[0-9]/.test(password) },
+  ];
+}
+
+export function passwordMeetsRequirements(password: string): boolean {
+  return passwordRequirements(password).every((r) => r.met);
 }
 
 let retryHandlerSeq = 0;

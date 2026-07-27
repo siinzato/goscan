@@ -1,7 +1,7 @@
 // Modo Scan — Parte 2: "Preparar imagens para o Scan" (geração de
 // embeddings em lote) + revisão de família/variante/capacidade + teste
 // interno de similaridade visual, sem câmera (isso é a Parte 4).
-import { escapeHtml } from "../../utils.ts";
+import { escapeHtml, renderErrorWithRetry } from "../../utils.ts";
 import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
 import {
@@ -150,7 +150,7 @@ async function loadSummary(root: HTMLElement): Promise<void> {
       </div>`;
   } catch (err) {
     wrap.className = "";
-    wrap.innerHTML = `<div class="error-box">Erro ao carregar status: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(wrap, "Erro ao carregar status: " + (err instanceof Error ? err.message : String(err)), () => void loadSummary(root));
   }
 }
 
@@ -196,7 +196,7 @@ async function loadClassification(root: HTMLElement): Promise<void> {
     (root.querySelector("#vsPrevPage") as HTMLButtonElement).disabled = classificationPage === 0;
     (root.querySelector("#vsNextPage") as HTMLButtonElement).disabled = classificationPage + 1 >= totalPages;
   } catch (err) {
-    wrap.innerHTML = `<div class="error-box">Erro ao carregar classificação: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(wrap, "Erro ao carregar classificação: " + (err instanceof Error ? err.message : String(err)), () => void loadClassification(root));
   }
 }
 
@@ -335,7 +335,7 @@ async function loadTestPanel(root: HTMLElement): Promise<void> {
       await runTest(root, () => testQueryByUpload(base64, 5));
     });
   } catch (err) {
-    wrap.innerHTML = `<div class="error-box">Erro ao carregar imagens de teste: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(wrap, "Erro ao carregar imagens de teste: " + (err instanceof Error ? err.message : String(err)), () => void loadTestPanel(root));
   }
 }
 
@@ -422,7 +422,7 @@ async function loadLearningSamples(root: HTMLElement): Promise<void> {
       });
     });
   } catch (err) {
-    wrap.innerHTML = `<div class="error-box">Erro ao carregar memória visual: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>`;
+    renderErrorWithRetry(wrap, "Erro ao carregar memória visual: " + (err instanceof Error ? err.message : String(err)), () => void loadLearningSamples(root));
   }
 }
 

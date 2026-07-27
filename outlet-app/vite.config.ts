@@ -24,9 +24,9 @@ export default defineConfig({
       // Nome/ícones espelham src/client/brand.ts — JSON do manifest não pode importar TS.
       includeAssets: ["icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon-180.png", "icons/favicon-32.png"],
       manifest: {
-        name: "GoScan — Conferência Inteligente de Outlet",
+        name: "GoScan — Conferência Inteligente de Produtos GoCase",
         short_name: "GoScan",
-        description: "Conferência Inteligente de Produtos de Outlet — uma ferramenta GoGroup.",
+        description: "Conferência Inteligente de Produtos GoCase — uma ferramenta GoGroup.",
         start_url: "/",
         scope: "/",
         display: "standalone",
