@@ -128,6 +128,10 @@ function renderCurrentScreen(): void {
   // precisa ter visitado "catalogo" antes pra isso não ser null) — nunca
   // dispara um import() dentro do teardown, que precisa ser síncrono.
   if (previousRoute === "catalogo" && route !== "catalogo") catalogVisualModule?.teardownTraining();
+  // CORREÇÃO ESTRUTURAL — encerra a sessão de colaboração em tempo real da
+  // Conferência por NF (ver realtimeCollab.ts) ao sair de "conferir": nunca
+  // deixa uma subscription viva ouvindo mudanças de uma NF já fechada.
+  if (previousRoute === "conferir" && route !== "conferir") conferenceModule?.teardownConference();
   previousRoute = route;
 
   document.querySelectorAll<HTMLButtonElement>(".bottom-nav-btn").forEach((btn) => {

@@ -120,6 +120,27 @@ export function passwordMeetsRequirements(password: string): boolean {
   return passwordRequirements(password).every((r) => r.met);
 }
 
+// ---------------------------------------------------------------------------
+// CORREÇÃO — Reconhecimento automático e busca por EAN na Conferência por NF.
+// Função ÚNICA de normalização de código de barras — usada em TODO o app
+// (parser da NF-e, matching, busca do catálogo, importador, CRUD manual,
+// associações memorizadas). Nunca duplicar esta regra em outro lugar.
+//
+// EAN/GTIN nunca é convertido para número em nenhuma etapa (perderia zero à
+// esquerda) — sempre string, do XML até o banco.
+// ---------------------------------------------------------------------------
+
+/** Remove tudo que não for dígito (espaços, pontos, traços, tabs, caracteres invisíveis). Nunca usado pra regravar o valor original — só para comparação/busca. */
+export function normalizeEan(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  return String(value).replace(/[^\d]/g, "");
+}
+
+/** Um EAN/GTIN real tem 8 (EAN-8), 12 (UPC-A), 13 (EAN-13) ou 14 (ITF-14/GTIN-14) dígitos — qualquer outro comprimento (incluindo "0", "SEMGTIN" sem espaço, "N/A") não é um código de barras válido. */
+export function isValidEanFormat(normalized: string): boolean {
+  return normalized.length === 8 || normalized.length === 12 || normalized.length === 13 || normalized.length === 14;
+}
+
 let retryHandlerSeq = 0;
 
 /**

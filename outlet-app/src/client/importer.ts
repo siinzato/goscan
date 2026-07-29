@@ -6,6 +6,7 @@ import { getSupabase } from "./supabaseClient.ts";
 import { getAuthState, isManagerOrAdmin } from "./auth.ts";
 import { normalize } from "./utils.ts";
 import { invalidateAliasCache } from "./matching.ts";
+import { invalidateSearchCache } from "./catalogApi.ts";
 import { buildColorCodeMap, resolveColorFromSuffix, type ColorCodeMapRow } from "./skuColorResolver.ts";
 
 export interface ImportRowInput {
@@ -238,6 +239,7 @@ export async function importCatalog(fileName: string, rawRows: Record<string, un
       .eq("id", importRow.id);
 
     invalidateAliasCache();
+    invalidateSearchCache();
 
     return { total_rows: rawRows.length, inserted_rows, updated_rows, rejected_rows, errors };
   } catch (err) {
@@ -439,6 +441,8 @@ export async function importNormalProducts(fileName: string, rawRows: Record<str
         finished_at: new Date().toISOString(),
       })
       .eq("id", importRow.id);
+
+    invalidateSearchCache();
 
     return { total_rows: rawRows.length, inserted_rows, updated_rows, rejected_rows, errors };
   } catch (err) {

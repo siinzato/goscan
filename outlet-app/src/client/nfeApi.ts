@@ -5,11 +5,11 @@
 // ser vinculado a um SKU Outlet, mesmo que o texto pareça bater.
 import { getSupabase } from "./supabaseClient.ts";
 import { getAuthState } from "./auth.ts";
+import { normalizeEan, isValidEanFormat } from "./utils.ts";
 import type { NfeParsed } from "./nfeParser.ts";
 import {
   resolveInvoiceItem,
   normalizeKey,
-  computeItemStatus,
   summarizeReceipt,
   type NormalVariantCandidate,
   type AliasMaps,
@@ -20,6 +20,12 @@ import {
 
 export type ReceiptStatus = "not_started" | "in_progress" | "completed" | "with_divergences";
 export type ItemStatus = "pending" | "counted" | "ok" | "missing" | "surplus" | "unlinked";
+// CORREÇÃO ESTRUTURAL — Conferência Colaborativa (ver 0042_collab_conference_schema.sql):
+// volume = divisão por caixa/pallet/área física (mesmo SKU pode ser contado por
+// pessoas diferentes em volumes diferentes, nunca bloqueia); product = reserva
+// temporária por produto (só quem reservou bipa aquele item enquanto ativo);
+// free = compartilhado sem bloqueio automático (só alerta visualmente via presença).
+export type WorkMode = "volume" | "product" | "free";
 
 export interface InvoiceReceipt {
   id: string;
@@ -30,6 +36,7 @@ export interface InvoiceReceipt {
   supplier_cnpj: string | null;
   issued_at: string | null;
   status: ReceiptStatus;
+  work_mode: WorkMode;
   created_by: string;
   finished_by: string | null;
   created_at: string;
@@ -67,6 +74,14 @@ export interface InvoiceReceiptItem {
   // linked_* acima.
   sku_code?: string | null;
   produto?: string | null;
+  /**
+   * EXPANSÃO GOSCAN — Exibição de EAN no card de conferência: EAN
+   * REGISTRADO no cadastro do produto vinculado (product_variants.gtin),
+   * vindo do MESMO join de getReceipt() — nunca uma consulta extra por
+   * item. Usado como fallback só quando `ean` (o valor que veio na própria
+   * NF) está ausente — a NF sempre tem prioridade quando existe.
+   */
+  catalog_ean?: string | null;
 }
 
 export interface ReceiptCount {
@@ -117,22 +132,33 @@ export async function findReceiptByInvoiceKey(invoiceKey: string): Promise<Invoi
 interface NormalVariantRow {
   id: string;
   sku_code: string;
-  gtin: string | null;
+  gtin_normalized: string | null;
 }
 
-/** Busca só os candidatos relevantes (por código/EAN presentes NESTA nota) — nunca a tabela toda. Sempre restrito a product_type='normal'. */
+/**
+ * Busca só os candidatos relevantes (por código/EAN presentes NESTA nota) —
+ * nunca a tabela toda. Sempre restrito a product_type='normal'.
+ *
+ * CORREÇÃO — causa raiz do "EAN já cadastrado não reconhece automaticamente":
+ * antes filtrava pela coluna CRUA (.in("gtin", eans)), sem normalizar — uma
+ * diferença de espaço/pontuação entre o EAN da NF e o gravado fazia o
+ * produto nunca sequer ENTRAR nesta lista de candidatos (a normalização em
+ * memória de resolveInvoiceItem nunca chegava a rodar sobre ele). Agora
+ * filtra por gtin_normalized (mantida por trigger — ver migration 0046),
+ * usando exatamente a mesma normalização (normalizeEan) do lado da NF.
+ */
 async function fetchNormalCandidates(codes: string[], eans: string[]): Promise<NormalVariantCandidate[]> {
   const supabase = getSupabase();
   const cleanCodes = Array.from(new Set(codes.filter((c) => c && c.trim())));
-  const cleanEans = Array.from(new Set(eans.filter((e) => e && e.trim())));
+  const cleanEans = Array.from(new Set(eans.map(normalizeEan).filter((e) => isValidEanFormat(e))));
   if (cleanCodes.length === 0 && cleanEans.length === 0) return [];
 
   const [byCode, byEan] = await Promise.all([
     cleanCodes.length > 0
-      ? supabase.from("product_variants").select("id, sku_code, gtin, products!inner(product_type)").eq("products.product_type", "normal").in("sku_code", cleanCodes)
+      ? supabase.from("product_variants").select("id, sku_code, gtin_normalized, products!inner(product_type)").eq("products.product_type", "normal").in("sku_code", cleanCodes)
       : Promise.resolve({ data: [] as unknown[], error: null }),
     cleanEans.length > 0
-      ? supabase.from("product_variants").select("id, sku_code, gtin, products!inner(product_type)").eq("products.product_type", "normal").in("gtin", cleanEans)
+      ? supabase.from("product_variants").select("id, sku_code, gtin_normalized, products!inner(product_type)").eq("products.product_type", "normal").in("gtin_normalized", cleanEans)
       : Promise.resolve({ data: [] as unknown[], error: null }),
   ]);
   if (byCode.error) throw byCode.error;
@@ -140,7 +166,7 @@ async function fetchNormalCandidates(codes: string[], eans: string[]): Promise<N
 
   const merged = new Map<string, NormalVariantCandidate>();
   for (const row of [...((byCode.data as unknown as NormalVariantRow[]) || []), ...((byEan.data as unknown as NormalVariantRow[]) || [])]) {
-    merged.set(row.id, { variant_id: row.id, sku_code: row.sku_code, gtin: row.gtin });
+    merged.set(row.id, { variant_id: row.id, sku_code: row.sku_code, gtin_normalized: row.gtin_normalized });
   }
   return Array.from(merged.values());
 }
@@ -148,6 +174,7 @@ async function fetchNormalCandidates(codes: string[], eans: string[]): Promise<N
 interface NormalProductNameRow {
   id: string;
   sku_code: string;
+  gtin: string | null;
   products: { name: string } | { name: string }[] | null;
 }
 
@@ -173,7 +200,7 @@ export async function fetchAllNormalProducts(): Promise<NameCandidate[]> {
     const to = from + PAGE_SIZE - 1;
     const { data, error } = await supabase
       .from("product_variants")
-      .select("id, sku_code, products!inner(name, product_type)")
+      .select("id, sku_code, gtin, products!inner(name, product_type)")
       .eq("products.product_type", "normal")
       .eq("active", true)
       // BUG REAL corrigido: sem order(), o Postgres não garante a mesma
@@ -191,40 +218,50 @@ export async function fetchAllNormalProducts(): Promise<NameCandidate[]> {
 
   return rows.map((row) => {
     const product = Array.isArray(row.products) ? row.products[0] : row.products;
-    return { variant_id: row.id, sku_code: row.sku_code, produto: product?.name ?? "" };
+    return { variant_id: row.id, sku_code: row.sku_code, produto: product?.name ?? "", gtin: row.gtin };
   });
 }
 
-interface AliasRow {
+interface AliasCodeRow {
   invoice_product_code: string | null;
-  ean: string | null;
   product_variant_id: string;
 }
 
+interface AliasEanRow {
+  ean_normalized: string | null;
+  product_variant_id: string;
+}
+
+/**
+ * CORREÇÃO — mesmo bug de fetchNormalCandidates: filtrava `.in("ean", eans)`
+ * pela coluna crua, então uma associação memorizada com EAN formatado
+ * diferente do que vem na NF nunca era encontrada. Agora usa ean_normalized
+ * (mantida por trigger — migration 0046) dos dois lados da comparação.
+ */
 async function fetchAliasMaps(codes: string[], eans: string[]): Promise<AliasMaps> {
   const supabase = getSupabase();
   const cleanCodes = Array.from(new Set(codes.filter((c) => c && c.trim())));
-  const cleanEans = Array.from(new Set(eans.filter((e) => e && e.trim())));
+  const cleanEans = Array.from(new Set(eans.map(normalizeEan).filter((e) => isValidEanFormat(e))));
   const byCode = new Map<string, string>();
   const byEan = new Map<string, string>();
   if (cleanCodes.length === 0 && cleanEans.length === 0) return { byCode, byEan };
 
   const [codeRes, eanRes] = await Promise.all([
     cleanCodes.length > 0
-      ? supabase.from("invoice_sku_aliases").select("invoice_product_code, ean, product_variant_id").in("invoice_product_code", cleanCodes)
+      ? supabase.from("invoice_sku_aliases").select("invoice_product_code, product_variant_id").in("invoice_product_code", cleanCodes)
       : Promise.resolve({ data: [] as unknown[], error: null }),
     cleanEans.length > 0
-      ? supabase.from("invoice_sku_aliases").select("invoice_product_code, ean, product_variant_id").in("ean", cleanEans)
+      ? supabase.from("invoice_sku_aliases").select("ean_normalized, product_variant_id").in("ean_normalized", cleanEans)
       : Promise.resolve({ data: [] as unknown[], error: null }),
   ]);
   if (codeRes.error) throw codeRes.error;
   if (eanRes.error) throw eanRes.error;
 
-  for (const row of (codeRes.data as unknown as AliasRow[]) || []) {
+  for (const row of (codeRes.data as unknown as AliasCodeRow[]) || []) {
     if (row.invoice_product_code) byCode.set(normalizeKey(row.invoice_product_code), row.product_variant_id);
   }
-  for (const row of (eanRes.data as unknown as AliasRow[]) || []) {
-    if (row.ean) byEan.set(normalizeKey(row.ean), row.product_variant_id);
+  for (const row of (eanRes.data as unknown as AliasEanRow[]) || []) {
+    if (row.ean_normalized) byEan.set(row.ean_normalized, row.product_variant_id);
   }
   return { byCode, byEan };
 }
@@ -263,6 +300,17 @@ export async function createReceiptFromParsed(parsed: NfeParsed, xml: string): P
 
   const itemRows = parsed.items.map((item) => {
     const resolved = resolveInvoiceItem({ invoice_product_code: item.invoice_product_code, ean: item.ean }, candidates, aliases);
+    // Diagnóstico (seção 14 do pedido) — só em desenvolvimento, nunca exposto ao operador.
+    if (import.meta.env.DEV) {
+      console.debug("[GoScan NF Match]", {
+        descricao: item.description,
+        cProd: item.invoice_product_code,
+        eanOriginal: item.ean,
+        eanNormalizado: normalizeEan(item.ean),
+        encontrado: resolved.variant_id !== null,
+        criterio: resolved.link_source,
+      });
+    }
     return {
       receipt_id: receipt.id,
       product_variant_id: resolved.variant_id,
@@ -334,36 +382,207 @@ export async function startCounting(receiptId: string): Promise<void> {
   if (error) throw error;
 }
 
+// ---------------------------------------------------------------------------
+// CORREÇÃO ESTRUTURAL — Conferência Colaborativa Segura (ver
+// 0043_collab_conference_rpcs.sql). record_invoice_count_event agora devolve
+// um resultado RICO em jsonb (não mais a linha crua da tabela) porque passou
+// a cobrir 3 desfechos possíveis, nunca silenciosos:
+//   - sucesso normal (code "OK"), com total/restante/conclusão/excesso;
+//   - RESERVATION_CONFLICT: outro operador já reservou este item (modo
+//     "product") — nada é gravado, o chamador decide (ir pra outro produto/
+//     solicitar colaboração/assumir se inativo/cancelar);
+//   - EXCESS_CONFIRMATION_REQUIRED: esta bipagem ultrapassaria a quantidade
+//     da NF — nada é gravado até reenviar com confirmExcess=true (o servidor
+//     recalcula tudo de novo nesse reenvio, nunca reaplica um cálculo velho).
+// ---------------------------------------------------------------------------
+export interface CountEventSuccess {
+  success: true;
+  code: "OK";
+  item: InvoiceReceiptItem;
+  newTotal: number;
+  expectedQuantity: number;
+  remaining: number;
+  itemCompleted: boolean;
+  firstCompletion: boolean;
+  excess: number;
+  performedBy: string | null;
+  eventId: string | null;
+}
+
+export interface ReservationConflictInfo {
+  userId: string;
+  fullName: string;
+  since: string;
+  lastActivity: string;
+}
+
+export interface CountEventReservationConflict {
+  success: false;
+  code: "RESERVATION_CONFLICT";
+  reservation: ReservationConflictInfo;
+}
+
+export interface CountEventExcessConfirmationRequired {
+  success: false;
+  code: "EXCESS_CONFIRMATION_REQUIRED";
+  currentTotal: number;
+  attemptedTotal: number;
+  expectedQuantity: number;
+  completedBy: string | null;
+  completedAt: string | null;
+}
+
+export type CountEventResult = CountEventSuccess | CountEventReservationConflict | CountEventExcessConfirmationRequired;
+
+export interface CountEventOptions {
+  /** Identifica o dispositivo físico (não o usuário) — usado pra reserva e auditoria. */
+  deviceId?: string;
+  /** Como esta contagem foi originada — nunca inventado, sempre o canal real usado. */
+  origin?: "scanner" | "camera" | "manual" | "voice";
+  volumeId?: string | null;
+  /** Reenvio explícito e deliberado depois de EXCESS_CONFIRMATION_REQUIRED. */
+  confirmExcess?: boolean;
+  idempotencyKey?: string;
+}
+
 /**
- * Registra uma contagem (inicial ou recontagem) — NUNCA sobrescreve o
- * histórico em receipt_counts, só acrescenta uma linha nova com count_number
- * incrementado. invoice_receipt_items.physical_quantity sempre reflete a
- * contagem MAIS RECENTE.
+ * CORREÇÃO ESTRUTURAL — Concorrência segura: antes lia count_number/
+ * physical_quantity e sobrescrevia em duas chamadas separadas (janela real de
+ * corrida entre duas bipagens concorrentes no mesmo item — ver migration
+ * 0039_atomic_scan_events.sql). Agora delega inteiramente pra
+ * record_invoice_count_event(), que trava a linha no banco e faz tudo (evento
+ * + receipt_counts + physical_quantity + reserva + excesso) numa única
+ * transação atômica.
+ *
+ * idempotencyKey: gerado pelo chamador (crypto.randomUUID()) e REUTILIZADO em
+ * caso de retry — o banco garante que a mesma tentativa nunca é aplicada duas
+ * vezes, mesmo que o retry aconteça por falha de rede após o servidor já ter
+ * processado a primeira chamada. Também é reutilizada no reenvio explícito
+ * com confirmExcess=true (a 1ª tentativa nunca grava nada quando pede
+ * confirmação, então reaproveitar a chave é seguro).
+ *
+ * mode='set': define o valor absoluto (usado pela recontagem manual e pelo
+ * card "Confirmar item"). mode='increment': soma um delta ATOMICAMENTE no
+ * banco (bipagem por EAN/scanner/câmera/voz — nunca calcula "atual + 1" no
+ * frontend).
  */
-export async function submitCount(itemId: string, quantity: number): Promise<InvoiceReceiptItem> {
+async function recordCountEvent(itemId: string, value: number, mode: "set" | "increment", opts: CountEventOptions = {}): Promise<CountEventResult> {
   const supabase = getSupabase();
-  const userId = requireUserId();
-
-  const { data: prevCounts, error: prevError } = await supabase
-    .from("receipt_counts")
-    .select("count_number")
-    .eq("item_id", itemId)
-    .order("count_number", { ascending: false })
-    .limit(1);
-  if (prevError) throw prevError;
-  const nextCountNumber = ((prevCounts as { count_number: number }[] | null)?.[0]?.count_number ?? 0) + 1;
-
-  const { error: countError } = await supabase.from("receipt_counts").insert({ item_id: itemId, user_id: userId, quantity, count_number: nextCountNumber });
-  if (countError) throw countError;
-
-  const { data, error } = await supabase
-    .from("invoice_receipt_items")
-    .update({ physical_quantity: quantity, status: "counted", counted_by: userId })
-    .eq("id", itemId)
-    .select()
-    .single();
+  const key = opts.idempotencyKey ?? crypto.randomUUID();
+  const { data, error } = await supabase.rpc("record_invoice_count_event", {
+    p_item_id: itemId,
+    p_delta: value,
+    p_mode: mode,
+    p_idempotency_key: key,
+    p_device_id: opts.deviceId ?? null,
+    p_origin: opts.origin ?? "manual",
+    p_volume_id: opts.volumeId ?? null,
+    p_confirm_excess: opts.confirmExcess ?? false,
+  });
   if (error) throw error;
-  return data as InvoiceReceiptItem;
+  return data as CountEventResult;
+}
+
+/** Define a quantidade física ABSOLUTA de um item (recontagem/"Confirmar item"). */
+export async function submitCount(itemId: string, quantity: number, opts?: CountEventOptions): Promise<CountEventResult> {
+  return recordCountEvent(itemId, quantity, "set", opts);
+}
+
+/** Soma `delta` à quantidade física ATUAL de forma atômica (bipagem por EAN/scanner/câmera/voz). */
+export async function submitCountDelta(itemId: string, delta: number, opts?: CountEventOptions): Promise<CountEventResult> {
+  return recordCountEvent(itemId, delta, "increment", opts);
+}
+
+export interface UndoCountResult {
+  success: boolean;
+  item: InvoiceReceiptItem;
+  newTotal: number;
+  expectedQuantity?: number;
+  performedBy?: string | null;
+  undoneEventId: string;
+  eventId: string | null;
+}
+
+/** "Desfazer minha última bipagem" (seção 13) — nunca apaga o evento original, grava um evento compensatório referenciando-o. */
+export async function undoLastCount(eventId: string, reason?: string, idempotencyKey?: string): Promise<UndoCountResult> {
+  const supabase = getSupabase();
+  const key = idempotencyKey ?? crypto.randomUUID();
+  const { data, error } = await supabase.rpc("undo_last_invoice_count_event", {
+    p_event_id: eventId,
+    p_idempotency_key: key,
+    p_reason: reason ?? null,
+  });
+  if (error) throw error;
+  return data as UndoCountResult;
+}
+
+export interface ReservationState {
+  id: string;
+  itemId: string;
+  userId: string;
+  expiresAt: string;
+}
+
+export type ReserveItemResult =
+  | { success: true; code: "OK"; reservation: ReservationState }
+  | { success: false; code: "RESERVATION_CONFLICT"; reservation: ReservationConflictInfo };
+
+/** Reserva explícita de um item no modo "product" (ao abrir/tocar o produto pra contar, antes mesmo de bipar). */
+export async function reserveItem(itemId: string, deviceId: string, volumeId?: string | null): Promise<ReserveItemResult> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.rpc("reserve_invoice_receipt_item", {
+    p_item_id: itemId,
+    p_device_id: deviceId,
+    p_volume_id: volumeId ?? null,
+  });
+  if (error) throw error;
+  return data as ReserveItemResult;
+}
+
+/** Renovação periódica da reserva enquanto o operador continua na tela do produto — chamado a cada ~30s. */
+export async function heartbeatReservation(reservationId: string): Promise<{ success: boolean; code: string; expiresAt?: string }> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.rpc("heartbeat_invoice_receipt_item_reservation", { p_reservation_id: reservationId });
+  if (error) throw error;
+  return data;
+}
+
+/** Libera a reserva ativa de um item — pelo próprio dono (mudou de produto) ou por um gerente/admin ("liberação por supervisor"). */
+export async function releaseReservation(itemId: string, reason: string = "manual"): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.rpc("release_invoice_receipt_item_reservation", { p_item_id: itemId, p_reason: reason });
+  if (error) throw error;
+}
+
+export interface ReceiptVolume {
+  id: string;
+  receipt_id: string;
+  label: string;
+  created_by: string;
+  created_at: string;
+}
+
+export async function listVolumes(receiptId: string): Promise<ReceiptVolume[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.from("invoice_receipt_volumes").select("*").eq("receipt_id", receiptId).order("created_at", { ascending: true });
+  if (error) throw error;
+  return (data as ReceiptVolume[]) || [];
+}
+
+/** Cria um volume físico simples (Caixa 01, Pallet 02…) — texto livre, não é um módulo de WMS. */
+export async function createVolume(receiptId: string, label: string): Promise<ReceiptVolume> {
+  const supabase = getSupabase();
+  const createdBy = requireUserId();
+  const { data, error } = await supabase.from("invoice_receipt_volumes").insert({ receipt_id: receiptId, label: label.trim(), created_by: createdBy }).select().single();
+  if (error) throw error;
+  return data as ReceiptVolume;
+}
+
+/** Define o modo de divisão do trabalho da conferência colaborativa — escolhido uma vez, ao iniciar a contagem. */
+export async function setWorkMode(receiptId: string, mode: WorkMode): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.from("invoice_receipts").update({ work_mode: mode }).eq("id", receiptId);
+  if (error) throw error;
 }
 
 export async function listItemCounts(itemId: string): Promise<ReceiptCount[]> {
@@ -375,6 +594,7 @@ export async function listItemCounts(itemId: string): Promise<ReceiptCount[]> {
 
 interface VariantJoinForItem {
   sku_code: string;
+  gtin: string | null;
   products: { name: string } | { name: string }[] | null;
 }
 
@@ -399,7 +619,9 @@ export async function getReceipt(receiptId: string): Promise<{ receipt: InvoiceR
       .single(),
     supabase
       .from("invoice_receipt_items")
-      .select("*, product_variants(sku_code, products(name))")
+      // EXPANSÃO GOSCAN — Exibição de EAN no card de conferência: gtin
+      // incluído no MESMO join já existente (nunca uma consulta por item).
+      .select("*, product_variants(sku_code, gtin, products(name))")
       .eq("receipt_id", receiptId)
       .order("created_at", { ascending: true }),
   ]);
@@ -419,7 +641,7 @@ export async function getReceipt(receiptId: string): Promise<{ receipt: InvoiceR
   const mapped = ((items as (InvoiceReceiptItem & { product_variants: VariantJoinForItem | null })[]) || []).map(({ product_variants: v, ...item }) => {
     const productObj = v?.products;
     const produto = Array.isArray(productObj) ? productObj[0]?.name : productObj?.name;
-    return { ...item, sku_code: v?.sku_code ?? null, produto: produto ?? null };
+    return { ...item, sku_code: v?.sku_code ?? null, produto: produto ?? null, catalog_ean: v?.gtin ?? null };
   });
 
   return { receipt: receiptWithNames, items: mapped };
@@ -431,81 +653,42 @@ export interface FinalizeResult {
   summary: ReceiptSummary;
 }
 
+export type FinalizeOutcome =
+  | ({ ok: true } & FinalizeResult)
+  | { ok: false; alreadyFinalized: true; finishedByName: string | null; finishedAt: string | null; status: ReceiptStatus };
+
 /**
- * Calcula OK/Falta/Sobra por item (nunca por soma líquida — ver
- * summarizeReceipt) e grava. Idempotente: pode ser chamada de novo após uma
- * recontagem para recalcular o resultado.
+ * CORREÇÃO ESTRUTURAL — Finalização colaborativa atômica (seção 21 do
+ * pedido). Antes, esta função recalculava e gravava em VÁRIAS chamadas
+ * separadas do cliente sem nenhum lock — dois usuários finalizando quase ao
+ * mesmo tempo podiam os dois recalcular e escrever, um sobrescrevendo o
+ * finished_by/finished_at do outro silenciosamente. Agora TUDO (recálculo de
+ * status/snapshot + transição de status da NF) acontece dentro de
+ * finalize_invoice_receipt_atomic() (ver 0044), com a NF travada — quem
+ * chegar depois do primeiro commit recebe ALREADY_FINALIZED de volta, nunca
+ * reprocessa nem sobrescreve. Idempotente pra recontagem: pode ser chamada de
+ * novo (só reabre-se implicitamente porque uma recontagem de manager/admin já
+ * teria voltado o status, ver RLS) para recalcular o resultado.
  */
-export async function finalizeReceipt(receiptId: string): Promise<FinalizeResult> {
+export async function finalizeReceipt(receiptId: string, opts: { recompute?: boolean } = {}): Promise<FinalizeOutcome> {
   const supabase = getSupabase();
-  const userId = requireUserId();
+  const { data, error } = await supabase.rpc("finalize_invoice_receipt_atomic", { p_receipt_id: receiptId, p_recompute: opts.recompute ?? false });
+  if (error) throw error;
+  const result = data as { success: boolean; code: string; status?: ReceiptStatus; finishedBy?: string | null; finishedAt?: string | null };
 
-  const { data: items, error: itemsError } = await supabase.from("invoice_receipt_items").select("*").eq("receipt_id", receiptId);
-  if (itemsError) throw itemsError;
-  const rows = (items as InvoiceReceiptItem[]) || [];
-
-  // SNAPSHOT imutável (ver migration 0025): busca o produto vinculado de cada
-  // item EXATAMENTE agora e grava nome/SKU/EAN direto na linha — o relatório
-  // final nunca mais muda sozinho se o cadastro for editado depois. Rodada
-  // de novo numa recontagem só atualiza o snapshot pro estado atual naquele
-  // NOVO momento de finalização, o que continua sendo a regra correta.
-  const variantIds = [...new Set(rows.map((r) => r.product_variant_id).filter((id): id is string => !!id))];
-  const linkedByVariantId = new Map<string, { sku_code: string; name: string; gtin: string | null }>();
-  if (variantIds.length > 0) {
-    const { data: variantRows, error: variantError } = await supabase
-      .from("product_variants")
-      .select("id, sku_code, gtin, products(name)")
-      .in("id", variantIds);
-    if (variantError) throw variantError;
-    for (const v of (variantRows as { id: string; sku_code: string; gtin: string | null; products: { name: string } | { name: string }[] | null }[]) || []) {
-      const product = Array.isArray(v.products) ? v.products[0] : v.products;
-      linkedByVariantId.set(v.id, { sku_code: v.sku_code, name: product?.name ?? "", gtin: v.gtin });
+  if (!result.success && result.code === "ALREADY_FINALIZED") {
+    let finishedByName: string | null = null;
+    if (result.finishedBy) {
+      const { data: p } = await supabase.from("profiles").select("full_name").eq("id", result.finishedBy).maybeSingle();
+      finishedByName = (p as { full_name: string | null } | null)?.full_name ?? null;
     }
+    return { ok: false, alreadyFinalized: true, finishedByName, finishedAt: result.finishedAt ?? null, status: result.status ?? "with_divergences" };
   }
 
-  // Item sem produto vinculado mantém status 'unlinked' — sem um SKU real não
-  // há "quantidade esperada" confiável pra comparar, mas ele continua
-  // aparecendo no relatório de divergências como "produto não localizado".
-  //
-  // BUG REAL encontrado e corrigido durante a verificação: upsert() do
-  // PostgREST monta um INSERT de verdade (com ON CONFLICT DO UPDATE) — as
-  // constraints NOT NULL das colunas OMITIDAS (receipt_id, expected_quantity
-  // etc.) são validadas contra a linha proposta ANTES do conflito ser
-  // resolvido, então um payload parcial ({id, status}) falha com "null value
-  // in column ... violates not-null constraint" mesmo a linha já existindo.
-  // A correção é reenviar a linha JÁ BUSCADA por inteiro, só trocando o
-  // campo status — as outras colunas voltam com o mesmo valor que já tinham.
-  const statusUpdates = rows
-    .filter((r) => r.product_variant_id !== null)
-    .map((r) => {
-      const linked = linkedByVariantId.get(r.product_variant_id!);
-      return {
-        ...r,
-        status: computeItemStatus(r.expected_quantity, r.physical_quantity),
-        linked_sku_code: linked?.sku_code ?? r.linked_sku_code,
-        linked_product_name: linked?.name ?? r.linked_product_name,
-        linked_ean: linked?.gtin ?? r.linked_ean,
-      };
-    });
-
-  if (statusUpdates.length > 0) {
-    const { error: updateError } = await supabase.from("invoice_receipt_items").upsert(statusUpdates, { onConflict: "id" });
-    if (updateError) throw updateError;
-  }
-
-  const summary = summarizeReceipt(rows.map((r) => ({ expected_quantity: r.expected_quantity, physical_quantity: r.physical_quantity })));
-  const hasUnresolved = rows.some((r) => r.product_variant_id === null) || summary.pending > 0;
-  const allOk = summary.missing === 0 && summary.surplus === 0 && !hasUnresolved;
-
-  const { error: receiptError } = await supabase
-    .from("invoice_receipts")
-    .update({ status: allOk ? "completed" : "with_divergences", finished_at: new Date().toISOString(), finished_by: userId })
-    .eq("id", receiptId);
-  if (receiptError) throw receiptError;
-
-  // Busca de novo já com o nome de quem finalizou (join) e os itens com o snapshot recém-gravado.
+  // Busca de novo já com o nome de quem finalizou (join) e os itens com o snapshot/status recém-gravados pela RPC.
   const { receipt: refreshedReceipt, items: refreshedItems } = await getReceipt(receiptId);
-  return { receipt: refreshedReceipt, items: refreshedItems, summary };
+  const summary = summarizeReceipt(refreshedItems.map((r) => ({ expected_quantity: r.expected_quantity, physical_quantity: r.physical_quantity })));
+  return { ok: true, receipt: refreshedReceipt, items: refreshedItems, summary };
 }
 
 export interface ReceiptWithCounts extends InvoiceReceipt {

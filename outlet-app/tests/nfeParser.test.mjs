@@ -211,3 +211,29 @@ test("parseNfeXml preserva zeros à esquerda do EAN vindo de cEANTrib (nunca vir
   );
   assert.equal(parseNfeXml(xml).items[0].ean, "0078955555555");
 });
+
+// ---------------------------------------------------------------------------
+// CORREÇÃO — Reconhecimento automático por EAN: validEanCandidate agora
+// valida o FORMATO real (8/12/13/14 dígitos), não só "SEM GTIN" com espaço —
+// lixo como "0", "N/A" ou "SEMGTIN" sem espaço não pode ser tratado como um
+// EAN válido (bug real: um XML assim fazia o item nunca cair pro cEANTrib).
+// ---------------------------------------------------------------------------
+test("parseNfeXml rejeita cEAN='0' e usa cEANTrib (antes era aceito como EAN válido por engano)", () => {
+  const xml = xmlWithSingleItem("<cProd>A-6</cProd><xProd>Produto</xProd><cEAN>0</cEAN><cEANTrib>7895555555555</cEANTrib><uCom>UN</uCom><qCom>1</qCom>");
+  assert.equal(parseNfeXml(xml).items[0].ean, "7895555555555");
+});
+
+test("parseNfeXml rejeita cEAN='N/A' e usa cEANTrib", () => {
+  const xml = xmlWithSingleItem("<cProd>A-7</cProd><xProd>Produto</xProd><cEAN>N/A</cEAN><cEANTrib>7896666666666</cEANTrib><uCom>UN</uCom><qCom>1</qCom>");
+  assert.equal(parseNfeXml(xml).items[0].ean, "7896666666666");
+});
+
+test("parseNfeXml rejeita cEAN='SEMGTIN' (sem espaço) igual a 'SEM GTIN'", () => {
+  const xml = xmlWithSingleItem("<cProd>A-8</cProd><xProd>Produto</xProd><cEAN>SEMGTIN</cEAN><cEANTrib>7897777777777</cEANTrib><uCom>UN</uCom><qCom>1</qCom>");
+  assert.equal(parseNfeXml(xml).items[0].ean, "7897777777777");
+});
+
+test("parseNfeXml retorna null quando cEAN e cEANTrib são ambos lixo sem formato de EAN", () => {
+  const xml = xmlWithSingleItem("<cProd>A-9</cProd><xProd>Produto</xProd><cEAN>0</cEAN><cEANTrib>N/A</cEANTrib><uCom>UN</uCom><qCom>1</qCom>");
+  assert.equal(parseNfeXml(xml).items[0].ean, null);
+});

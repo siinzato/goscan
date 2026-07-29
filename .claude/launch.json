@@ -6,6 +6,12 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["outlet-app/run-local.mjs"],
       "port": 8787
+    },
+    {
+      "name": "outlet-app-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "outlet-app", "run", "dev:web"],
+      "port": 5173
     }
   ]
 }

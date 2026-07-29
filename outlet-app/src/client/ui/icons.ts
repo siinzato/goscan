@@ -63,6 +63,21 @@ import iconPhone from "lucide-static/icons/phone.svg?raw";
 import iconMail from "lucide-static/icons/mail.svg?raw";
 import iconSun from "lucide-static/icons/sun.svg?raw";
 import iconMoon from "lucide-static/icons/moon.svg?raw";
+import iconUsers from "lucide-static/icons/users.svg?raw";
+import iconUsersRound from "lucide-static/icons/users-round.svg?raw";
+import iconUserPlus from "lucide-static/icons/user-plus.svg?raw";
+import iconUserX from "lucide-static/icons/user-x.svg?raw";
+import iconFilter from "lucide-static/icons/filter.svg?raw";
+import iconArrowUpDown from "lucide-static/icons/arrow-up-down.svg?raw";
+import iconKey from "lucide-static/icons/key.svg?raw";
+import iconShieldCheck from "lucide-static/icons/shield-check.svg?raw";
+import iconMic from "lucide-static/icons/mic.svg?raw";
+import iconMicOff from "lucide-static/icons/mic-off.svg?raw";
+import iconVolume2 from "lucide-static/icons/volume-2.svg?raw";
+import iconVolumeX from "lucide-static/icons/volume-x.svg?raw";
+import iconUndo2 from "lucide-static/icons/undo-2.svg?raw";
+import iconBox from "lucide-static/icons/box.svg?raw";
+import iconPause from "lucide-static/icons/pause.svg?raw";
 
 export const Icon = {
   camera: iconCamera,
@@ -128,6 +143,21 @@ export const Icon = {
   mail: iconMail,
   sun: iconSun,
   moon: iconMoon,
+  users: iconUsers,
+  usersRound: iconUsersRound,
+  userPlus: iconUserPlus,
+  userX: iconUserX,
+  filter: iconFilter,
+  arrowUpDown: iconArrowUpDown,
+  key: iconKey,
+  shieldCheck: iconShieldCheck,
+  mic: iconMic,
+  micOff: iconMicOff,
+  volume2: iconVolume2,
+  volumeX: iconVolumeX,
+  undo2: iconUndo2,
+  box: iconBox,
+  pause: iconPause,
 } as const;
 
 export type IconName = keyof typeof Icon;

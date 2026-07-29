@@ -4,7 +4,7 @@
 // de nunca misturar com produtos Outlet é da QUERY que monta `candidates`
 // (nfeApi.ts filtra product_variants por products.product_type='normal') —
 // esta função só decide, dentro do que já veio filtrado, qual candidato bate.
-import { normalize } from "./utils.ts";
+import { normalize, normalizeEan, isValidEanFormat } from "./utils.ts";
 
 export type LinkSource = "sku" | "ean" | "alias" | null;
 
@@ -16,12 +16,18 @@ export interface InvoiceItemKey {
 export interface NormalVariantCandidate {
   variant_id: string;
   sku_code: string;
-  gtin: string | null;
+  /**
+   * CORREÇÃO — Reconhecimento automático por EAN: coluna JÁ NORMALIZADA
+   * (dígitos apenas, mantida por trigger no banco — ver migration 0046),
+   * nunca o `gtin` cru. Comparar direto contra ela evita reintroduzir uma
+   * segunda regra de normalização divergente aqui.
+   */
+  gtin_normalized: string | null;
 }
 
 export interface AliasMaps {
-  byCode: Map<string, string>; // invoice_product_code normalizado -> variant_id
-  byEan: Map<string, string>; // ean normalizado -> variant_id
+  byCode: Map<string, string>; // invoice_product_code normalizado (normalizeKey) -> variant_id
+  byEan: Map<string, string>; // ean normalizado (normalizeEan — dígitos apenas) -> variant_id
 }
 
 export interface ResolvedLink {
@@ -49,18 +55,23 @@ export function normalizeKey(value: string | null | undefined): string {
  * aprendida (invoice_sku_aliases) > nenhuma (exige vínculo manual). Nunca
  * inventa correspondência por similaridade textual/nome aqui — isso fica a
  * cargo da UI, que pode SUGERIR via busca, mas o operador sempre confirma.
+ *
+ * CORREÇÃO — EAN nunca usa normalizeKey (que só maiúsculiza/trima): usa
+ * normalizeEan (dígitos apenas) contra candidate.gtin_normalized, a MESMA
+ * regra usada no banco (fetchNormalCandidates já filtra por essa coluna) e
+ * na busca manual do catálogo — uma só regra, nunca duas divergentes.
  */
 export function resolveInvoiceItem(item: InvoiceItemKey, candidates: NormalVariantCandidate[], aliases?: AliasMaps): ResolvedLink {
   const code = normalizeKey(item.invoice_product_code);
-  const ean = normalizeKey(item.ean);
+  const ean = normalizeEan(item.ean);
 
   if (code) {
     const bySku = candidates.find((c) => normalizeKey(c.sku_code) === code);
     if (bySku) return { variant_id: bySku.variant_id, link_source: "sku" };
   }
 
-  if (ean) {
-    const byEan = candidates.find((c) => normalizeKey(c.gtin) === ean);
+  if (ean && isValidEanFormat(ean)) {
+    const byEan = candidates.find((c) => c.gtin_normalized === ean);
     if (byEan) return { variant_id: byEan.variant_id, link_source: "ean" };
   }
 
@@ -155,6 +166,8 @@ export interface NameCandidate {
   variant_id: string;
   sku_code: string;
   produto: string;
+  /** EAN cadastrado no produto — carregado pela MESMA consulta que já busca os candidatos (fetchAllNormalProducts), nunca uma query extra. */
+  gtin: string | null;
 }
 
 export interface NameSuggestion {

@@ -7,6 +7,18 @@ import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
 import { setTheme, type ThemeName } from "../../theme.ts";
 import { renderPasswordChangeForm } from "../passwordChangeForm.ts";
+import { renderAdminPanel, isAllowedIntoAdminPanel } from "./adminPanel.ts";
+import {
+  loadConferencePreferences,
+  saveMyConferencePreferences,
+  resetMyConferencePreferences,
+  getConferencePreferences,
+  type ConferencePreferences,
+} from "../../conferencePreferences.ts";
+import { playSound, unlockConferenceSounds } from "../../soundManager.ts";
+import { speak, isVoiceSupported } from "../../voiceFeedback.ts";
+import { vibrate, isVibrationSupported } from "../../vibrationFeedback.ts";
+import { isVoiceCommandSupported } from "../../voiceCommands.ts";
 
 export async function renderProfileSettings(root: HTMLElement, sub: string[]): Promise<void> {
   if (sub[0] === "administracao") {
@@ -54,6 +66,8 @@ function renderSettingsHub(root: HTMLElement): void {
 
       <div class="card" id="settingsSegurancaWrap"></div>
 
+      <div class="card" id="settingsConferenciaWrap"></div>
+
       <button type="button" class="profile-menu-item" id="btnGotoAdmin">
         <span class="profile-menu-icon">${canManage ? Icon.settings : Icon.lock}</span>
         <span class="profile-menu-text">
@@ -81,6 +95,7 @@ function renderSettingsHub(root: HTMLElement): void {
 
   renderMinhaConta(root.querySelector<HTMLElement>("#settingsContaWrap")!);
   renderSeguranca(root.querySelector<HTMLElement>("#settingsSegurancaWrap")!);
+  void renderConferenciaAlertas(root.querySelector<HTMLElement>("#settingsConferenciaWrap")!);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,11 +311,112 @@ function renderSeguranca(root: HTMLElement): void {
 }
 
 // ---------------------------------------------------------------------------
-// Administração — Fase A só protege a rota de verdade; painel é a Fase B.
+// EXPANSÃO GOSCAN — Conferência e alertas (seção 19 do pedido): sons, voz,
+// vibração e comandos de voz da Conferência Colaborativa por NF. Preferência
+// por usuário/dispositivo (profiles.conference_preferences), com padrão da
+// empresa como base quando o campo nunca foi tocado (ver conferencePreferences.ts).
 // ---------------------------------------------------------------------------
+function toggleRow(id: string, label: string, checked: boolean, disabled = false, disabledHint?: string): string {
+  return `
+    <label class="hint-text" style="display:flex;align-items:center;gap:8px;margin-top:10px${disabled ? ";opacity:.6" : ""}">
+      <input type="checkbox" id="${id}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} />
+      <span>${escapeHtml(label)}${disabled && disabledHint ? ` — ${escapeHtml(disabledHint)}` : ""}</span>
+    </label>`;
+}
+
+async function renderConferenciaAlertas(root: HTMLElement): Promise<void> {
+  await loadConferencePreferences();
+  const prefs = getConferencePreferences();
+  const voiceOk = isVoiceSupported();
+  const voiceCommandsOk = isVoiceCommandSupported();
+  const vibrationOk = isVibrationSupported();
+
+  root.innerHTML = `
+    <h3>${Icon.volume2}Conferência e alertas</h3>
+    <p class="hint-text">Sons, voz e vibração usados na Conferência Colaborativa por Nota Fiscal. Ajuste só neste dispositivo.</p>
+
+    ${toggleRow("prefSounds", "Sons ativados", prefs.soundsEnabled)}
+    <label for="prefVolume" class="hint-text" style="display:block;margin-top:10px">Volume</label>
+    <input type="range" id="prefVolume" min="0" max="100" value="${Math.round(prefs.soundVolume * 100)}" ${prefs.soundsEnabled ? "" : "disabled"} />
+
+    ${toggleRow("prefVoice", "Voz ativada", prefs.voiceEnabled, !voiceOk, "não suportada neste navegador")}
+    ${toggleRow("prefSpeakProductName", "Falar nome do produto nos avisos", prefs.speakProductName, !voiceOk)}
+    ${toggleRow("prefVibration", "Vibração ativada", prefs.vibrationEnabled, !vibrationOk, "não suportada neste dispositivo")}
+    ${toggleRow("prefVoiceCommands", "Comandos de voz (segurar para falar)", prefs.voiceCommandsEnabled, !voiceCommandsOk, "não suportado neste navegador")}
+
+    <p class="hint-text" style="margin-top:14px;font-weight:600">Avisos</p>
+    ${toggleRow("prefNotifyCompleted", "Avisar produto finalizado", prefs.notifyItemCompleted)}
+    ${toggleRow("prefNotifyExcess", "Avisar excesso", prefs.notifyExcess)}
+    ${toggleRow("prefNotifyConflict", "Avisar conflito com outro operador", prefs.notifyConflict)}
+
+    <div class="review-actions" style="margin-top:14px">
+      <button type="button" class="btn-secondary" id="btnTestSound">Testar sons</button>
+      <button type="button" class="btn-secondary" id="btnTestVoice">Testar voz</button>
+      <button type="button" class="btn-secondary" id="btnResetConferencePrefs">Restaurar padrão</button>
+    </div>`;
+
+  function field<T extends HTMLElement>(id: string): T {
+    return root.querySelector<T>(`#${id}`)!;
+  }
+
+  async function save(patch: Partial<ConferencePreferences>): Promise<void> {
+    try {
+      await saveMyConferencePreferences(patch);
+    } catch (err) {
+      showToast("Erro ao salvar preferência: " + describeError(err), "error");
+    }
+  }
+
+  field<HTMLInputElement>("prefSounds").addEventListener("change", (e) => {
+    const enabled = (e.target as HTMLInputElement).checked;
+    field<HTMLInputElement>("prefVolume").disabled = !enabled;
+    void save({ soundsEnabled: enabled });
+  });
+  field<HTMLInputElement>("prefVolume").addEventListener("change", (e) => {
+    void save({ soundVolume: Number((e.target as HTMLInputElement).value) / 100 });
+  });
+  if (voiceOk) {
+    field<HTMLInputElement>("prefVoice").addEventListener("change", (e) => void save({ voiceEnabled: (e.target as HTMLInputElement).checked }));
+    field<HTMLInputElement>("prefSpeakProductName").addEventListener("change", (e) => void save({ speakProductName: (e.target as HTMLInputElement).checked }));
+  }
+  if (vibrationOk) {
+    field<HTMLInputElement>("prefVibration").addEventListener("change", (e) => void save({ vibrationEnabled: (e.target as HTMLInputElement).checked }));
+  }
+  if (voiceCommandsOk) {
+    field<HTMLInputElement>("prefVoiceCommands").addEventListener("change", (e) => void save({ voiceCommandsEnabled: (e.target as HTMLInputElement).checked }));
+  }
+  field<HTMLInputElement>("prefNotifyCompleted").addEventListener("change", (e) => void save({ notifyItemCompleted: (e.target as HTMLInputElement).checked }));
+  field<HTMLInputElement>("prefNotifyExcess").addEventListener("change", (e) => void save({ notifyExcess: (e.target as HTMLInputElement).checked }));
+  field<HTMLInputElement>("prefNotifyConflict").addEventListener("change", (e) => void save({ notifyConflict: (e.target as HTMLInputElement).checked }));
+
+  field<HTMLButtonElement>("btnTestSound").addEventListener("click", () => {
+    unlockConferenceSounds();
+    playSound("product_completed");
+    vibrate("completed");
+  });
+  field<HTMLButtonElement>("btnTestVoice").addEventListener("click", () => {
+    speak("Este é um teste de voz do GoScan.", { priority: "high" });
+  });
+  field<HTMLButtonElement>("btnResetConferencePrefs").addEventListener("click", async () => {
+    try {
+      await resetMyConferencePreferences();
+      showToast("Preferências restauradas para o padrão.", "success");
+      void renderConferenciaAlertas(root);
+    } catch (err) {
+      showToast("Erro ao restaurar padrão: " + describeError(err), "error");
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Administração — painel real. A proteção de verdade não é esta tela (ela só
+// evita mostrar um painel vazio/quebrado pra quem não tem acesso): toda ação
+// dentro do painel passa pela Edge Function admin-users, que valida
+// hierarquia/permissão de novo no servidor a cada chamada — acessar a URL
+// direto nunca contorna isso, só mostraria um painel cujas ações falhariam.
 function renderAdministracaoGate(root: HTMLElement): void {
   const { profile } = getAuthState();
-  if (!isManagerOrAdmin(profile)) {
+  if (!isAllowedIntoAdminPanel(profile?.role)) {
     root.innerHTML = `
       <section class="profile-screen">
         <div class="card">
@@ -315,13 +431,5 @@ function renderAdministracaoGate(root: HTMLElement): void {
     return;
   }
 
-  root.innerHTML = `
-    <section class="profile-screen">
-      <div class="card">
-        ${backButton()}
-        <h2>Administração</h2>
-        <p class="hint-text">O painel completo (usuários, permissões, auditoria) chega na próxima etapa desta expansão.</p>
-      </div>
-    </section>`;
-  wireBack(root, "/perfil/configuracoes");
+  void renderAdminPanel(root);
 }

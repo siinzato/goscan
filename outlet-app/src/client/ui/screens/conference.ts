@@ -14,6 +14,7 @@ import {
   type SessionItem,
 } from "../../conferenceSession.ts";
 import { exportItemsToXlsx } from "../../exporter.ts";
+import { stopCollabSession } from "../../realtimeCollab.ts";
 import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
 import { confirmAction } from "../confirmModal.ts";
@@ -246,6 +247,25 @@ export async function renderConference(root: HTMLElement): Promise<void> {
 // andamento, igual já acontece hoje entre os modos imagens/texto).
 let nfeConferenceModule: typeof import("./nfeConference.ts") | null = null;
 let nfeConferenceMounted = false;
+
+/**
+ * Chamado por shell.ts ao sair da rota "conferir" — encerra a sessão de
+ * colaboração em tempo real ativa (ver realtimeCollab.ts), seja ela do modo
+ * Outlet (conferenceSession.ts) ou da Conferência por NF (nfeConference.ts):
+ * o módulo é um singleton global, então um único stopCollabSession() cobre
+ * os dois casos, não importa qual sub-modo estava aberto. Nunca deixa uma
+ * subscription viva ouvindo mudanças de uma tela que já fechou.
+ *
+ * CORREÇÃO ESTRUTURAL — Conferência Colaborativa Segura: se o módulo de NF-e
+ * já foi carregado, também libera a reserva ativa e para o heartbeat/fila de
+ * voz dele — sem isso, sair pra OUTRA aba do app (não só trocar de sub-tela
+ * dentro do fluxo de NF-e) deixaria um timer de heartbeat rodando pra sempre
+ * e um produto reservado preso até expirar sozinho.
+ */
+export function teardownConference(): void {
+  stopCollabSession();
+  nfeConferenceModule?.teardownNfeConference();
+}
 
 function wireInputModeSwitch(root: HTMLElement): void {
   const extraCards = root.querySelector<HTMLElement>("#outletExtraCards")!;
@@ -768,13 +788,16 @@ function renderSessionItems(root: HTMLElement, session: Session): void {
   wrap.querySelectorAll<HTMLButtonElement>("[data-qty-dec]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const it = session.items.find((i) => i.uiId === btn.dataset.qtyDec);
-      if (it) void updateItemQuantity(it.uiId, Math.max(1, it.quantity - 1));
+      // updateItemQuantity recebe um DELTA (não mais o valor absoluto
+      // calculado aqui) — o ajuste final é sempre resolvido atomicamente no
+      // banco (ver conferenceSession.ts).
+      if (it) void updateItemQuantity(it.uiId, -1);
     });
   });
   wrap.querySelectorAll<HTMLButtonElement>("[data-qty-inc]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const it = session.items.find((i) => i.uiId === btn.dataset.qtyInc);
-      if (it) void updateItemQuantity(it.uiId, it.quantity + 1);
+      if (it) void updateItemQuantity(it.uiId, 1);
     });
   });
 

@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { resolveInvoiceItem, computeItemStatus, summarizeReceipt, scoreNameSimilarity, suggestBestMatch } from "../src/client/nfeMatching.ts";
 
 const candidates = [
-  { variant_id: "v1", sku_code: "TCGCM42-1", gtin: "7891234567890" },
-  { variant_id: "v2", sku_code: "GFGCM13-2", gtin: null },
+  { variant_id: "v1", sku_code: "TCGCM42-1", gtin_normalized: "7891234567890" },
+  { variant_id: "v2", sku_code: "GFGCM13-2", gtin_normalized: null },
 ];
 
 test("resolveInvoiceItem prioriza SKU exato sobre EAN", () => {
@@ -17,6 +17,29 @@ test("resolveInvoiceItem cai para EAN exato quando o código da NF não bate com
   const result = resolveInvoiceItem({ invoice_product_code: "CODIGO-DO-FORNECEDOR-XYZ", ean: "7891234567890" }, candidates);
   assert.equal(result.variant_id, "v1");
   assert.equal(result.link_source, "ean");
+});
+
+// ---------------------------------------------------------------------------
+// CORREÇÃO — causa raiz do bug relatado ("EAN já cadastrado não vincula
+// automaticamente"): o EAN da NF pode chegar com espaço/pontuação/traço que o
+// EAN cadastrado (já normalizado em gtin_normalized) não tem — a comparação
+// TEM que tolerar isso via normalizeEan, nunca por igualdade de texto cru.
+// ---------------------------------------------------------------------------
+test("resolveInvoiceItem encontra por EAN mesmo com espaços ao redor (formatação da NF)", () => {
+  const result = resolveInvoiceItem({ invoice_product_code: "CODIGO-DESCONHECIDO", ean: " 7891234567890 " }, candidates);
+  assert.equal(result.variant_id, "v1");
+  assert.equal(result.link_source, "ean");
+});
+
+test("resolveInvoiceItem encontra por EAN formatado com espaços/traços internos", () => {
+  const result = resolveInvoiceItem({ invoice_product_code: "CODIGO-DESCONHECIDO", ean: "789-1234-567890" }, candidates);
+  assert.equal(result.variant_id, "v1");
+  assert.equal(result.link_source, "ean");
+});
+
+test("resolveInvoiceItem nunca trata um EAN de formato inválido (ex.: '0') como correspondência", () => {
+  const result = resolveInvoiceItem({ invoice_product_code: "CODIGO-DESCONHECIDO", ean: "0" }, candidates);
+  assert.equal(result.variant_id, null);
 });
 
 test("resolveInvoiceItem usa associação aprendida só quando SKU e EAN exatos não batem", () => {

@@ -3,7 +3,7 @@
 // fluxo totalmente separado do reconhecimento visual/matching Outlet — não
 // reaproveita conferences/conference_items, tem suas próprias tabelas
 // (invoice_receipts/invoice_receipt_items/receipt_counts).
-import { escapeHtml, debounce, formatDateTime, describeError } from "../../utils.ts";
+import { escapeHtml, debounce, formatDateTime, describeError, initials, normalizeEan } from "../../utils.ts";
 import { parseNfeXml, diagnoseNfeXml, type NfeXmlDiagnostics } from "../../nfeParser.ts";
 import { normalizeKey, suggestBestMatch } from "../../nfeMatching.ts";
 import { getAuthState, isAdmin, isManagerOrAdmin } from "../../auth.ts";
@@ -13,6 +13,14 @@ import {
   resolveItemManually,
   startCounting,
   submitCount,
+  submitCountDelta,
+  undoLastCount,
+  reserveItem,
+  heartbeatReservation,
+  releaseReservation,
+  listVolumes,
+  createVolume,
+  setWorkMode,
   getReceipt,
   finalizeReceipt,
   listReceiptHistory,
@@ -23,22 +31,361 @@ import {
   type InvoiceReceiptWithNames,
   type InvoiceReceiptItem,
   type ReceiptWithCounts,
+  type WorkMode,
+  type CountEventResult,
+  type CountEventOptions,
+  type ReceiptVolume,
+  type ReservationConflictInfo,
 } from "../../nfeApi.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
 import { exportNfeReportToXlsx } from "../../exporter.ts";
 import { RECEIPT_STATUS_LABEL, itemStamp, reportStatusStamp, itemTitle, itemCodeLabel, itemEanLabel } from "../../nfeReportFormat.ts";
 import { startNfeKeyLookup, isNfeKeyLookupInFlight, type LookupHandle, type LookupProgress } from "../../nfeKeyLookup.ts";
+import { joinCollabSession, stopCollabSession, updateMyPresenceState, sendBroadcast, type PresenceUser, type PresenceStatus } from "../../realtimeCollab.ts";
+import { loadConferencePreferences, getConferencePreferences } from "../../conferencePreferences.ts";
+import { playSound, unlockConferenceSounds } from "../../soundManager.ts";
+import { speak, stopVoiceQueue } from "../../voiceFeedback.ts";
+import { vibrate } from "../../vibrationFeedback.ts";
+import { isVoiceCommandSupported, startPushToTalk, stopPushToTalk, isListening as isVoiceListening, type VoiceCommand } from "../../voiceCommands.ts";
 import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
-import { confirmAction } from "../confirmModal.ts";
+import { confirmAction, chooseAction, promptText } from "../confirmModal.ts";
 
-type NfeView = "upload" | "prep" | "counting" | "result" | "history";
+type NfeView = "upload" | "prep" | "mode" | "counting" | "result" | "history";
 
 let view: NfeView = "upload";
 let currentReceipt: InvoiceReceiptWithNames | null = null;
 let currentItems: InvoiceReceiptItem[] = [];
 let countingFilter: "all" | "pending" | "counted" = "all";
 let countingQuery = "";
+
+// CORREÇÃO ESTRUTURAL — Conferência colaborativa em tempo real (ver
+// realtimeCollab.ts). participants reflete quem mais está com ESTA MESMA NF
+// aberta agora (presence); collabConnected alimenta o indicador discreto de
+// sincronização — nunca bloqueia a tela, só informa.
+let participants: PresenceUser[] = [];
+let collabConnected = true;
+let participantsExpanded = false;
+// Nome de todo mundo que já apareceu na presença desta sessão — usado pra
+// resolver "quem completou o item"/"quem confirmou excesso" em eventos que só
+// trazem o uuid (counted_by), sem precisar de outra consulta ao banco.
+const knownNames = new Map<string, string>();
+
+// EXPANSÃO GOSCAN — Conferência Colaborativa Segura (identidade estável do
+// DISPOSITIVO físico, não do usuário — persistida no navegador pra
+// sobreviver a um F5 no meio de uma reserva/heartbeat).
+function getDeviceId(): string {
+  const KEY = "goscan:device-id";
+  let id = localStorage.getItem(KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(KEY, id);
+  }
+  return id;
+}
+const myDeviceId = getDeviceId();
+
+// Reserva por produto (modo "product"): conflitos conhecidos (item → quem
+// reservou), minha própria reserva ativa (pra heartbeat/liberação) e o
+// heartbeat periódico enquanto a tela de contagem estiver aberta.
+const itemReservations = new Map<string, ReservationConflictInfo>();
+let myReservation: { id: string; itemId: string } | null = null;
+let reservationHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+// Volumes (modo "volume"): lista carregada da NF atual + volume ativo
+// escolhido pelo operador NESTA tela (não persiste entre sessões — é normal
+// escolher de novo ao reabrir, já que outro volume pode fazer mais sentido).
+let volumes: ReceiptVolume[] = [];
+let activeVolumeId: string | null = null;
+
+// "Desfazer minha última bipagem": só oferece desfazer uma ação feita NESTA
+// sessão (evita ambiguidade sobre o que é "a última" depois de F5/troca de
+// dispositivo) — ver seção 13 do pedido.
+const lastEventIdByItem = new Map<string, string>();
+// Último item cujo campo de quantidade recebeu foco — usado como "produto
+// atual" pelos comandos de voz que agem sobre um item específico.
+let lastFocusedItemId: string | null = null;
+
+// Evita repetir som/voz de "produto finalizado" pro MESMO item mais de uma
+// vez nesta sessão, mesmo que o Realtime entregue eventos duplicados/fora de ordem.
+const announcedCompletedItemIds = new Set<string>();
+
+let voicePushToTalkActive = false;
+
+/**
+ * Entra na sessão de colaboração desta NF (idempotente — reentrar com o
+ * mesmo receiptId não recria a subscription). Chamado sempre que uma NF é
+ * aberta para prep/contagem/relatório; encerrado em goTo("upload"/"history")
+ * e no teardown da rota (ver conference.ts:teardownConference, chamado por
+ * shell.ts).
+ */
+function enterReceiptCollab(root: HTMLElement, receiptId: string): void {
+  participants = [];
+  collabConnected = true;
+  void loadConferencePreferences();
+  void listVolumes(receiptId).then((v) => {
+    volumes = v;
+    if (view === "counting" && root.isConnected) renderVolumeSelector(root);
+  });
+  startReservationHeartbeat();
+
+  joinCollabSession(
+    `nfe-receipt:${receiptId}`,
+    [
+      {
+        table: "invoice_receipt_items",
+        filter: `receipt_id=eq.${receiptId}`,
+        onChange: (row: InvoiceReceiptItem) => {
+          if (!currentReceipt || currentReceipt.id !== receiptId || !root.isConnected) return;
+          const idx = currentItems.findIndex((i) => i.id === row.id);
+          const previous = idx !== -1 ? currentItems[idx] : null;
+          // sku_code/produto só existem via join local (getReceipt) — o
+          // payload do Realtime traz só as colunas reais da tabela.
+          if (idx === -1) {
+            currentItems = [...currentItems, { ...row, sku_code: null, produto: null }];
+          } else {
+            currentItems = currentItems.map((i) => (i.id === row.id ? { ...row, sku_code: i.sku_code, produto: i.produto } : i));
+          }
+          // Item completado por OUTRO usuário: a mesma detecção de "primeira
+          // conclusão" que o servidor calcula pra quem bipou, só que aqui é
+          // derivada localmente comparando o estado antes/depois — o dado já
+          // estava no objeto local (getReceipt busca a linha inteira), a
+          // contagem cega só decide NÃO exibir isso durante a digitação normal.
+          const wasComplete = previous ? previous.expected_quantity > 0 && (previous.physical_quantity ?? 0) >= previous.expected_quantity : false;
+          const isComplete = row.expected_quantity > 0 && (row.physical_quantity ?? 0) >= row.expected_quantity;
+          if (isComplete && !wasComplete && row.counted_by) {
+            const { session } = getAuthState();
+            const isMe = session?.user.id === row.counted_by;
+            const whoLabel = isMe ? "Você" : knownNames.get(row.counted_by) || "Um operador";
+            announceItemCompleted(row.id, whoLabel, previous?.produto || previous?.description || row.description || "produto");
+          }
+          // OTIMIZAÇÃO — nunca recarrega a NF inteira por causa de UM item alterado.
+          if (view === "counting" && !updateSingleCountingCard(root, row.id)) renderCountingList(root);
+        },
+      },
+      {
+        table: "invoice_receipts",
+        filter: `id=eq.${receiptId}`,
+        onChange: (row: InvoiceReceipt) => {
+          if (!currentReceipt || currentReceipt.id !== receiptId || !root.isConnected) return;
+          const wasOpen = currentReceipt.status === "not_started" || currentReceipt.status === "in_progress";
+          const nowClosed = row.status === "completed" || row.status === "with_divergences";
+          if (wasOpen && nowClosed && view === "counting") {
+            showToast("Outro usuário finalizou esta conferência.", "default");
+            playSound("receipt_finalized");
+            speak("Conferência finalizada.", { priority: "high", dedupeKey: "receipt-finalized" });
+            void getReceipt(receiptId).then(({ receipt, items }) => {
+              currentReceipt = receipt;
+              currentItems = items;
+              goTo(root, "result");
+            });
+            return;
+          }
+          currentReceipt = { ...currentReceipt, status: row.status, work_mode: row.work_mode, finished_at: row.finished_at, finished_by: row.finished_by };
+        },
+      },
+      {
+        table: "invoice_receipt_item_reservations",
+        filter: `receipt_id=eq.${receiptId}`,
+        onChange: (row: { item_id: string; user_id: string; status: string; reserved_at: string; last_heartbeat_at: string }) => {
+          if (!root.isConnected) return;
+          if (row.status === "active" && row.user_id !== getAuthState().session?.user.id) {
+            itemReservations.set(row.item_id, {
+              userId: row.user_id,
+              fullName: knownNames.get(row.user_id) || "Outro operador",
+              since: row.reserved_at,
+              lastActivity: row.last_heartbeat_at,
+            });
+          } else {
+            itemReservations.delete(row.item_id);
+          }
+          if (view === "counting" && !updateSingleCountingCard(root, row.item_id)) renderCountingList(root);
+        },
+      },
+      {
+        table: "invoice_receipt_volumes",
+        filter: `receipt_id=eq.${receiptId}`,
+        onChange: (row: ReceiptVolume) => {
+          if (!root.isConnected || volumes.some((v) => v.id === row.id)) return;
+          volumes = [...volumes, row].sort((a, b) => a.label.localeCompare(b.label, "pt-BR"));
+          if (view === "counting") renderVolumeSelector(root);
+        },
+      },
+    ],
+    {
+      onPresenceChange: (users) => {
+        participants = users;
+        users.forEach((u) => knownNames.set(u.userId, u.fullName));
+        if (view === "counting" && root.isConnected) renderParticipantsBanner(root);
+      },
+      onReconnect: () => {
+        collabConnected = true;
+        if (view === "counting" && root.isConnected) renderParticipantsBanner(root);
+        showToast("Conectado novamente — sincronizando…", "success");
+        playSound("connection_restored");
+        // Nunca confia só no que o Realtime entregou enquanto esteve offline
+        // (pode ter perdido eventos) — rebusca o estado oficial ao reconectar.
+        void getReceipt(receiptId).then(({ receipt, items }) => {
+          if (!root.isConnected || currentReceipt?.id !== receiptId) return;
+          currentReceipt = receipt;
+          currentItems = items;
+          if (view === "counting") renderCountingList(root);
+        });
+      },
+      onDisconnected: () => {
+        collabConnected = false;
+        if (view === "counting" && root.isConnected) renderParticipantsBanner(root);
+        playSound("connection_lost");
+      },
+      onBroadcast: (type, data) => {
+        if (type === "collab-request" && root.isConnected && view === "counting") {
+          const fromName = typeof data.fromName === "string" ? data.fromName : "Alguém";
+          const itemLabel = typeof data.itemLabel === "string" ? data.itemLabel : "um produto";
+          showToast(`${fromName} pediu colaboração em: ${itemLabel}`, "default");
+        }
+      },
+    }
+  );
+}
+
+const PRESENCE_STATUS_LABEL: Record<PresenceStatus, string> = { online: "Online", counting: "Conferindo", paused: "Pausado" };
+
+function renderParticipantsBanner(root: HTMLElement): void {
+  const el = root.querySelector<HTMLElement>("#nfeParticipantsBanner");
+  if (!el) return;
+  const { session: authSession } = getAuthState();
+  const myId = authSession?.user.id;
+  const syncNote = collabConnected ? "" : " · sincronizando…";
+  const sorted = [...participants].sort((a, b) => (a.userId === myId ? -1 : b.userId === myId ? 1 : 0));
+  const visible = sorted.slice(0, 4);
+  const extra = participants.length - visible.length;
+
+  el.innerHTML = `
+    <button type="button" class="collab-participants-toggle" id="nfeParticipantsToggle" aria-expanded="${participantsExpanded}">
+      <span class="avatar-stack">
+        ${visible.map((p) => `<span class="avatar-chip" title="${escapeHtml(p.fullName)}">${escapeHtml(initials(p.fullName))}</span>`).join("")}
+        ${extra > 0 ? `<span class="avatar-chip avatar-chip-more">+${extra}</span>` : ""}
+      </span>
+      <span class="sync-indicator">${participants.length <= 1 ? "Conferência compartilhada" : "Conferindo agora"}${syncNote}</span>
+      ${Icon.chevronDown}
+    </button>
+    <div class="collab-participants-detail" id="nfeParticipantsDetail" ${participantsExpanded ? "" : "hidden"}>
+      ${sorted
+        .map(
+          (p) => `
+        <div class="collab-participant-row">
+          <span class="avatar-chip">${escapeHtml(initials(p.fullName))}</span>
+          <span class="collab-participant-info">
+            <strong>${escapeHtml(p.fullName)}${p.userId === myId ? " (você)" : ""}</strong>
+            <span class="hint-text">${PRESENCE_STATUS_LABEL[p.status] || "Online"}${p.currentItemLabel ? " · " + escapeHtml(p.currentItemLabel) : ""}</span>
+          </span>
+        </div>`
+        )
+        .join("")}
+      ${participants.length === 0 ? `<p class="hint-text">Nenhum participante ativo.</p>` : ""}
+    </div>`;
+
+  el.querySelector("#nfeParticipantsToggle")!.addEventListener("click", () => {
+    participantsExpanded = !participantsExpanded;
+    renderParticipantsBanner(root);
+  });
+}
+
+/** "Produto finalizado" — som/voz/vibração + toast, no máximo UMA vez por item por sessão (evita repetir por eventos Realtime duplicados/fora de ordem). */
+function announceItemCompleted(itemId: string, whoLabel: string, itemLabel: string): void {
+  if (announcedCompletedItemIds.has(itemId)) return;
+  announcedCompletedItemIds.add(itemId);
+  if (!getConferencePreferences().notifyItemCompleted) return;
+  playSound("product_completed");
+  vibrate("completed");
+  const phrase = getConferencePreferences().speakProductName ? `Produto finalizado: ${itemLabel}.` : "Produto finalizado.";
+  speak(phrase, { priority: "high", dedupeKey: `completed:${itemId}` });
+  showToast(`${whoLabel} completou "${itemLabel}".`, "success");
+}
+
+function itemLabelFor(itemId: string): string {
+  const it = currentItems.find((i) => i.id === itemId);
+  return it ? itemTitle(it) : "produto";
+}
+
+// ---------------------------------------------------------------------------
+// Reserva de produto (modo "product") — heartbeat periódico + liberação ao sair.
+// ---------------------------------------------------------------------------
+function startReservationHeartbeat(): void {
+  stopReservationHeartbeat();
+  reservationHeartbeatTimer = setInterval(() => {
+    if (myReservation) void heartbeatReservationSilently();
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopReservationHeartbeat(): void {
+  if (reservationHeartbeatTimer) {
+    clearInterval(reservationHeartbeatTimer);
+    reservationHeartbeatTimer = null;
+  }
+}
+
+async function heartbeatReservationSilently(): Promise<void> {
+  if (!myReservation) return;
+  try {
+    const result = await heartbeatReservation(myReservation.id);
+    // Reserva perdida (expirou antes do heartbeat chegar) — a próxima
+    // bipagem/foco no item reserva de novo naturalmente, sem travar nada.
+    if (!result.success) myReservation = null;
+  } catch {
+    /* falha de rede pontual no heartbeat não é crítica — tenta de novo no próximo ciclo */
+  }
+}
+
+function releaseMyReservationSilently(): void {
+  if (!myReservation) return;
+  const itemId = myReservation.itemId;
+  myReservation = null;
+  updateMyPresenceState({ status: "online", currentItemLabel: null });
+  void releaseReservation(itemId, "left_screen").catch(() => {
+    /* melhor esforço — se falhar, a reserva expira sozinha pelo TTL de qualquer forma */
+  });
+}
+
+/** Chamado ao focar o campo de quantidade de um item — no modo "product", isso É "começar a contar" (ver seção 7.2 do pedido). */
+async function handleItemFocusReserve(root: HTMLElement, itemId: string): Promise<void> {
+  if (!currentReceipt || currentReceipt.work_mode !== "product") return;
+  if (myReservation?.itemId === itemId) return;
+
+  try {
+    const result = await reserveItem(itemId, myDeviceId, activeVolumeId);
+    if (!result.success) {
+      itemReservations.set(itemId, result.reservation);
+      // Recria o card pra mostrar o banner de bloqueio (e desabilitar o
+      // campo) — perder o foco aqui é o comportamento CORRETO: o operador
+      // não pode mesmo digitar neste item enquanto estiver reservado.
+      if (!updateSingleCountingCard(root, itemId)) renderCountingList(root);
+      playSound("product_with_other_operator");
+      vibrate("error");
+      if (getConferencePreferences().notifyConflict) {
+        speak(
+          getConferencePreferences().speakProductName ? `${result.reservation.fullName} está conferindo este produto: ${itemLabelFor(itemId)}.` : `${result.reservation.fullName} está conferindo este produto.`,
+          { priority: "high", dedupeKey: `conflict:${itemId}` }
+        );
+      }
+      return;
+    }
+    if (myReservation && myReservation.itemId !== itemId) {
+      void releaseReservation(myReservation.itemId, "switched_item").catch(() => {});
+    }
+    myReservation = { id: result.reservation.id, itemId };
+    itemReservations.delete(itemId);
+    updateMyPresenceState({ status: "counting", currentItemLabel: itemLabelFor(itemId) });
+    // Nada no card muda visualmente numa reserva própria bem-sucedida (o
+    // banner de bloqueio só aparece pra reserva de OUTRO usuário) — não
+    // re-renderiza, então o campo que acabou de ganhar foco nunca o perde.
+  } catch (err) {
+    // Falha ao reservar não deve travar a digitação manual — o servidor
+    // ainda protege via a checagem embutida no próprio scan/confirmação.
+    console.error("Falha ao reservar item:", describeError(err));
+  }
+}
 // Filtro do relatório final: os 5 estados pedidos + o atalho "divergências"
 // (falta OU sobra OU não conferido — nunca inclui OK nem "não localizado").
 type ResultFilter = "all" | "ok" | "missing" | "surplus" | "pending" | "divergent";
@@ -50,6 +397,15 @@ let historyList: ReceiptWithCounts[] = [];
 /** Decide de onde retomar uma nota já existente — nunca força voltar pra preparação se já não há pendências. */
 function decideViewForReceipt(receipt: InvoiceReceipt, items: InvoiceReceiptItem[]): NfeView {
   if (receipt.status === "completed" || receipt.status === "with_divergences") return "result";
+  // CORREÇÃO ESTRUTURAL — Conferência Colaborativa Segura: "not_started"
+  // SEMPRE volta pra preparação, mesmo que todos os itens já estejam
+  // vinculados (ex.: um import cujo XML casou tudo por SKU/EAN sozinho, mas
+  // o operador saiu antes de clicar "Iniciar Conferência"). Sem isto, reabrir
+  // essa NF pelo Histórico pulava direto pra contagem sem NUNCA passar pela
+  // escolha de modo de trabalho (work_mode) nem chamar startCounting() — a
+  // NF ficava "em contagem" na tela mas com status ainda not_started/work_mode
+  // no valor padrão, nunca escolhido de propósito.
+  if (receipt.status === "not_started") return "prep";
   if (items.some((i) => i.product_variant_id === null)) return "prep";
   return "counting";
 }
@@ -61,6 +417,9 @@ export async function renderNfeConference(root: HTMLElement): Promise<void> {
       break;
     case "prep":
       await renderPrepView(root);
+      break;
+    case "mode":
+      renderModeView(root);
       break;
     case "counting":
       renderCountingView(root);
@@ -74,8 +433,41 @@ export async function renderNfeConference(root: HTMLElement): Promise<void> {
   }
 }
 
+/**
+ * Chamado por conference.ts (teardownConference, por sua vez chamado por
+ * shell.ts ao sair da rota "conferir" inteira — não só ao trocar de sub-tela
+ * dentro do fluxo de NF-e, que já é coberto por goTo()). Sem isto, sair do
+ * app pra outra aba (Catálogo, Histórico...) enquanto uma reserva/heartbeat
+ * estivesse ativo deixaria o timer rodando pra sempre e o produto reservado
+ * "preso" até expirar sozinho pelo TTL — nunca liberado de propósito.
+ */
+export function teardownNfeConference(): void {
+  releaseMyReservationSilently();
+  stopReservationHeartbeat();
+  stopPushToTalk();
+  stopVoiceQueue();
+  stopCollabSession();
+}
+
 function goTo(root: HTMLElement, next: NfeView): void {
+  // Saindo da tela de contagem: libera minha reserva ativa (se houver),
+  // para o heartbeat e encerra qualquer captura de voz em andamento — nunca
+  // deixa um produto bloqueado ou um microfone ouvindo numa tela que já saiu.
+  if (view === "counting" && next !== "counting") {
+    releaseMyReservationSilently();
+    stopReservationHeartbeat();
+    stopPushToTalk();
+  }
   view = next;
+  // Entra/mantém a colaboração em tempo real desta NF em prep/modo/contagem/
+  // relatório; qualquer outra tela (upload/histórico) encerra a subscription
+  // — nunca fica ouvindo mudanças de uma NF que o usuário já não está vendo.
+  if ((next === "prep" || next === "mode" || next === "counting" || next === "result") && currentReceipt) {
+    enterReceiptCollab(root, currentReceipt.id);
+  } else {
+    stopCollabSession();
+    stopVoiceQueue();
+  }
   void renderNfeConference(root);
 }
 
@@ -150,6 +542,11 @@ function renderUploadView(root: HTMLElement): void {
 
 /** Mesma apresentação para os dois caminhos que podem encontrar uma NF já existente a partir da chave (checagem local e sinal ALREADY_IMPORTED da Edge Function). */
 function renderAlreadyImported(root: HTMLElement, statusEl: HTMLElement, existing: InvoiceReceiptWithCreator): void {
+  // Uma NF só existe uma vez (invoice_key único) — encontrá-la aqui significa
+  // entrar na MESMA sessão compartilhada pela empresa, nunca criar uma
+  // segunda independente (ver receiptActionLabel).
+  const isDone = existing.status === "completed" || existing.status === "with_divergences";
+  const actionLabel = isDone ? "Visualizar relatório" : "Continuar conferência";
   statusEl.innerHTML = `
     <div class="warning-box">${Icon.info} Esta Nota Fiscal já foi importada.</div>
     <div class="product-card-meta">
@@ -157,7 +554,7 @@ function renderAlreadyImported(root: HTMLElement, statusEl: HTMLElement, existin
       <span>Fornecedor: ${escapeHtml(existing.supplier_name || "-")}</span>
       <span>Status: ${escapeHtml(RECEIPT_STATUS_LABEL[existing.status])}</span>
     </div>
-    <button class="btn-primary btn-block" id="btnOpenByKey">Abrir conferência</button>`;
+    <button class="btn-primary btn-block" id="btnOpenByKey">${escapeHtml(actionLabel)}</button>`;
   statusEl.querySelector("#btnOpenByKey")!.addEventListener("click", async () => {
     const { receipt, items } = await getReceipt(existing.id);
     currentReceipt = receipt;
@@ -342,6 +739,8 @@ async function processXmlText(xml: string, statusEl: HTMLElement, root: HTMLElem
   }
 
   if (existing) {
+    const isDone = existing.status === "completed" || existing.status === "with_divergences";
+    const actionLabel = isDone ? "Visualizar relatório" : "Continuar conferência";
     statusEl.innerHTML = `
       <div class="warning-box">${Icon.info} Esta Nota Fiscal já foi importada.</div>
       <div class="product-card-meta">
@@ -349,7 +748,7 @@ async function processXmlText(xml: string, statusEl: HTMLElement, root: HTMLElem
         <span>Importada em: ${formatDateTime(existing.created_at)}</span>
         <span>Responsável: ${escapeHtml(existing.created_by_name || "-")}</span>
       </div>
-      <button class="btn-primary btn-block" id="btnOpenExisting">Abrir conferência existente</button>
+      <button class="btn-primary btn-block" id="btnOpenExisting">${escapeHtml(actionLabel)}</button>
       ${debugHtml}`;
     statusEl.querySelector("#btnOpenExisting")!.addEventListener("click", async () => {
       const { receipt, items } = await getReceipt(existing!.id);
@@ -432,17 +831,72 @@ async function renderPrepView(root: HTMLElement): Promise<void> {
     void renderPendingSuggestions(root, pending);
   }
 
-  root.querySelector("#btnStartCounting")!.addEventListener("click", async () => {
-    const btn = root.querySelector("#btnStartCounting") as HTMLButtonElement;
-    btn.disabled = true;
-    try {
-      await startCounting(receipt.id);
-      currentReceipt = { ...receipt, status: "in_progress" };
-      goTo(root, "counting");
-    } catch (err) {
-      showToast("Erro ao iniciar conferência: " + (describeError(err)), "error");
-      btn.disabled = false;
-    }
+  root.querySelector("#btnStartCounting")!.addEventListener("click", () => {
+    goTo(root, "mode");
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 2.5 Escolha do modo de trabalho — só acontece UMA vez, na 1ª transição
+// not_started → in_progress (ver seção 7 do pedido). Depois de escolhido, o
+// modo fica salvo em invoice_receipts.work_mode até o fim da conferência.
+// ---------------------------------------------------------------------------
+const WORK_MODE_INFO: Record<WorkMode, { title: string; description: string }> = {
+  volume: {
+    title: "Por volume",
+    description: "Cada operador assume uma caixa, pallet ou área física. O mesmo produto pode ser contado por pessoas diferentes em volumes diferentes — os totais são somados no resultado geral.",
+  },
+  product: {
+    title: "Por produto",
+    description: "Cada produto é reservado temporariamente para quem começar a contá-lo — evita que dois operadores contem fisicamente o mesmo produto sem perceber.",
+  },
+  free: {
+    title: "Livre compartilhada",
+    description: "Todos podem conferir qualquer produto. Combinem entre vocês como separar fisicamente os volumes para evitar dupla contagem — o sistema alerta, mas não bloqueia.",
+  },
+};
+
+function renderModeView(root: HTMLElement): void {
+  const receipt = currentReceipt!;
+  root.innerHTML = `
+    <div class="card">
+      <h2>Como vocês vão conferir esta nota?</h2>
+      <p class="hint-text">Escolham juntos o modo de divisão do trabalho — combine com quem mais for participar antes de continuar. O modo escolhido vale até o fim desta conferência.</p>
+      <div class="work-mode-options">
+        ${(Object.keys(WORK_MODE_INFO) as WorkMode[])
+          .map(
+            (m) => `
+          <button type="button" class="work-mode-card" data-mode="${m}">
+            <strong>${escapeHtml(WORK_MODE_INFO[m].title)}</strong>
+            <span class="hint-text">${escapeHtml(WORK_MODE_INFO[m].description)}</span>
+          </button>`
+          )
+          .join("")}
+      </div>
+    </div>`;
+
+  root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const mode = btn.dataset.mode as WorkMode;
+      if (mode === "free") {
+        const confirmed = await confirmAction({
+          title: "Modo livre compartilhado",
+          message: "Todos podem conferir qualquer produto. Para evitar dupla contagem física, combinem entre vocês como separar os volumes antes de começar.",
+          confirmLabel: "Entendi, continuar",
+        });
+        if (!confirmed) return;
+      }
+      root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((b) => (b.disabled = true));
+      try {
+        await setWorkMode(receipt.id, mode);
+        await startCounting(receipt.id);
+        currentReceipt = { ...receipt, status: "in_progress", work_mode: mode };
+        goTo(root, "counting");
+      } catch (err) {
+        showToast("Erro ao iniciar conferência: " + describeError(err), "error");
+        root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((b) => (b.disabled = false));
+      }
+    });
   });
 }
 
@@ -484,7 +938,9 @@ async function renderPendingSuggestions(root: HTMLElement, pending: InvoiceRecei
           invoiceProductCode: item.invoice_product_code,
           ean: item.ean,
         });
-        currentItems = currentItems.map((i) => (i.id === item.id ? { ...i, ...updated, sku_code: suggestion.candidate.sku_code, produto: suggestion.candidate.produto } : i));
+        currentItems = currentItems.map((i) =>
+          i.id === item.id ? { ...i, ...updated, sku_code: suggestion.candidate.sku_code, produto: suggestion.candidate.produto, catalog_ean: suggestion.candidate.gtin } : i
+        );
         showToast(`Vinculado a "${suggestion.candidate.produto}".`, "success");
         void renderNfeConference(root);
       } catch (err) {
@@ -508,6 +964,11 @@ function renderPendingItemCard(it: InvoiceReceiptItem): string {
         <span class="sku-code">Código NF: ${escapeHtml(it.invoice_product_code || "-")}</span>
         ${it.ean ? `<span>EAN ${escapeHtml(it.ean)}</span>` : ""}
       </div>
+      ${
+        !it.ean
+          ? `<p class="hint-text">Este item da NF não possui EAN válido. Pesquise pelo nome, SKU ou código do fornecedor para vinculá-lo.</p>`
+          : ""
+      }
       <div id="pendingSuggestion-${it.id}"></div>
       <div class="sku-picker" data-pending-idx="${it.id}">
         <input type="text" class="sku-picker-input" aria-label="Buscar produto normal" placeholder="Buscar por palavra-chave do nome, SKU ou EAN…" data-pending-input="${it.id}" />
@@ -519,20 +980,49 @@ function renderPendingItemCard(it: InvoiceReceiptItem): string {
     </div>`;
 }
 
+/**
+ * CORREÇÃO — Reconhecimento automático e busca por EAN: antes, buscar por
+ * EAN aqui nunca encontrava nada (searchCatalog não filtrava por gtin — ver
+ * catalogApi.ts) e não havia cancelamento de buscas antigas nem estado de
+ * carregamento/erro. Agora cada campo mantém seu próprio AbortController
+ * (cancela a busca anterior a cada nova tecla — nunca deixa uma resposta
+ * velha sobrescrever a mais recente) e mostra "Buscando…"/erro com retry.
+ */
 function wirePendingItemPickers(root: HTMLElement): void {
   root.querySelectorAll<HTMLInputElement>("[data-pending-input]").forEach((input) => {
     const itemId = input.dataset.pendingInput!;
     const resultsBox = input.parentElement!.querySelector<HTMLDivElement>(".sku-picker-results")!;
+    let activeController: AbortController | null = null;
 
-    const search = debounce(async (q: string) => {
+    const runSearch = async (q: string): Promise<void> => {
+      activeController?.abort();
       if (!q.trim()) {
         resultsBox.hidden = true;
         return;
       }
-      const rows = await searchSkuForPicker(q, 15, "normal");
+      const controller = new AbortController();
+      activeController = controller;
+      resultsBox.hidden = false;
+      resultsBox.innerHTML = `<div class="sku-picker-empty">Buscando…</div>`;
+      let rows: CatalogRow[];
+      try {
+        rows = await searchSkuForPicker(q, 15, "normal", controller.signal);
+      } catch {
+        if (controller.signal.aborted) return;
+        renderError(q);
+        return;
+      }
+      if (controller.signal.aborted) return;
       renderResults(rows);
-    }, 300);
-    input.addEventListener("input", () => search(input.value));
+    };
+    const search = debounce(runSearch, 300);
+    input.addEventListener("input", () => void search(input.value));
+
+    function renderError(q: string): void {
+      resultsBox.innerHTML = `<div class="sku-picker-empty">Erro ao consultar a base. <button type="button" class="link-btn" data-picker-retry>Tentar novamente</button></div>`;
+      resultsBox.hidden = false;
+      resultsBox.querySelector("[data-picker-retry]")?.addEventListener("click", () => void runSearch(q));
+    }
 
     function renderResults(rows: CatalogRow[]): void {
       if (rows.length === 0) {
@@ -541,12 +1031,21 @@ function wirePendingItemPickers(root: HTMLElement): void {
         return;
       }
       resultsBox.innerHTML = rows
-        .map(
-          (r) =>
-            `<button type="button" class="sku-picker-item" data-variant="${r.variant_id}" data-produto="${escapeHtml(r.produto)}">${escapeHtml(
-              r.produto
-            )} <span class="sku-code">${escapeHtml(r.sku_code)}</span></button>`
-        )
+        .map((r) => {
+          const badge =
+            r.match_type === "exact_ean"
+              ? `<span class="status-badge success">EAN exato</span>`
+              : r.match_type === "exact_sku"
+                ? `<span class="status-badge success">SKU exato</span>`
+                : "";
+          return `<button type="button" class="sku-picker-item" data-variant="${r.variant_id}" data-produto="${escapeHtml(r.produto)}" data-sku="${escapeHtml(r.sku_code)}" data-ean="${escapeHtml(r.gtin || "")}">
+              <span class="sku-picker-item-info">
+                <span class="product-card-name">${escapeHtml(r.produto)}</span>
+                <span class="sku-code">${escapeHtml(r.sku_code)}${r.gtin ? ` · EAN ${escapeHtml(r.gtin)}` : ""}</span>
+              </span>
+              ${badge}
+            </button>`;
+        })
         .join("");
       resultsBox.hidden = false;
       resultsBox.querySelectorAll<HTMLButtonElement>(".sku-picker-item").forEach((btn) => {
@@ -559,7 +1058,12 @@ function wirePendingItemPickers(root: HTMLElement): void {
               invoiceProductCode: item.invoice_product_code,
               ean: item.ean,
             });
-            currentItems = currentItems.map((i) => (i.id === itemId ? { ...i, ...updated, sku_code: item.sku_code, produto: btn.dataset.produto! } : i));
+            // BUG REAL corrigido: usava item.sku_code (o item PENDENTE ainda
+            // não tem SKU nenhum — ficava null/stale) em vez do SKU do
+            // produto de verdade escolhido no picker.
+            currentItems = currentItems.map((i) =>
+              i.id === itemId ? { ...i, ...updated, sku_code: btn.dataset.sku!, produto: btn.dataset.produto!, catalog_ean: btn.dataset.ean || null } : i
+            );
             showToast(`Vinculado a "${btn.dataset.produto}".`, "success");
             void renderNfeConference(root);
           } catch (err) {
@@ -576,6 +1080,7 @@ function wirePendingItemPickers(root: HTMLElement): void {
 // ---------------------------------------------------------------------------
 function renderCountingView(root: HTMLElement): void {
   const receipt = currentReceipt!;
+  const voiceReady = isVoiceCommandSupported() && getConferencePreferences().voiceCommandsEnabled;
 
   root.innerHTML = `
     <div class="card">
@@ -585,6 +1090,8 @@ function renderCountingView(root: HTMLElement): void {
         <span>Fornecedor: ${escapeHtml(receipt.supplier_name || "-")}</span>
       </div>
       <p class="hint-text">Conte o que realmente foi recebido — a quantidade da nota só aparece depois de finalizar.</p>
+      <div id="nfeParticipantsBanner"></div>
+      <div id="nfeVolumeSelector"></div>
 
       <label for="nfeEanInput" class="sr-only">Digitar ou ler EAN</label>
       <div class="search-row search-row-icon">
@@ -600,6 +1107,12 @@ function renderCountingView(root: HTMLElement): void {
         <button class="mode-btn ${countingFilter === "pending" ? "active" : ""}" data-count-filter="pending">Pendentes</button>
         <button class="mode-btn ${countingFilter === "counted" ? "active" : ""}" data-count-filter="counted">Conferidos</button>
       </div>
+
+      ${
+        voiceReady
+          ? `<button type="button" class="voice-ptt-btn" id="nfeVoicePtt" aria-label="Segure para falar um comando">${Icon.mic}<span>Segure para falar</span></button>`
+          : ""
+      }
     </div>
 
     <div class="card">
@@ -610,21 +1123,30 @@ function renderCountingView(root: HTMLElement): void {
       <button class="btn-accent btn-block" id="btnFinalizeReceipt">Finalizar Conferência</button>
     </div>`;
 
+  root.addEventListener("click", unlockConferenceSounds, { once: true });
+
   renderCountingList(root);
+  renderParticipantsBanner(root);
+  renderVolumeSelector(root);
 
   const eanInput = root.querySelector<HTMLInputElement>("#nfeEanInput")!;
   eanInput.addEventListener("keydown", async (e) => {
     if (e.key !== "Enter") return;
-    const code = normalizeKey(eanInput.value);
+    // CORREÇÃO — EAN nunca usa normalizeKey (só maiúsculiza/trima): usa
+    // normalizeEan (dígitos apenas) pra tolerar espaço/pontuação/traço vindos
+    // de leitor USB/colagem, mesma regra usada em todo o resto do app.
+    const code = normalizeEan(eanInput.value);
     eanInput.value = "";
     if (!code) return;
-    const match = currentItems.find((i) => i.ean && normalizeKey(i.ean) === code);
+    const match = currentItems.find((i) => i.ean && normalizeEan(i.ean) === code);
     if (!match) {
+      playSound("product_out_of_invoice");
+      vibrate("error");
+      speak("Produto não pertence a esta nota.", { priority: "high", dedupeKey: "not-in-invoice", dedupeWindowMs: 1500 });
       showToast("EAN não encontrado nesta nota.", "error");
       return;
     }
-    const nextQty = (match.physical_quantity ?? 0) + 1;
-    await confirmCount(root, match.id, nextQty);
+    await confirmCountDelta(root, match.id, 1, "scanner");
   });
 
   const searchInput = root.querySelector<HTMLInputElement>("#nfeCountingSearch")!;
@@ -643,16 +1165,25 @@ function renderCountingView(root: HTMLElement): void {
     });
   });
 
+  wirePushToTalkButton(root);
+
   root.querySelector("#btnFinalizeReceipt")!.addEventListener("click", async () => {
     // Breakdown real (nunca "finalizar silenciosamente" com pendências escondidas).
     const totalItens = currentItems.length;
     const conferidos = currentItems.filter((i) => i.physical_quantity !== null).length;
     const pendentes = totalItens - conferidos;
+    const { session } = getAuthState();
+    const others = participants.filter((p) => p.userId !== session?.user.id);
     const breakdown = `NF: ${receipt.invoice_number || "-"} · Itens da NF: ${totalItens} · Itens conferidos: ${conferidos} · Pendentes: ${pendentes}`;
+    const participantsNote = others.length > 0 ? ` Existem outros operadores nesta conferência: ${others.map((p) => p.fullName).join(", ")} — confirme que todos terminaram.` : "";
+    const reservationsNote = itemReservations.size > 0 ? ` Há ${itemReservations.size} produto(s) ainda reservado(s) por outro operador.` : "";
     const message =
-      pendentes > 0
-        ? `⚠️ Existem produtos ainda não conferidos. ${breakdown}. A quantidade da NF será revelada e comparada com a contagem física — itens não contados aparecem como "Não conferido" no relatório.`
-        : `${breakdown}. A quantidade da NF será revelada e comparada com a contagem física.`;
+      (pendentes > 0
+        ? `Existem produtos ainda não conferidos. ${breakdown}.`
+        : `${breakdown}.`) +
+      participantsNote +
+      reservationsNote +
+      ` A quantidade da NF será revelada e comparada com a contagem física${pendentes > 0 ? ' — itens não contados aparecem como "Não conferido" no relatório' : ""}.`;
 
     const confirmed = await confirmAction({
       title: "Finalizar Conferência?",
@@ -665,9 +1196,24 @@ function renderCountingView(root: HTMLElement): void {
     btn.disabled = true;
     btn.textContent = "Finalizando…";
     try {
-      const { receipt: updated, items } = await finalizeReceipt(receipt.id);
-      currentReceipt = updated;
-      currentItems = items;
+      const outcome = await finalizeReceipt(receipt.id);
+      if (!outcome.ok) {
+        // CORREÇÃO ESTRUTURAL — dupla finalização real: outro operador
+        // finalizou entre o momento em que esta tela abriu e este clique
+        // (ver finalize_invoice_receipt_atomic). Nunca reprocessa por cima —
+        // só leva ao relatório já oficial.
+        showToast(`Esta conferência já foi finalizada${outcome.finishedByName ? " por " + outcome.finishedByName : ""}.`, "default");
+        const { receipt: refreshed, items } = await getReceipt(receipt.id);
+        currentReceipt = refreshed;
+        currentItems = items;
+        goTo(root, "result");
+        return;
+      }
+      currentReceipt = outcome.receipt;
+      currentItems = outcome.items;
+      playSound("receipt_finalized");
+      vibrate("completed");
+      speak("Conferência finalizada.", { priority: "high", dedupeKey: "receipt-finalized" });
       goTo(root, "result");
     } catch (err) {
       showToast("Erro ao finalizar: " + (describeError(err)), "error");
@@ -677,14 +1223,252 @@ function renderCountingView(root: HTMLElement): void {
   });
 }
 
+function renderVolumeSelector(root: HTMLElement): void {
+  const el = root.querySelector<HTMLElement>("#nfeVolumeSelector");
+  if (!el) return;
+  if (!currentReceipt || currentReceipt.work_mode !== "volume") {
+    el.innerHTML = "";
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="volume-selector">
+      ${Icon.box}
+      <label for="nfeVolumeSelect" class="sr-only">Volume atual</label>
+      <select id="nfeVolumeSelect">
+        <option value="">Sem volume definido</option>
+        ${volumes.map((v) => `<option value="${v.id}" ${v.id === activeVolumeId ? "selected" : ""}>${escapeHtml(v.label)}</option>`).join("")}
+      </select>
+      <button type="button" class="btn-secondary" id="btnNewVolume">${Icon.plus}Novo volume</button>
+    </div>`;
+
+  el.querySelector<HTMLSelectElement>("#nfeVolumeSelect")!.addEventListener("change", (e) => {
+    activeVolumeId = (e.target as HTMLSelectElement).value || null;
+  });
+
+  el.querySelector("#btnNewVolume")!.addEventListener("click", async () => {
+    const label = await promptText({ title: "Novo volume", placeholder: "Ex.: Caixa 01, Pallet 02, Área A…", confirmLabel: "Criar" });
+    if (!label) return;
+    try {
+      const created = await createVolume(currentReceipt!.id, label);
+      if (!volumes.some((v) => v.id === created.id)) volumes = [...volumes, created];
+      activeVolumeId = created.id;
+      renderVolumeSelector(root);
+      showToast(`Volume "${created.label}" criado.`, "success");
+    } catch (err) {
+      showToast("Erro ao criar volume: " + describeError(err), "error");
+    }
+  });
+}
+
+function wirePushToTalkButton(root: HTMLElement): void {
+  const pttBtn = root.querySelector<HTMLButtonElement>("#nfeVoicePtt");
+  if (!pttBtn) return;
+
+  const begin = (e: Event) => {
+    e.preventDefault();
+    if (voicePushToTalkActive) return;
+    voicePushToTalkActive = true;
+    pttBtn.classList.add("active");
+    const started = startPushToTalk({
+      onResult: (cmd) => void handleVoiceCommand(root, cmd),
+      onLowConfidence: () => showToast("Não entendi o comando. Tente novamente.", "error"),
+      onError: (msg) => showToast(msg, "error"),
+      onEnd: () => {
+        voicePushToTalkActive = false;
+        pttBtn.classList.remove("active");
+      },
+    });
+    if (!started) {
+      voicePushToTalkActive = false;
+      pttBtn.classList.remove("active");
+    }
+  };
+  const end = () => {
+    if (isVoiceListening()) stopPushToTalk();
+  };
+  pttBtn.addEventListener("pointerdown", begin);
+  pttBtn.addEventListener("pointerup", end);
+  pttBtn.addEventListener("pointerleave", end);
+}
+
+/** Confirmação elegível por voz (segunda captura push-to-talk) OU toque — nunca aplica um comando de voz sem essa confirmação explícita (ver seção 18 do pedido). */
+async function confirmVoiceEligibleAction(title: string, message: string): Promise<boolean> {
+  const voiceReady = isVoiceCommandSupported() && getConferencePreferences().voiceCommandsEnabled;
+  const options = [{ label: "Confirmar", value: "confirm" }];
+  if (voiceReady) options.push({ label: "Confirmar por voz", value: "voice" });
+  const choice = await chooseAction({ title, message, options, dismissLabel: "Cancelar" });
+  if (choice === "confirm") return true;
+  if (choice === "voice") {
+    return new Promise((resolve) => {
+      const started = startPushToTalk({
+        onResult: (cmd) => resolve(cmd.kind === "confirm"),
+        onLowConfidence: () => {
+          showToast("Não entendi o comando. Tente novamente.", "error");
+          resolve(false);
+        },
+        onError: (msg) => {
+          showToast(msg, "error");
+          resolve(false);
+        },
+        onEnd: () => {},
+      });
+      if (!started) resolve(false);
+    });
+  }
+  return false;
+}
+
+function focusNextPendingItem(root: HTMLElement): void {
+  const pendingList = filteredCountingItems().filter((i) => i.status === "pending" || i.status === "unlinked");
+  if (pendingList.length === 0) {
+    showToast("Não há mais produtos pendentes.", "default");
+    return;
+  }
+  const currentIdx = lastFocusedItemId ? pendingList.findIndex((i) => i.id === lastFocusedItemId) : -1;
+  const next = pendingList[(currentIdx + 1) % pendingList.length];
+  const input = root.querySelector<HTMLInputElement>(`[data-qty-input="${next.id}"]`);
+  input?.scrollIntoView({ behavior: "smooth", block: "center" });
+  input?.focus();
+}
+
+async function handleUndoClick(root: HTMLElement, itemId: string): Promise<void> {
+  const eventId = lastEventIdByItem.get(itemId);
+  if (!eventId) return;
+  const confirmed = await confirmAction({
+    title: "Desfazer última bipagem?",
+    message: `Isso reverte a sua última contagem em "${itemLabelFor(itemId)}". O histórico não é apagado — fica registrado como uma correção.`,
+    confirmLabel: "Desfazer",
+    danger: true,
+  });
+  if (!confirmed) return;
+  try {
+    const result = await undoLastCount(eventId);
+    currentItems = currentItems.map((i) => (i.id === itemId ? { ...i, ...result.item } : i));
+    lastEventIdByItem.delete(itemId);
+    if (!updateSingleCountingCard(root, itemId)) renderCountingList(root);
+    showToast(`Desfeito — total ${result.newTotal}.`, "success");
+  } catch (err) {
+    showToast("Erro ao desfazer: " + describeError(err), "error");
+  }
+}
+
+async function handleVoiceCommand(root: HTMLElement, cmd: VoiceCommand): Promise<void> {
+  switch (cmd.kind) {
+    case "add_quantity":
+    case "remove_quantity": {
+      const targetId = myReservation?.itemId || lastFocusedItemId;
+      if (!targetId) {
+        showToast("Nenhum produto selecionado — toque em um produto antes de usar comandos de voz.", "error");
+        return;
+      }
+      const amount = cmd.kind === "add_quantity" ? cmd.amount : -cmd.amount;
+      const verb = cmd.kind === "add_quantity" ? "adicionar" : "remover";
+      const confirmed = await confirmVoiceEligibleAction(`${verb === "adicionar" ? "Adicionar" : "Remover"} ${cmd.amount} unidade(s)?`, `${itemLabelFor(targetId)} — confirma ${verb} ${cmd.amount} unidade(s)?`);
+      if (!confirmed) return;
+      await attemptCountEvent(root, targetId, amount, "increment", { origin: "voice", deviceId: myDeviceId, volumeId: activeVolumeId });
+      return;
+    }
+    case "finish_product": {
+      const targetId = myReservation?.itemId || lastFocusedItemId;
+      if (!targetId) {
+        showToast("Nenhum produto selecionado.", "error");
+        return;
+      }
+      const it = currentItems.find((i) => i.id === targetId);
+      if (!it) return;
+      const confirmed = await confirmVoiceEligibleAction("Finalizar produto?", `Confirmar ${it.physical_quantity ?? 0} unidade(s) para ${itemLabelFor(targetId)}?`);
+      if (!confirmed) return;
+      await attemptCountEvent(root, targetId, it.physical_quantity ?? 0, "set", { origin: "voice", deviceId: myDeviceId, volumeId: activeVolumeId });
+      return;
+    }
+    case "next_product":
+      focusNextPendingItem(root);
+      return;
+    case "show_pending":
+      countingFilter = "pending";
+      renderCountingList(root);
+      root.querySelectorAll<HTMLButtonElement>("[data-count-filter]").forEach((b) => b.classList.toggle("active", b.dataset.countFilter === "pending"));
+      return;
+    case "undo_last": {
+      const targetId = lastFocusedItemId && lastEventIdByItem.has(lastFocusedItemId) ? lastFocusedItemId : [...lastEventIdByItem.keys()].pop();
+      if (!targetId) {
+        showToast("Nenhuma bipagem recente para desfazer.", "error");
+        return;
+      }
+      await handleUndoClick(root, targetId);
+      return;
+    }
+    case "pause_conference":
+      updateMyPresenceState({ status: "paused" });
+      showToast("Você marcou sua presença como pausada.", "default");
+      return;
+    case "confirm":
+    case "cancel":
+      return;
+    case "unrecognized":
+      showToast("Não entendi o comando. Tente novamente.", "error");
+  }
+}
+
 function filteredCountingItems(): InvoiceReceiptItem[] {
   const q = normalizeKey(countingQuery);
+  // CORREÇÃO — busca por EAN tolerante a espaço/pontuação (ver normalizeEan):
+  // testada à parte do haystack textual porque normalizeKey não remove
+  // espaço interno nem pontuação, só maiúscula/trima.
+  const qEan = normalizeEan(countingQuery);
   return currentItems.filter((it) => {
     if (countingFilter === "pending" && it.status !== "pending" && it.status !== "unlinked") return false;
     if (countingFilter === "counted" && it.status !== "counted") return false;
     if (!q) return true;
+    if (qEan && it.ean && normalizeEan(it.ean) === qEan) return true;
     const haystack = normalizeKey(`${it.produto || ""} ${it.description || ""} ${it.sku_code || ""} ${it.invoice_product_code || ""} ${it.ean || ""}`);
     return haystack.includes(q);
+  });
+}
+
+/** Liga os controles (±/confirmar/foco/desfazer) de UM OU MAIS cards dentro de `scope` — reutilizado tanto pelo render completo quanto pela atualização cirúrgica de um único card. */
+function wireCountingCards(root: HTMLElement, scope: ParentNode): void {
+  scope.querySelectorAll<HTMLButtonElement>("[data-qty-dec]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = scope.querySelector<HTMLInputElement>(`[data-qty-input="${btn.dataset.qtyDec}"]`)!;
+      input.value = String(Math.max(0, Number(input.value || 0) - 1));
+    });
+  });
+  scope.querySelectorAll<HTMLButtonElement>("[data-qty-inc]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = scope.querySelector<HTMLInputElement>(`[data-qty-input="${btn.dataset.qtyInc}"]`)!;
+      input.value = String(Number(input.value || 0) + 1);
+    });
+  });
+  // EXPANSÃO GOSCAN — copiar EAN do card (nunca bloqueia a bipagem: falha de
+  // clipboard só mostra um toast de erro, não interrompe a contagem).
+  scope.querySelectorAll<HTMLButtonElement>("[data-copy-ean]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const ean = btn.dataset.copyEan!;
+      try {
+        await navigator.clipboard.writeText(ean);
+        showToast("EAN copiado.", "success");
+      } catch {
+        showToast("Não foi possível copiar o EAN.", "error");
+      }
+    });
+  });
+  scope.querySelectorAll<HTMLButtonElement>("[data-confirm-count]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const itemId = btn.dataset.confirmCount!;
+      const input = scope.querySelector<HTMLInputElement>(`[data-qty-input="${itemId}"]`)!;
+      await confirmCount(root, itemId, Math.max(0, Number(input.value) || 0));
+    });
+  });
+  scope.querySelectorAll<HTMLInputElement>("[data-qty-input]").forEach((input) => {
+    input.addEventListener("focus", () => {
+      lastFocusedItemId = input.dataset.qtyInput!;
+      void handleItemFocusReserve(root, input.dataset.qtyInput!);
+    });
+  });
+  scope.querySelectorAll<HTMLButtonElement>("[data-undo-item]").forEach((btn) => {
+    btn.addEventListener("click", () => void handleUndoClick(root, btn.dataset.undoItem!));
   });
 }
 
@@ -697,58 +1481,171 @@ function renderCountingList(root: HTMLElement): void {
   }
 
   wrap.innerHTML = `<div class="product-card-list">${rows.map(renderCountingCard).join("")}</div>`;
+  wireCountingCards(root, wrap);
+}
 
-  wrap.querySelectorAll<HTMLButtonElement>("[data-qty-dec]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const input = wrap.querySelector<HTMLInputElement>(`[data-qty-input="${btn.dataset.qtyDec}"]`)!;
-      input.value = String(Math.max(0, Number(input.value || 0) - 1));
-    });
-  });
-  wrap.querySelectorAll<HTMLButtonElement>("[data-qty-inc]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const input = wrap.querySelector<HTMLInputElement>(`[data-qty-input="${btn.dataset.qtyInc}"]`)!;
-      input.value = String(Number(input.value || 0) + 1);
-    });
-  });
-  wrap.querySelectorAll<HTMLButtonElement>("[data-confirm-count]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const itemId = btn.dataset.confirmCount!;
-      const input = wrap.querySelector<HTMLInputElement>(`[data-qty-input="${itemId}"]`)!;
-      await confirmCount(root, itemId, Math.max(0, Number(input.value) || 0));
-    });
-  });
+/**
+ * OTIMIZAÇÃO — nunca recarrega a lista inteira quando só UM item mudou (via
+ * Realtime ou pela própria bipagem local): troca só o card daquele item no
+ * DOM. Cai pro render completo (retorna false) só quando o card não está
+ * na tela (item novo) ou quando o item deixou de bater com o filtro/busca
+ * atual (posição na lista pode mudar).
+ */
+function updateSingleCountingCard(root: HTMLElement, itemId: string): boolean {
+  const el = root.querySelector<HTMLElement>(`[data-item-row="${itemId}"]`);
+  const it = currentItems.find((i) => i.id === itemId);
+  if (!el || !it || !filteredCountingItems().some((r) => r.id === itemId)) return false;
+  el.outerHTML = renderCountingCard(it);
+  const fresh = root.querySelector<HTMLElement>(`[data-item-row="${itemId}"]`);
+  if (fresh) wireCountingCards(root, fresh);
+  return true;
 }
 
 async function confirmCount(root: HTMLElement, itemId: string, quantity: number): Promise<void> {
+  await attemptCountEvent(root, itemId, quantity, "set", { origin: "manual", deviceId: myDeviceId, volumeId: activeVolumeId });
+}
+
+/**
+ * Bipagem por EAN/scanner (+1 atômico). idempotencyKey é gerada UMA VEZ por
+ * tentativa e reenviada em cada retry — se a 1ª chamada já tiver sido
+ * processada no servidor mas a resposta se perder por falha de rede, o
+ * retry com a MESMA chave não soma de novo (ver record_invoice_count_event).
+ */
+async function confirmCountDelta(root: HTMLElement, itemId: string, delta: number, origin: NonNullable<CountEventOptions["origin"]> = "scanner"): Promise<void> {
+  await attemptCountEvent(root, itemId, delta, "increment", { origin, deviceId: myDeviceId, volumeId: activeVolumeId });
+}
+
+/**
+ * CORREÇÃO ESTRUTURAL — ponto único de entrada de qualquer contagem (manual/
+ * scanner/voz), cobrindo os 3 desfechos possíveis da RPC (ver
+ * record_invoice_count_event em 0043_collab_conference_rpcs.sql): sucesso
+ * normal, RESERVATION_CONFLICT (modo "product") e EXCESS_CONFIRMATION_REQUIRED.
+ * Reaproveita a MESMA idempotencyKey em qualquer reenvio (excesso confirmado
+ * ou reserva assumida) — a 1ª tentativa nunca grava nada nesses dois casos,
+ * então reenviar com a chave igual é sempre seguro.
+ */
+async function attemptCountEvent(root: HTMLElement, itemId: string, value: number, mode: "set" | "increment", baseOpts: CountEventOptions): Promise<void> {
+  const opts: CountEventOptions = { ...baseOpts, idempotencyKey: baseOpts.idempotencyKey ?? crypto.randomUUID() };
+  let result: CountEventResult;
   try {
-    const updated = await submitCount(itemId, quantity);
-    currentItems = currentItems.map((i) => (i.id === itemId ? { ...i, ...updated } : i));
-    renderCountingList(root);
-    showToast("Contagem salva.", "success");
+    result = mode === "increment" ? await submitCountDelta(itemId, value, opts) : await submitCount(itemId, value, opts);
   } catch (err) {
-    showToast("Erro ao salvar contagem: " + (describeError(err)), "error");
+    showToast("Erro ao registrar contagem: " + describeError(err), "error");
+    return;
+  }
+
+  if (result.success) {
+    if (result.eventId) lastEventIdByItem.set(itemId, result.eventId);
+    currentItems = currentItems.map((i) => (i.id === itemId ? { ...i, ...result.item } : i));
+    if (!updateSingleCountingCard(root, itemId)) renderCountingList(root);
+    if (result.firstCompletion) {
+      announceItemCompleted(itemId, "Você", itemLabelFor(itemId));
+    } else if (result.excess > 0) {
+      playSound("excess");
+      vibrate("excess");
+      showToast(`Registrado com excesso: total ${result.newTotal} (${result.excess} acima da NF).`, "default");
+    } else {
+      playSound(opts.origin === "scanner" || opts.origin === "camera" ? "product_correct" : "quantity_added");
+      vibrate("success");
+      showToast(`Bipado — total ${result.newTotal}.`, "success");
+    }
+    return;
+  }
+
+  if (result.code === "RESERVATION_CONFLICT") {
+    itemReservations.set(itemId, result.reservation);
+    if (!updateSingleCountingCard(root, itemId)) renderCountingList(root);
+    playSound("product_with_other_operator");
+    vibrate("error");
+    if (getConferencePreferences().notifyConflict) {
+      speak(`${result.reservation.fullName} está conferindo este produto.`, { priority: "high", dedupeKey: `conflict:${itemId}` });
+    }
+
+    const choice = await chooseAction({
+      title: "Produto em conferência",
+      message: `${result.reservation.fullName} já está contando este produto (desde ${formatDateTime(result.reservation.since)}). Para evitar dupla contagem, escolha uma opção.`,
+      options: [
+        { label: "Solicitar colaboração", value: "collab" },
+        { label: "Ir para outro produto", value: "skip" },
+        { label: "Tentar assumir (se estiver inativo)", value: "assume" },
+      ],
+      dismissLabel: "Cancelar",
+    });
+
+    if (choice === "collab") {
+      sendBroadcast("collab-request", { fromName: getAuthState().profile?.full_name || "Alguém", itemLabel: itemLabelFor(itemId) });
+      showToast("Pedido de colaboração enviado.", "success");
+      return;
+    }
+    if (choice === "assume") {
+      // Mesma idempotencyKey — se a reserva ainda não expirou, conflita de
+      // novo (nada duplicado); se expirou, assume e conta nesta mesma chamada.
+      await attemptCountEvent(root, itemId, value, mode, opts);
+    }
+    return;
+  }
+
+  // EXCESS_CONFIRMATION_REQUIRED
+  playSound("excess");
+  vibrate("excess");
+  if (getConferencePreferences().notifyExcess) {
+    speak("Quantidade excedida.", { priority: "high", dedupeKey: `excess-confirm:${itemId}` });
+  }
+
+  const completedNote = result.completedBy ? ` ${result.completedBy} finalizou o produto ${formatDateTime(result.completedAt)}.` : "";
+  const choice = await chooseAction({
+    title: "Quantidade da NF já atingida",
+    message: `Este produto já tem ${result.currentTotal} de ${result.expectedQuantity} unidades esperadas.${completedNote} Deseja confirmar esta contagem mesmo assim (${result.attemptedTotal} no total)?`,
+    options: [{ label: "Confirmar excesso", value: "confirm" }],
+    dismissLabel: "Cancelar",
+  });
+
+  if (choice === "confirm") {
+    await attemptCountEvent(root, itemId, value, mode, { ...opts, confirmExcess: true });
   }
 }
 
+/**
+ * EXPANSÃO GOSCAN — EAN clicável (copiar) no card de conferência. Prioriza
+ * o EAN que veio na própria NF (it.ean); cai pro EAN cadastrado no produto
+ * vinculado (it.catalog_ean — mesmo join de getReceipt, NUNCA uma consulta
+ * extra por card) só quando a NF não trouxe um. Sem nenhum dos dois, mostra
+ * "EAN não informado" discreto. `.product-card-meta` é um flex-wrap que já
+ * aceita mais spans — campos futuros (localização, fabricante, marca, peso,
+ * unidade, observações) entram do mesmo jeito, sem refazer o card.
+ */
+function renderEanChip(it: InvoiceReceiptItem): string {
+  const ean = it.ean || it.catalog_ean || null;
+  if (!ean) return `<span class="hint-text">EAN não informado</span>`;
+  return `<button type="button" class="ean-copy-chip" data-copy-ean="${escapeHtml(ean)}" aria-label="Copiar EAN ${escapeHtml(ean)}">EAN: ${escapeHtml(ean)}</button>`;
+}
+
 function renderCountingCard(it: InvoiceReceiptItem): string {
+  const { session } = getAuthState();
+  const myId = session?.user.id;
+  const reservation = itemReservations.get(it.id);
+  const isLockedByOther = !!reservation && reservation.userId !== myId;
+  const canUndo = lastEventIdByItem.has(it.id);
   return `
-    <div class="product-card">
+    <div class="product-card ${isLockedByOther ? "product-card-locked" : ""}" data-item-row="${it.id}">
       <div class="product-card-top">
         <p class="product-card-name">${escapeHtml(itemTitle(it))}</p>
         ${itemStamp(it.status)}
       </div>
       <div class="product-card-meta">
         <span class="sku-code">${escapeHtml(itemCodeLabel(it))}</span>
-        ${it.ean ? `<span>EAN ${escapeHtml(it.ean)}</span>` : ""}
+        ${renderEanChip(it)}
       </div>
+      ${isLockedByOther ? `<div class="warning-box reservation-banner">${Icon.lock}Em conferência por ${escapeHtml(reservation!.fullName)}</div>` : ""}
       <div class="product-card-bottom">
         <div class="qty-stepper">
-          <button type="button" data-qty-dec="${it.id}" aria-label="Diminuir quantidade">${Icon.minus}</button>
-          <input type="number" min="0" inputmode="numeric" value="${it.physical_quantity ?? 0}" data-qty-input="${it.id}" aria-label="Quantidade física" />
-          <button type="button" data-qty-inc="${it.id}" aria-label="Aumentar quantidade">${Icon.plus}</button>
+          <button type="button" data-qty-dec="${it.id}" aria-label="Diminuir quantidade" ${isLockedByOther ? "disabled" : ""}>${Icon.minus}</button>
+          <input type="number" min="0" inputmode="numeric" value="${it.physical_quantity ?? 0}" data-qty-input="${it.id}" aria-label="Quantidade física" ${isLockedByOther ? "disabled" : ""} />
+          <button type="button" data-qty-inc="${it.id}" aria-label="Aumentar quantidade" ${isLockedByOther ? "disabled" : ""}>${Icon.plus}</button>
         </div>
-        <button class="btn-primary" data-confirm-count="${it.id}">Confirmar item</button>
+        <button class="btn-primary" data-confirm-count="${it.id}" ${isLockedByOther ? "disabled" : ""}>Confirmar item</button>
       </div>
+      ${canUndo ? `<button type="button" class="btn-secondary btn-block" data-undo-item="${it.id}" style="margin-top:8px">${Icon.undo2}Desfazer minha última bipagem</button>` : ""}
     </div>`;
 }
 
@@ -969,12 +1866,22 @@ function wireRecountButtons(root: HTMLElement): void {
       const input = root.querySelector<HTMLInputElement>(`[data-recount-input="${itemId}"]`)!;
       const quantity = Math.max(0, Number(input.value) || 0);
       try {
-        await submitCount(itemId, quantity);
+        const result = await submitCount(itemId, quantity, { origin: "manual", deviceId: myDeviceId });
+        if (!result.success) {
+          // Recontagem de manager/admin também passa pela checagem de
+          // excesso — reenvia já confirmando (é uma correção deliberada, não
+          // uma bipagem espontânea que precisa de diálogo extra).
+          if (result.code !== "EXCESS_CONFIRMATION_REQUIRED") throw new Error("Não foi possível registrar a recontagem.");
+          const retry = await submitCount(itemId, quantity, { origin: "manual", deviceId: myDeviceId, confirmExcess: true });
+          if (!retry.success) throw new Error("Não foi possível registrar a recontagem.");
+        }
         // Recontagem pode mudar o resultado geral (ok/falta/sobra) — refinaliza
-        // pra recalcular status de TODOS os itens, não só o recontado.
-        const { receipt: updated, items } = await finalizeReceipt(currentReceipt!.id);
-        currentReceipt = updated;
-        currentItems = items;
+        // com recompute:true (permitido pra manager/admin numa NF já
+        // fechada) pra recalcular status de TODOS os itens, não só o recontado.
+        const outcome = await finalizeReceipt(currentReceipt!.id, { recompute: true });
+        if (!outcome.ok) throw new Error("Não foi possível recalcular o resultado da conferência.");
+        currentReceipt = outcome.receipt;
+        currentItems = outcome.items;
         recountingIds.delete(itemId);
         renderResultView(root);
         showToast("Recontagem registrada — histórico anterior preservado.", "success");
@@ -1037,11 +1944,13 @@ async function renderHistoryView(root: HTMLElement): Promise<void> {
     <ul class="recent-list">
       ${historyList
         .map((r) => {
-          // Dono só exclui enquanto a NF não foi finalizada (nenhum relatório
-          // auditável em jogo ainda) — manager/admin pode sempre (ver migration
-          // 0026). Corresponde exatamente à policy de DELETE no banco: esconder
-          // o botão quando ele com certeza falharia evita um erro confuso.
-          const canDelete = canManage || r.status === "not_started" || r.status === "in_progress";
+          // CORREÇÃO ESTRUTURAL — excluir NF passou a ser exclusivo de
+          // manager/admin, mesmo para quem importou (pedido explícito: "o
+          // operador não pode excluir uma NF"). Corresponde exatamente à
+          // policy de DELETE no banco (ver 0038_company_scoped_rls.sql) —
+          // esconder o botão quando ele com certeza falharia evita um erro
+          // confuso pro operador.
+          const canDelete = canManage;
           return `
         <li data-open-receipt="${r.id}" style="cursor:pointer">
           <div>

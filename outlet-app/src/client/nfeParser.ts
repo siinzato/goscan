@@ -4,6 +4,7 @@
 // fala direto com o Supabase. Função pura, sem I/O, por isso testável direto
 // com `node --test` (fast-xml-parser funciona igual em Node e no bundle Vite).
 import { XMLParser } from "fast-xml-parser";
+import { normalizeEan, isValidEanFormat } from "./utils.ts";
 
 export interface NfeParsedItem {
   invoice_product_code: string;
@@ -65,14 +66,19 @@ function toNumber(value: unknown): number | null {
 }
 
 /**
- * Regra de EAN (seção 13 do pedido de consulta por chave): "SEM GTIN" nunca
- * é um código de barras, só um marcador de "não informado" — vazio conta
- * igual. Nunca converte pra número (perderia zero à esquerda), sempre string.
+ * Regra de EAN (seção 13 do pedido de consulta por chave, endurecida na
+ * correção de reconhecimento automático): valores como "SEM GTIN", "SEMGTIN",
+ * "N/A" ou "0" nunca são um código de barras — só marcadores de "não
+ * informado". Em vez de checar caso a caso, valida o FORMATO real (8/12/13/14
+ * dígitos após normalizar) — qualquer lixo sem esse formato é tratado como
+ * ausente, nunca como um EAN válido por acidente. Retorna o texto ORIGINAL
+ * (trimado, nunca convertido pra número — perderia zero à esquerda), só a
+ * checagem de validade usa a forma normalizada.
  */
 function validEanCandidate(raw: string | null): string | null {
   if (!raw) return null;
   const trimmed = raw.trim();
-  if (!trimmed || trimmed.toUpperCase() === "SEM GTIN") return null;
+  if (!trimmed || !isValidEanFormat(normalizeEan(trimmed))) return null;
   return trimmed;
 }
 

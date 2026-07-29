@@ -4,6 +4,7 @@
 import * as api from "./conferencesApi.ts";
 import * as offline from "./offline.ts";
 import { localId } from "./utils.ts";
+import { joinCollabSession } from "./realtimeCollab.ts";
 import type { ItemMatchStatus, ItemSource } from "./conferencesApi.ts";
 
 export type SyncState = "saving" | "saved" | "error" | "pending_offline";
@@ -108,7 +109,72 @@ export async function startOrResumeConference(): Promise<Session> {
   session = { conference, items: applyPendingQueueOnTop(conference.id, baseItems) };
   emit();
   void flushPendingQueue();
+  enterCollab(conference.id);
   return session;
+}
+
+/**
+ * CORREÇÃO ESTRUTURAL — Conferência colaborativa em tempo real (mesmo
+ * mecanismo do fluxo NF-e, ver realtimeCollab.ts). Mudanças feitas por OUTRO
+ * usuário da mesma empresa na mesma conferência (bipagem, ajuste de
+ * quantidade, finalização) chegam aqui e atualizam o estado local — quem
+ * está com a tela aberta vê sem precisar de F5.
+ */
+function enterCollab(conferenceId: string): void {
+  joinCollabSession(`conference:${conferenceId}`, [
+    {
+      table: "conference_items",
+      filter: `conference_id=eq.${conferenceId}`,
+      onChange: (row: { id: string; quantity: number; product_variant_id: string | null; match_status: ItemMatchStatus }) => {
+        if (!session || session.conference.id !== conferenceId) return;
+        const idx = session.items.findIndex((it) => it.serverId === row.id);
+        if (idx === -1) {
+          // Item novo adicionado por outro usuário — entra na lista; sku_code/
+          // produto (só existem via join) chegam no próximo carregamento
+          // completo da tela, não pelo payload do Realtime.
+          session = {
+            ...session,
+            items: [
+              ...session.items,
+              {
+                uiId: row.id,
+                serverId: row.id,
+                product_variant_id: row.product_variant_id,
+                sku_code: null,
+                produto: null,
+                raw_model: "",
+                raw_color: "",
+                quantity: row.quantity,
+                match_status: row.match_status,
+                match_confidence: null,
+                source: "manual",
+                recognition_id: null,
+                syncState: "saved",
+                errorMessage: null,
+              },
+            ],
+          };
+        } else {
+          session = {
+            ...session,
+            items: session.items.map((it) =>
+              it.serverId === row.id ? { ...it, quantity: row.quantity, product_variant_id: row.product_variant_id, match_status: row.match_status } : it
+            ),
+          };
+        }
+        emit();
+      },
+    },
+    {
+      table: "conferences",
+      filter: `id=eq.${conferenceId}`,
+      onChange: (row: { status: api.ConferenceStatus; finished_at: string | null; total_units: number; total_skus: number }) => {
+        if (!session || session.conference.id !== conferenceId) return;
+        session = { ...session, conference: { ...session.conference, ...row } };
+        emit();
+      },
+    },
+  ]);
 }
 
 export async function addItem(input: {
@@ -207,16 +273,28 @@ async function trySaveOp(conferenceId: string, tempId: string): Promise<void> {
   }
 }
 
-/** Ajusta a quantidade de um item já na conferência (stepper +/- no card mobile). */
-export async function updateItemQuantity(uiId: string, quantity: number): Promise<void> {
-  if (!session || quantity < 1) return;
+/**
+ * Ajusta a quantidade de um item já na conferência (stepper +/- no card
+ * mobile). CORREÇÃO ESTRUTURAL — quando o item já está salvo no servidor, o
+ * ajuste é aplicado de forma ATÔMICA (record_conference_item_delta, ver
+ * migration 0039_atomic_scan_events.sql) em vez de calcular a quantidade
+ * final localmente e sobrescrever: dois usuários da mesma empresa mexendo no
+ * MESMO item ao mesmo tempo não perdem mais o incremento um do outro.
+ *
+ * Item ainda não confirmado salvo (serverId nulo, só existe na fila offline
+ * local): não há concorrência possível — ninguém mais enxerga esse item
+ * ainda — então o ajuste local+fila continua sendo por valor absoluto.
+ */
+export async function updateItemQuantity(uiId: string, delta: number): Promise<void> {
+  if (!session) return;
   const item = session.items.find((it) => it.uiId === uiId);
   if (!item) return;
   const conferenceId = session.conference.id;
+  const optimisticQuantity = Math.max(1, item.quantity + delta);
 
   session = {
     ...session,
-    items: session.items.map((it) => (it.uiId === uiId ? { ...it, quantity, syncState: "saving" } : it)),
+    items: session.items.map((it) => (it.uiId === uiId ? { ...it, quantity: optimisticQuantity, syncState: "saving" } : it)),
   };
   emit();
 
@@ -226,7 +304,7 @@ export async function updateItemQuantity(uiId: string, quantity: number): Promis
     const op = queue.find((o) => o.tempId === uiId);
     if (op && op.payload) {
       offline.removeFromQueue(conferenceId, uiId);
-      offline.enqueue(conferenceId, { ...op, payload: { ...op.payload, quantity } });
+      offline.enqueue(conferenceId, { ...op, payload: { ...op.payload, quantity: optimisticQuantity } });
     }
     if (session) {
       session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "pending_offline" } : it)) };
@@ -236,9 +314,12 @@ export async function updateItemQuantity(uiId: string, quantity: number): Promis
   }
 
   try {
-    await api.updateItem(item.serverId, { quantity });
+    const updated = await api.updateItemQuantityDelta(item.serverId, delta);
     if (session) {
-      session = { ...session, items: session.items.map((it) => (it.uiId === uiId ? { ...it, syncState: "saved", errorMessage: null } : it)) };
+      session = {
+        ...session,
+        items: session.items.map((it) => (it.uiId === uiId ? { ...it, quantity: updated.quantity, syncState: "saved", errorMessage: null } : it)),
+      };
       emit();
     }
   } catch (err) {

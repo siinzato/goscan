@@ -21,6 +21,8 @@ export interface Profile {
   theme: "light" | "dark";
   must_change_password: boolean;
   last_login_at: string | null;
+  /** CORREÇÃO ESTRUTURAL — empresa à qual este usuário pertence (ver 0037_companies.sql); fonte real de compartilhamento de NFs/conferências. */
+  company_id: string;
 }
 
 // "initializing": validando sessão/perfil no boot — nunca dura mais que
@@ -74,8 +76,33 @@ function logAuthEvent(event: string, meta?: Record<string, unknown>): void {
  * falha de refresh do token (que dispara o mesmo evento no supabase-js). */
 let manualSignOutInFlight = false;
 
+// CORREÇÃO ESTRUTURAL — condição de corrida real no fluxo de troca de senha
+// obrigatória (Parte 14 do pedido). CAUSA RAIZ: supabase.auth.updateUser()
+// dispara internamente um evento onAuthStateChange("USER_UPDATED") ANTES da
+// própria chamada retornar — o listener registrado em initAuth() reage a
+// TODO evento chamando applySession(), que busca o perfil (ainda com
+// must_change_password=true, porque a RPC de limpeza só roda DEPOIS, dentro
+// de updatePassword()). Como applySession() e o refreshProfile() explícito
+// de updatePassword() disparam buscas de perfil CONCORRENTES e sem
+// coordenação, o setState() que resolve por último "vencia" — se a busca
+// disparada pelo evento USER_UPDATED (que pegou o perfil ainda com a flag
+// antiga) resolvesse DEPOIS do refreshProfile() (que já pegava a flag
+// correta), o estado global regredia pra must_change_password=true de novo,
+// prendendo o usuário na tela de troca de senha até um F5 (que refaz tudo
+// numa única carga, sem concorrência).
+//
+// Fix: cada busca de perfil captura um número de sequência ao COMEÇAR: só
+// aplica seu resultado via setState() se nenhuma busca mais nova tiver
+// começado nesse meio-tempo. Como updatePassword() sempre chama
+// refreshProfile() DEPOIS de qualquer evento que updateUser() possa ter
+// disparado (JS é single-thread — o listener síncrono já rodou e já
+// incrementou o contador antes da nossa próxima linha executar), a busca do
+// refreshProfile() é sempre a mais recente e sempre vence, não importa a
+// ordem em que as respostas de rede realmente cheguem.
+let profileLoadSeq = 0;
+
 const PROFILE_COLUMNS =
-  "id, full_name, role, active, job_title, work_group, phone, recovery_email, recovery_email_verified, theme, must_change_password, last_login_at";
+  "id, full_name, role, active, job_title, work_group, phone, recovery_email, recovery_email_verified, theme, must_change_password, last_login_at, company_id";
 
 async function loadProfile(userId: string): Promise<Profile | null> {
   const supabase = getSupabase();
@@ -88,6 +115,7 @@ async function loadProfile(userId: string): Promise<Profile | null> {
 }
 
 async function applySession(session: Session | null, opts: { expired?: boolean; recordLastLogin?: boolean } = {}): Promise<void> {
+  const mySeq = ++profileLoadSeq;
   if (!session) {
     const expired = !!opts.expired && !manualSignOutInFlight;
     if (expired) logAuthEvent("session_expired");
@@ -103,6 +131,11 @@ async function applySession(session: Session | null, opts: { expired?: boolean; 
   }
   setState({ bootStep: "Carregando perfil…" });
   const profile = await loadProfile(session.user.id);
+  // Uma busca MAIS NOVA já começou enquanto esta estava em andamento (ver
+  // comentário de profileLoadSeq acima) — descarta este resultado por
+  // inteiro, mesmo que a rede tenha respondido "certinho": aplicá-lo agora
+  // regrediria o estado global pra um instantâneo mais antigo do perfil.
+  if (mySeq !== profileLoadSeq) return;
   if (!profile) {
     setState({ status: "signed_out", session, profile: null, error: "Perfil não encontrado para este usuário.", sessionExpired: false });
     return;
@@ -136,7 +169,12 @@ async function applySession(session: Session | null, opts: { expired?: boolean; 
  */
 export async function refreshProfile(): Promise<void> {
   if (!state.session) return;
+  const mySeq = ++profileLoadSeq;
   const profile = await loadProfile(state.session.user.id);
+  // Mesma trava de sequência de applySession() — nunca deixa uma busca mais
+  // antiga (ex.: disparada por um onAuthStateChange concorrente) sobrescrever
+  // o resultado desta, que é sempre a mais recente no fluxo de troca de senha.
+  if (mySeq !== profileLoadSeq) return;
   if (profile) setState({ profile });
 }
 
@@ -259,20 +297,40 @@ export async function sendPasswordReset(email: string): Promise<string | null> {
 
 /**
  * Toda troca de senha bem-sucedida (tanto pelo link de recuperação em
- * login.ts quanto pelo formulário "Segurança" em Configurações) também
- * limpa must_change_password automaticamente — é o ÚNICO caminho real pra
- * esse flag sair de true (ver clear_own_must_change_password() na migration
- * 0028: só mexe na própria linha do chamador, nunca na de outro usuário).
- * Best-effort: uma falha aqui não desfaz a troca de senha, que já aconteceu.
+ * login.ts quanto pelo formulário "Segurança" em Configurações, quanto pela
+ * troca obrigatória de primeiro acesso) também limpa must_change_password
+ * automaticamente — é o ÚNICO caminho real pra esse flag sair de true (ver
+ * clear_own_must_change_password() na migration 0028: só mexe na própria
+ * linha do chamador, nunca na de outro usuário).
+ *
+ * refreshProfile() ao final é o que faz main.ts sair do gate de troca
+ * obrigatória e montar o app normal SEM F5 — a senha em si já mudou de
+ * verdade no Supabase Auth acima; o que falta é só a UI perceber que
+ * must_change_password virou false (ver profileLoadSeq: refreshProfile()
+ * aqui é sempre a busca de perfil mais recente, então sempre vence mesmo
+ * que updateUser() tenha disparado um onAuthStateChange concorrente com o
+ * perfil ainda desatualizado).
+ *
+ * Nunca finge sucesso total se a flag não foi limpa: tenta 1 retry
+ * automático (falha transitória de rede) antes de reportar um erro
+ * específico — a senha JÁ mudou nesse ponto, então nunca é "erro
+ * desconhecido" nem um loading infinito, é uma mensagem acionável.
  */
 export async function updatePassword(newPassword: string): Promise<string | null> {
   const supabase = getSupabase();
   const { error } = await supabase.auth.updateUser({ password: newPassword });
   if (error) return translateAuthError(error.message);
 
-  const { error: clearError } = await supabase.rpc("clear_own_must_change_password");
-  if (clearError) console.error("Falha ao limpar must_change_password:", clearError.message);
+  let clearError = (await supabase.rpc("clear_own_must_change_password")).error;
+  if (clearError) {
+    clearError = (await supabase.rpc("clear_own_must_change_password")).error;
+  }
   await refreshProfile();
+
+  if (clearError) {
+    console.error("Falha ao limpar must_change_password após 2 tentativas:", clearError.message);
+    return "Sua senha foi alterada, mas houve um problema ao liberar seu acesso. Tente novamente ou saia e entre de novo.";
+  }
 
   return null;
 }

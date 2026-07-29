@@ -129,6 +129,26 @@ export async function listRecentConferences(limit = 10): Promise<ConferenceWithO
   );
 }
 
+/**
+ * CORREÇÃO ESTRUTURAL — soma `delta` à quantidade ATUAL de forma atômica no
+ * banco (record_conference_item_delta, ver migration
+ * 0039_atomic_scan_events.sql), em vez de calcular "quantidade atual + delta"
+ * no frontend e sobrescrever — dois usuários ajustando o mesmo item ao mesmo
+ * tempo (stepper +/-) podiam perder um incremento um do outro.
+ * idempotencyKey evita reaplicar o mesmo ajuste em caso de retry de rede.
+ */
+export async function updateItemQuantityDelta(itemId: string, delta: number, idempotencyKey?: string): Promise<ConferenceItem> {
+  const supabase = getSupabase();
+  const key = idempotencyKey ?? crypto.randomUUID();
+  const { data, error } = await supabase.rpc("record_conference_item_delta", {
+    p_item_id: itemId,
+    p_delta: delta,
+    p_idempotency_key: key,
+  });
+  if (error) throw error;
+  return data as ConferenceItem;
+}
+
 export async function markInProgress(conferenceId: string): Promise<void> {
   const supabase = getSupabase();
   const { error } = await supabase
