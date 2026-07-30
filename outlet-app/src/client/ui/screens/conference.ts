@@ -84,6 +84,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   // anterior (ex.: #nfeConferenceRoot) deixou de existir, então o guard de
   // "já montado" tem que valer só pra ESTA instância do DOM.
   nfeConferenceMounted = false;
+  devolucaoMounted = false;
   root.innerHTML = `<div class="screen-loading">Carregando conferência…</div>`;
 
   let session: Session;
@@ -102,6 +103,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
           <button class="mode-btn active" data-mode="imagens">${Icon.camera}Prints (imagens)</button>
           <button class="mode-btn" data-mode="texto">${Icon.type}Colar texto</button>
           <button class="mode-btn" data-mode="nfe">${Icon.receipt}Nota Fiscal</button>
+          <button class="mode-btn" data-mode="devolucao">${Icon.undo2}Devolução</button>
         </div>
 
         <div class="mode-panel active" id="mode-imagens">
@@ -125,6 +127,10 @@ export async function renderConference(root: HTMLElement): Promise<void> {
 
         <div class="mode-panel" id="mode-nfe">
           <div id="nfeConferenceRoot"></div>
+        </div>
+
+        <div class="mode-panel" id="mode-devolucao">
+          <div id="devolucaoRoot"></div>
         </div>
       </div>
 
@@ -248,6 +254,12 @@ export async function renderConference(root: HTMLElement): Promise<void> {
 let nfeConferenceModule: typeof import("./nfeConference.ts") | null = null;
 let nfeConferenceMounted = false;
 
+// EXPANSÃO GOSCAN — módulo de Devolução, mesmo padrão de singleton lazy-mount
+// do bloco acima (nunca recarrega o módulo nem perde o estado em memória ao
+// trocar de sub-modo dentro da mesma visita à tela "Conferir").
+let devolucaoModule: typeof import("./devolucao/index.ts") | null = null;
+let devolucaoMounted = false;
+
 /**
  * Chamado por shell.ts ao sair da rota "conferir" — encerra a sessão de
  * colaboração em tempo real ativa (ver realtimeCollab.ts), seja ela do modo
@@ -265,6 +277,7 @@ let nfeConferenceMounted = false;
 export function teardownConference(): void {
   stopCollabSession();
   nfeConferenceModule?.teardownNfeConference();
+  devolucaoModule?.teardownDevolucao();
 }
 
 function wireInputModeSwitch(root: HTMLElement): void {
@@ -277,11 +290,12 @@ function wireInputModeSwitch(root: HTMLElement): void {
       root.querySelector(`#mode-${btn.dataset.mode}`)?.classList.add("active");
 
       const isNfe = btn.dataset.mode === "nfe";
+      const isDevolucao = btn.dataset.mode === "devolucao";
       // Cards "2. Revise antes de adicionar" e "3. Itens da conferência" são
       // específicos do fluxo de correspondência por texto/print (Outlet) —
-      // não fazem sentido na Conferência por Nota Fiscal, que tem seu
-      // próprio fluxo de preparação/contagem/resultado dentro do módulo nfe.
-      extraCards.hidden = isNfe;
+      // não fazem sentido na Conferência por Nota Fiscal nem na Devolução,
+      // que têm seu próprio fluxo dentro do respectivo módulo.
+      extraCards.hidden = isNfe || isDevolucao;
 
       if (isNfe) {
         const container = root.querySelector<HTMLElement>("#nfeConferenceRoot")!;
@@ -290,6 +304,17 @@ function wireInputModeSwitch(root: HTMLElement): void {
           void (nfeConferenceModule ? Promise.resolve(nfeConferenceModule) : import("./nfeConference.ts")).then((m) => {
             nfeConferenceModule = m;
             void m.renderNfeConference(container);
+          });
+        }
+      }
+
+      if (isDevolucao) {
+        const container = root.querySelector<HTMLElement>("#devolucaoRoot")!;
+        if (!devolucaoMounted) {
+          devolucaoMounted = true;
+          void (devolucaoModule ? Promise.resolve(devolucaoModule) : import("./devolucao/index.ts")).then((m) => {
+            devolucaoModule = m;
+            void m.renderDevolucao(container);
           });
         }
       }

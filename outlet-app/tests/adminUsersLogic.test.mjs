@@ -12,6 +12,10 @@ import {
   sanitizeGroupName,
   sanitizeSearchTerm,
   wouldLeaveZeroSuperAdmins,
+  isValidIntegrationProvider,
+  sanitizeCredentialFields,
+  hasAnyCredentialField,
+  maskSecret,
 } from "../supabase/functions/admin-users/logic.ts";
 
 test("isValidRole aceita só os 4 papéis reais", () => {
@@ -152,4 +156,66 @@ test("wouldLeaveZeroSuperAdmins BLOQUEIA rebaixar/desativar o super_admin quando
 test("wouldLeaveZeroSuperAdmins LIBERA rebaixar/desativar quando existe pelo menos outro super_admin ativo", () => {
   assert.equal(wouldLeaveZeroSuperAdmins({ role: "super_admin", active: true }, { active: false }, 1), false);
   assert.equal(wouldLeaveZeroSuperAdmins({ role: "super_admin", active: true }, { role: "admin" }, 5), false);
+});
+
+// ---------------------------------------------------------------------------
+// Integrações — validação/sanitização/mascaramento de credenciais reais de
+// API (nunca deixam o segredo voltar ao navegador).
+// ---------------------------------------------------------------------------
+test("isValidIntegrationProvider aceita só os 6 provedores reais da migration 0049", () => {
+  for (const p of ["tiny", "marketplace_mercado_livre", "marketplace_shopee", "marketplace_shein", "marketplace_amazon", "marketplace_tiktok"]) {
+    assert.equal(isValidIntegrationProvider(p), true, `deveria aceitar ${p}`);
+  }
+  assert.equal(isValidIntegrationProvider("mercado_livre"), false); // nome de marketplace puro (usado em returns), não de provedor de integração
+  assert.equal(isValidIntegrationProvider("tiny_erp"), false);
+  assert.equal(isValidIntegrationProvider(""), false);
+  assert.equal(isValidIntegrationProvider(undefined), false);
+});
+
+test("sanitizeCredentialFields aceita só os 6 campos reconhecidos, aparados, ignorando vazios e campos desconhecidos", () => {
+  const out = sanitizeCredentialFields({
+    client_id: "  abc123  ",
+    client_secret: "s3gr3d0",
+    access_token: "",
+    refresh_token: "   ",
+    external_account_id: "loja-1",
+    scopes: "read write",
+    role: "super_admin", // campo não reconhecido — nunca deve vazar pro insert
+    company_id: "outra-empresa",
+  });
+  assert.deepEqual(out, {
+    client_id: "abc123",
+    client_secret: "s3gr3d0",
+    external_account_id: "loja-1",
+    scopes: "read write",
+  });
+  assert.equal("access_token" in out, false);
+  assert.equal("refresh_token" in out, false);
+  assert.equal("role" in out, false);
+  assert.equal("company_id" in out, false);
+});
+
+test("sanitizeCredentialFields devolve objeto vazio quando não há nenhum campo válido", () => {
+  assert.deepEqual(sanitizeCredentialFields({}), {});
+  assert.deepEqual(sanitizeCredentialFields({ client_id: 123, foo: "bar" }), {});
+});
+
+test("hasAnyCredentialField distingue 'nada preenchido' de 'pelo menos um campo'", () => {
+  assert.equal(hasAnyCredentialField({}), false);
+  assert.equal(hasAnyCredentialField({ client_id: "x" }), true);
+  assert.equal(hasAnyCredentialField({ scopes: "read" }), true);
+});
+
+test("maskSecret nunca reconstitui o segredo — só confirma os últimos 4 caracteres", () => {
+  assert.equal(maskSecret("abcdefgh12345678"), "••••5678");
+  assert.equal(maskSecret("ab"), "••••"); // curto demais pra revelar qualquer parte com segurança
+  assert.equal(maskSecret(""), null);
+  assert.equal(maskSecret(null), null);
+  assert.equal(maskSecret(undefined), null);
+});
+
+test("maskSecret nunca inclui o valor original na saída (nem parcialmente além dos últimos 4)", () => {
+  const secret = "sk_live_TOPSECRETVALUE9999";
+  const masked = maskSecret(secret);
+  assert.equal(masked.includes(secret.slice(0, -4)), false);
 });

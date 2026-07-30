@@ -10,6 +10,7 @@ import { APP_NAME, APP_COMPANY } from "../../brand.ts";
 import { renderProfileSettings } from "./profileSettings.ts";
 import { renderProfileHelp } from "./profileHelp.ts";
 import { renderProfileAbout } from "./profileAbout.ts";
+import { renderProfileIntegrations } from "./profileIntegrations.ts";
 
 const ROLE_LABELS: Record<string, string> = {
   super_admin: "Super Administrador",
@@ -39,6 +40,10 @@ export function renderProfile(root: HTMLElement): void {
   }
   if (sub[0] === "sobre") {
     renderProfileAbout(root);
+    return;
+  }
+  if (sub[0] === "integracoes") {
+    void renderProfileIntegrations(root);
     return;
   }
   renderProfileHub(root);
@@ -85,6 +90,14 @@ function renderProfileHub(root: HTMLElement): void {
           <span class="profile-menu-text">
             <strong>Sobre o GoScan</strong>
             <span>Conheça a história, a missão e a evolução do GoScan.</span>
+          </span>
+          <span class="profile-menu-chevron">${Icon.chevronRight}</span>
+        </button>
+        <button type="button" class="profile-menu-item" data-goto="integracoes">
+          <span class="profile-menu-icon">${Icon.link}</span>
+          <span class="profile-menu-text">
+            <strong>Integrações</strong>
+            <span>Estrutura preparada para futuras integrações com ERP e marketplaces.</span>
           </span>
           <span class="profile-menu-chevron">${Icon.chevronRight}</span>
         </button>

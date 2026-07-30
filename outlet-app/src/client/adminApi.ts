@@ -221,3 +221,58 @@ export interface ListAuditResult {
 export async function listAuditLogs(params: ListAuditParams): Promise<ListAuditResult> {
   return invokeAdmin<ListAuditResult>("list_audit_logs", params);
 }
+
+// ---------------------------------------------------------------------------
+// Integrações (ERP/marketplace) — credenciais reais de API. Todo o CRUD passa
+// pela Edge Function (service_role) — integration_credentials tem RLS
+// habilitado e ZERO policies, então o Supabase client nunca consegue
+// ler/escrever essa tabela direto, com ou sem esta camada. O que volta aqui
+// nunca inclui o segredo em texto puro, só um resumo mascarado (ver
+// maskSecret em supabase/functions/admin-users/logic.ts).
+// ---------------------------------------------------------------------------
+export type IntegrationProvider = "tiny" | "marketplace_mercado_livre" | "marketplace_shopee" | "marketplace_shein" | "marketplace_amazon" | "marketplace_tiktok";
+export type IntegrationStatus = "not_configured" | "configuration_incomplete" | "connected" | "auth_error" | "sync_paused";
+
+export interface IntegrationCredentialSummary {
+  client_id: string | null;
+  external_account_id: string | null;
+  scopes: string | null;
+  expires_at: string | null;
+  client_secret_masked: string | null;
+  access_token_masked: string | null;
+  refresh_token_masked: string | null;
+  updated_at: string;
+}
+
+export interface IntegrationRow {
+  provider: IntegrationProvider;
+  status: IntegrationStatus;
+  last_sync_at: string | null;
+  next_retry_at: string | null;
+  last_error: string | null;
+  updated_at: string | null;
+  credential: IntegrationCredentialSummary | null;
+}
+
+export interface SaveIntegrationCredentialsParams {
+  provider: IntegrationProvider;
+  client_id?: string;
+  client_secret?: string;
+  access_token?: string;
+  refresh_token?: string;
+  external_account_id?: string;
+  scopes?: string;
+}
+
+export async function listIntegrations(): Promise<IntegrationRow[]> {
+  const data = await invokeAdmin<{ integrations: IntegrationRow[] }>("list_integrations");
+  return data.integrations;
+}
+
+export async function saveIntegrationCredentials(params: SaveIntegrationCredentialsParams): Promise<void> {
+  await invokeAdmin("save_integration_credentials", params);
+}
+
+export async function clearIntegrationCredentials(provider: IntegrationProvider): Promise<void> {
+  await invokeAdmin("clear_integration_credentials", { provider });
+}

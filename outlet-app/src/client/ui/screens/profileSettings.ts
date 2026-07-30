@@ -22,7 +22,7 @@ import { isVoiceCommandSupported } from "../../voiceCommands.ts";
 
 export async function renderProfileSettings(root: HTMLElement, sub: string[]): Promise<void> {
   if (sub[0] === "administracao") {
-    renderAdministracaoGate(root);
+    renderAdministracaoGate(root, sub[1]);
     return;
   }
   renderSettingsHub(root);
@@ -414,7 +414,7 @@ async function renderConferenciaAlertas(root: HTMLElement): Promise<void> {
 // dentro do painel passa pela Edge Function admin-users, que valida
 // hierarquia/permissão de novo no servidor a cada chamada — acessar a URL
 // direto nunca contorna isso, só mostraria um painel cujas ações falhariam.
-function renderAdministracaoGate(root: HTMLElement): void {
+function renderAdministracaoGate(root: HTMLElement, subTab?: string): void {
   const { profile } = getAuthState();
   if (!isAllowedIntoAdminPanel(profile?.role)) {
     root.innerHTML = `
@@ -431,5 +431,8 @@ function renderAdministracaoGate(root: HTMLElement): void {
     return;
   }
 
-  void renderAdminPanel(root);
+  // "/administracao/integracoes" (link vindo de Perfil > Integrações) abre o
+  // painel já na aba certa — deep-link só aplicado nesta entrada, nunca
+  // sobrescreve a aba durante navegação normal entre abas dentro do painel.
+  void renderAdminPanel(root, subTab === "integracoes" ? "integrations" : undefined);
 }

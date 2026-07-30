@@ -120,6 +120,9 @@ export const ADMIN_ACTIONS = [
   "get_user_permissions",
   "set_user_permissions",
   "list_audit_logs",
+  "list_integrations",
+  "save_integration_credentials",
+  "clear_integration_credentials",
 ] as const;
 export type AdminAction = (typeof ADMIN_ACTIONS)[number];
 
@@ -144,4 +147,55 @@ export function sanitizeGroupName(raw: unknown): string | null {
  */
 export function sanitizeSearchTerm(raw: string): string {
   return raw.replace(/[,()]/g, " ").trim();
+}
+
+// ---------------------------------------------------------------------------
+// Integrações (ERP/marketplace) — credenciais reais, nunca expostas de volta
+// ao navegador. Mesmos 6 provedores da migration 0049
+// (returns_integration_scaffolding) — nunca duas listas divergentes.
+// ---------------------------------------------------------------------------
+export const INTEGRATION_PROVIDERS = [
+  "tiny",
+  "marketplace_mercado_livre",
+  "marketplace_shopee",
+  "marketplace_shein",
+  "marketplace_amazon",
+  "marketplace_tiktok",
+] as const;
+export type IntegrationProvider = (typeof INTEGRATION_PROVIDERS)[number];
+
+export function isValidIntegrationProvider(value: unknown): value is IntegrationProvider {
+  return typeof value === "string" && (INTEGRATION_PROVIDERS as readonly string[]).includes(value);
+}
+
+export interface IntegrationCredentialInput {
+  client_id?: string;
+  client_secret?: string;
+  access_token?: string;
+  refresh_token?: string;
+  external_account_id?: string;
+  scopes?: string;
+}
+
+const CREDENTIAL_FIELDS = ["client_id", "client_secret", "access_token", "refresh_token", "external_account_id", "scopes"] as const;
+
+/** Só os campos de credencial reconhecidos, aparados e não-vazios — nunca deixa um campo arbitrário do corpo da requisição chegar no insert/update. */
+export function sanitizeCredentialFields(body: Record<string, unknown>): IntegrationCredentialInput {
+  const out: IntegrationCredentialInput = {};
+  for (const field of CREDENTIAL_FIELDS) {
+    const value = body[field];
+    if (typeof value === "string" && value.trim()) out[field] = value.trim();
+  }
+  return out;
+}
+
+export function hasAnyCredentialField(input: IntegrationCredentialInput): boolean {
+  return Object.values(input).some((v) => !!v);
+}
+
+/** Nunca deixa o segredo real voltar ao navegador — só um resumo (últimos 4 caracteres) pra confirmar visualmente qual valor está salvo, sem reconstituir a chave inteira. */
+export function maskSecret(value: string | null | undefined): string | null {
+  if (!value) return null;
+  if (value.length <= 4) return "••••";
+  return `••••${value.slice(-4)}`;
 }

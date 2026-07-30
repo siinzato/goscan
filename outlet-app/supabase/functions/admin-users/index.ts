@@ -24,6 +24,11 @@ import {
   sanitizeGroupName,
   sanitizeSearchTerm,
   wouldLeaveZeroSuperAdmins,
+  isValidIntegrationProvider,
+  sanitizeCredentialFields,
+  hasAnyCredentialField,
+  maskSecret,
+  INTEGRATION_PROVIDERS,
   type Role,
 } from "./logic.ts";
 
@@ -150,12 +155,12 @@ Deno.serve(async (req) => {
     return data === true;
   }
 
-  async function writeAudit(auditAction: string, targetUserId: string | null, metadata: Record<string, unknown>): Promise<void> {
+  async function writeAudit(auditAction: string, targetId: string | null, metadata: Record<string, unknown>, entityType = "profile"): Promise<void> {
     const { error } = await admin.from("audit_logs").insert({
       user_id: caller.id,
       action: auditAction,
-      entity_type: "profile",
-      entity_id: targetUserId,
+      entity_type: entityType,
+      entity_id: targetId,
       metadata,
     });
     if (error) console.error("[admin-users] falha ao gravar audit_logs:", error.message);
@@ -680,6 +685,123 @@ Deno.serve(async (req) => {
         }));
 
         return jsonResponse({ success: true, logs, total: count ?? 0, page, pageSize });
+      }
+
+      // -----------------------------------------------------------------
+      // Integrações (ERP/marketplace) — credenciais reais de API. Nunca
+      // devolve segredo em texto puro depois de salvo (só um resumo
+      // mascarado, ver maskSecret em logic.ts) — e nunca chama nenhuma API
+      // externa de verdade (isso continua fora de escopo até existir
+      // documentação/credenciais reais por provedor, ver migration 0049).
+      case "list_integrations": {
+        if (!(await hasPermission("integrations.manage")))
+          return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
+
+        const { data: providerRows, error: providersError } = await admin
+          .from("integration_providers")
+          .select("id, provider, status, last_sync_at, next_retry_at, last_error, updated_at")
+          .eq("company_id", caller.company_id);
+        if (providersError) throw providersError;
+
+        const providerIds = (providerRows ?? []).map((p) => p.id);
+        const { data: credentialRows, error: credentialsError } =
+          providerIds.length > 0
+            ? await admin
+                .from("integration_credentials")
+                .select("provider_id, client_id, client_secret, access_token, refresh_token, external_account_id, scopes, expires_at, updated_at")
+                .in("provider_id", providerIds)
+            : { data: [] as Record<string, unknown>[], error: null };
+        if (credentialsError) throw credentialsError;
+
+        const credentialByProviderId = new Map((credentialRows ?? []).map((c) => [c.provider_id as string, c]));
+        const rowByProvider = new Map((providerRows ?? []).map((p) => [p.provider as string, p]));
+
+        const integrations = INTEGRATION_PROVIDERS.map((provider) => {
+          const providerRow = rowByProvider.get(provider);
+          const cred = providerRow ? credentialByProviderId.get(providerRow.id) : undefined;
+          return {
+            provider,
+            status: providerRow?.status ?? "not_configured",
+            last_sync_at: providerRow?.last_sync_at ?? null,
+            next_retry_at: providerRow?.next_retry_at ?? null,
+            last_error: providerRow?.last_error ?? null,
+            updated_at: providerRow?.updated_at ?? null,
+            credential: cred
+              ? {
+                  client_id: (cred.client_id as string | null) ?? null,
+                  external_account_id: (cred.external_account_id as string | null) ?? null,
+                  scopes: (cred.scopes as string | null) ?? null,
+                  expires_at: (cred.expires_at as string | null) ?? null,
+                  client_secret_masked: maskSecret(cred.client_secret as string | null),
+                  access_token_masked: maskSecret(cred.access_token as string | null),
+                  refresh_token_masked: maskSecret(cred.refresh_token as string | null),
+                  updated_at: cred.updated_at,
+                }
+              : null,
+          };
+        });
+
+        return jsonResponse({ success: true, integrations });
+      }
+
+      // -----------------------------------------------------------------
+      case "save_integration_credentials": {
+        if (!(await hasPermission("integrations.manage")))
+          return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
+
+        const provider = body.provider;
+        if (!isValidIntegrationProvider(provider)) return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Provedor inválido." }, 400);
+
+        const fields = sanitizeCredentialFields(body);
+        if (!hasAnyCredentialField(fields)) {
+          return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Informe pelo menos um campo de credencial." }, 400);
+        }
+
+        const { data: providerRow, error: providerError } = await admin
+          .from("integration_providers")
+          .upsert({ company_id: caller.company_id, provider, status: "configuration_incomplete" }, { onConflict: "company_id,provider" })
+          .select("id")
+          .single();
+        if (providerError) throw providerError;
+
+        const { error: credentialError } = await admin
+          .from("integration_credentials")
+          .upsert({ provider_id: providerRow.id, ...fields }, { onConflict: "provider_id" });
+        if (credentialError) throw credentialError;
+
+        // Nunca grava o valor dos campos em si na auditoria — só QUAIS campos
+        // foram alterados (o segredo em si não pertence nem ao log).
+        await writeAudit("integration_credentials_saved", providerRow.id, { provider, fields_changed: Object.keys(fields) }, "integration_provider");
+        return jsonResponse({ success: true });
+      }
+
+      // -----------------------------------------------------------------
+      case "clear_integration_credentials": {
+        if (!(await hasPermission("integrations.manage")))
+          return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
+
+        const provider = body.provider;
+        if (!isValidIntegrationProvider(provider)) return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Provedor inválido." }, 400);
+
+        const { data: providerRow } = await admin
+          .from("integration_providers")
+          .select("id")
+          .eq("company_id", caller.company_id)
+          .eq("provider", provider)
+          .maybeSingle();
+        if (!providerRow) return jsonResponse({ success: true }); // nada configurado — já está no estado desejado
+
+        const { error: deleteError } = await admin.from("integration_credentials").delete().eq("provider_id", providerRow.id);
+        if (deleteError) throw deleteError;
+
+        const { error: resetError } = await admin
+          .from("integration_providers")
+          .update({ status: "not_configured", last_error: null, last_sync_at: null, next_retry_at: null })
+          .eq("id", providerRow.id);
+        if (resetError) throw resetError;
+
+        await writeAudit("integration_credentials_cleared", providerRow.id, { provider }, "integration_provider");
+        return jsonResponse({ success: true });
       }
 
       default: {

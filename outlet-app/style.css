@@ -1601,6 +1601,26 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 .about-closing span { font-size: 12.5px; color: var(--text-secondary); }
 
 /* ---------------------------------------------------------------------- */
+/* Perfil > Integrações — status dos provedores de ERP/marketplace         */
+/* ---------------------------------------------------------------------- */
+.integration-provider-list { display: flex; flex-direction: column; gap: 10px; }
+.integration-provider-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-subtle);
+}
+.integration-provider-icon { display: flex; flex-shrink: 0; color: var(--text-secondary); }
+.integration-provider-icon svg { width: 20px; height: 20px; }
+.integration-provider-info { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 2px; }
+.integration-provider-info strong { font-size: 13.5px; color: var(--text-primary); }
+.integration-provider-info span { font-size: 12px; color: var(--text-secondary); line-height: 1.4; }
+.integration-provider-card .status-badge { flex-shrink: 0; white-space: nowrap; }
+
+/* ---------------------------------------------------------------------- */
 /* Painel de Administração — 5 abas precisam quebrar linha no celular (o   */
 /* .input-mode-switch padrão nunca tinha mais de 3 itens); grid de         */
 /* estatísticas da Visão geral; agrupamento de permissões por categoria.   */
@@ -1766,6 +1786,33 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 }
 
 /* ---------------------------------------------------------------------- */
+/* EXPANSÃO GOSCAN — Módulo Devolução: layout mínimo reaproveitando os      */
+/* tokens/classes já existentes (chip-row, card, product-card, status-     */
+/* badge, table-wrap) — só o que realmente faltava.                        */
+/* ---------------------------------------------------------------------- */
+.filters-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.filters-inline select,
+.filters-inline .search-row {
+  flex: 1 1 160px;
+  min-width: 140px;
+}
+
+.pagination-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+tr[hidden] { display: none !important; }
+
+/* ---------------------------------------------------------------------- */
 /* "Exportar PDF" do Relatório de Conferência = window.print() — sem lib   */
 /* nova. Esconde a navegação/controles, força a versão em tabela (mesmo no */
 /* celular) e nunca corta colunas nem limita a altura da tabela.          */
@@ -1780,7 +1827,9 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   [data-recount-start],
   [data-recount-confirm],
   [data-recount-input],
-  .row-remove {
+  .row-remove,
+  #devolucaoTabs,
+  .report-controls {
     display: none !important;
   }
   .product-card-list.mobile-only { display: none !important; }

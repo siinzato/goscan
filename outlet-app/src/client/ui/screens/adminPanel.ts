@@ -23,13 +23,19 @@ import {
   getUserPermissions,
   setUserPermissions,
   listAuditLogs,
+  listIntegrations,
+  saveIntegrationCredentials,
+  clearIntegrationCredentials,
   type Role,
   type AdminOverview,
   type AdminUserRow,
   type WorkGroup,
   type PermissionRow,
   type AuditLogRow,
+  type IntegrationProvider,
+  type IntegrationRow,
 } from "../../adminApi.ts";
+import { INTEGRATION_PROVIDER_META, INTEGRATION_STATUS_META, type ProviderInfo } from "./profileIntegrations.ts";
 
 const ROLE_LABELS: Record<Role, string> = {
   super_admin: "Super Administrador",
@@ -45,7 +51,8 @@ const ROLE_ICON: Record<Role, string> = {
   viewer: Icon.eye,
 };
 
-type AdminTab = "overview" | "users" | "groups" | "permissions" | "audit";
+type AdminTab = "overview" | "users" | "groups" | "permissions" | "audit" | "integrations";
+const ADMIN_TABS: readonly AdminTab[] = ["overview", "users", "groups", "permissions", "audit", "integrations"];
 let activeTab: AdminTab = "overview";
 
 // Usuários
@@ -108,18 +115,23 @@ export function isAllowedIntoAdminPanel(role: Role | undefined): boolean {
   return role === "super_admin" || role === "admin";
 }
 
-export async function renderAdminPanel(root: HTMLElement): Promise<void> {
+export async function renderAdminPanel(root: HTMLElement, initialTab?: AdminTab): Promise<void> {
+  // Só aplicado num deep-link explícito (ex.: vindo de Perfil > Integrações)
+  // — nunca sobrescreve a aba em navegação normal, onde initialTab vem undefined.
+  if (initialTab && ADMIN_TABS.includes(initialTab)) activeTab = initialTab;
+
   root.innerHTML = `
     <section class="profile-screen">
       <div class="card">
         <button class="btn-secondary" id="btnBackToSettings">${Icon.chevronLeft}Voltar</button>
         <h2>${Icon.shieldCheck}Administração</h2>
-        <p class="hint-text">Gerencie usuários, grupos, permissões e auditoria do GoScan.</p>
+        <p class="hint-text">Gerencie usuários, grupos, permissões, integrações e auditoria do GoScan.</p>
         <div class="input-mode-switch admin-tabs" role="tablist" aria-label="Seções da Administração">
           <button class="mode-btn ${activeTab === "overview" ? "active" : ""}" data-admin-tab="overview">${Icon.gauge}Visão geral</button>
           <button class="mode-btn ${activeTab === "users" ? "active" : ""}" data-admin-tab="users">${Icon.users}Usuários</button>
           <button class="mode-btn ${activeTab === "groups" ? "active" : ""}" data-admin-tab="groups">${Icon.usersRound}Grupos</button>
           <button class="mode-btn ${activeTab === "permissions" ? "active" : ""}" data-admin-tab="permissions">${Icon.key}Permissões</button>
+          <button class="mode-btn ${activeTab === "integrations" ? "active" : ""}" data-admin-tab="integrations">${Icon.link}Integrações</button>
           <button class="mode-btn ${activeTab === "audit" ? "active" : ""}" data-admin-tab="audit">${Icon.history}Auditoria</button>
         </div>
       </div>
@@ -149,6 +161,9 @@ export async function renderAdminPanel(root: HTMLElement): Promise<void> {
       break;
     case "permissions":
       await renderPermissionsTab(root, content);
+      break;
+    case "integrations":
+      await renderIntegrationsTab(content);
       break;
     case "audit":
       await renderAuditTab(content);
@@ -1027,6 +1042,171 @@ async function loadPermissionsChecklist(content: HTMLElement): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Integrações — cadastro real das credenciais de API do ERP (Tiny/Olist) e
+// dos marketplaces. Todo o CRUD passa pela Edge Function admin-users
+// (service_role) — nunca lê/escreve integration_credentials direto (essa
+// tabela tem RLS habilitado e ZERO policies, então nem conseguiria). Nenhum
+// segredo em texto puro chega aqui depois de salvo, só um resumo mascarado.
+// ---------------------------------------------------------------------------
+async function renderIntegrationsTab(content: HTMLElement): Promise<void> {
+  content.innerHTML = `
+    <div class="card">
+      <h3>${Icon.link}Credenciais de integração</h3>
+      <p class="hint-text">Cadastre aqui as chaves de API do ERP e dos marketplaces. Elas ficam guardadas com segurança no backend — nunca aparecem novamente em texto completo, e nenhuma chamada externa é feita automaticamente só por estarem salvas aqui.</p>
+    </div>
+    <div id="integrationsListWrap"><div class="skeleton skeleton-card"></div></div>`;
+
+  await loadIntegrationsList(content);
+}
+
+async function loadIntegrationsList(content: HTMLElement): Promise<void> {
+  const wrap = content.querySelector<HTMLElement>("#integrationsListWrap")!;
+  let integrations: IntegrationRow[];
+  try {
+    integrations = await listIntegrations();
+  } catch (err) {
+    renderErrorWithRetry(wrap, "Erro ao carregar integrações: " + describeError(err), () => void loadIntegrationsList(content));
+    return;
+  }
+
+  const byProvider = new Map(integrations.map((i) => [i.provider, i]));
+  wrap.innerHTML = `<div class="product-card-list">${INTEGRATION_PROVIDER_META.map((meta) => renderIntegrationCard(meta, byProvider.get(meta.key) ?? null)).join("")}</div>`;
+
+  wrap.querySelectorAll<HTMLButtonElement>("[data-integration-configure]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const provider = btn.dataset.integrationConfigure as IntegrationProvider;
+      const meta = INTEGRATION_PROVIDER_META.find((m) => m.key === provider)!;
+      openIntegrationCredentialsModal(content, meta, byProvider.get(provider) ?? null);
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-integration-clear]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const provider = btn.dataset.integrationClear as IntegrationProvider;
+      const meta = INTEGRATION_PROVIDER_META.find((m) => m.key === provider)!;
+      const confirmed = await confirmAction({
+        title: "Remover credenciais?",
+        message: `As credenciais salvas de "${meta.name}" serão apagadas e o status volta para "Não configurada". Esta ação não pode ser desfeita.`,
+        confirmLabel: "Remover",
+        danger: true,
+      });
+      if (!confirmed) return;
+      try {
+        await clearIntegrationCredentials(provider);
+        showToast("Credenciais removidas.", "success");
+        await loadIntegrationsList(content);
+      } catch (err) {
+        showToast(describeError(err), "error");
+      }
+    });
+  });
+}
+
+function renderIntegrationCard(meta: ProviderInfo, row: IntegrationRow | null): string {
+  const status = row?.status ?? "not_configured";
+  const s = INTEGRATION_STATUS_META[status];
+  const cred = row?.credential;
+  const summaryLines: string[] = [];
+  if (cred) {
+    if (cred.client_id) summaryLines.push(`Client ID: ${escapeHtml(cred.client_id)}`);
+    if (cred.client_secret_masked) summaryLines.push(`Client Secret: ${cred.client_secret_masked}`);
+    if (cred.access_token_masked) summaryLines.push(`Token de acesso: ${cred.access_token_masked}`);
+    if (cred.refresh_token_masked) summaryLines.push(`Token de atualização: ${cred.refresh_token_masked}`);
+    if (cred.external_account_id) summaryLines.push(`Conta/Loja: ${escapeHtml(cred.external_account_id)}`);
+    if (cred.scopes) summaryLines.push(`Escopos: ${escapeHtml(cred.scopes)}`);
+  }
+
+  return `
+    <div class="product-card" data-integration-row="${meta.key}">
+      <div class="product-card-top">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="integration-provider-icon">${meta.icon}</span>
+          <p class="product-card-name">${escapeHtml(meta.name)}</p>
+        </div>
+        <span class="status-badge ${s.badge}">${s.icon}${s.text}</span>
+      </div>
+      <p class="hint-text" style="margin:4px 0">${escapeHtml(meta.description)}</p>
+      ${summaryLines.length > 0 ? `<div class="product-card-meta">${summaryLines.map((l) => `<span>${l}</span>`).join("")}</div>` : ""}
+      <div class="review-actions" style="margin-top:8px">
+        <button type="button" class="btn-secondary" data-integration-configure="${meta.key}">${Icon.key}${cred ? "Editar credenciais" : "Configurar"}</button>
+        ${cred ? `<button type="button" class="btn-danger" data-integration-clear="${meta.key}">${Icon.trash}Remover</button>` : ""}
+      </div>
+    </div>`;
+}
+
+function openIntegrationCredentialsModal(content: HTMLElement, meta: ProviderInfo, existing: IntegrationRow | null): void {
+  const cred = existing?.credential;
+  const { close } = openModal(
+    `
+    <h3 id="intCredTitle">${Icon.key}${escapeHtml(meta.name)}</h3>
+    <p class="hint-text">Os campos abaixo já preenchidos com "•" ficam salvos — deixe em branco pra manter o valor atual, ou digite um novo valor pra substituí-lo.</p>
+    <form id="intCredForm">
+      <label for="icClientId">Client ID</label>
+      <input type="text" id="icClientId" autocomplete="off" value="${escapeHtml(cred?.client_id || "")}" />
+
+      <label for="icClientSecret">Client Secret ${cred?.client_secret_masked ? `<span class="hint-text">(atual: ${cred.client_secret_masked})</span>` : ""}</label>
+      <input type="password" id="icClientSecret" autocomplete="off" placeholder="${cred?.client_secret_masked ? "Deixe em branco pra manter" : ""}" />
+
+      <label for="icAccessToken">Token de acesso ${cred?.access_token_masked ? `<span class="hint-text">(atual: ${cred.access_token_masked})</span>` : ""}</label>
+      <input type="password" id="icAccessToken" autocomplete="off" placeholder="${cred?.access_token_masked ? "Deixe em branco pra manter" : ""}" />
+
+      <label for="icRefreshToken">Token de atualização ${cred?.refresh_token_masked ? `<span class="hint-text">(atual: ${cred.refresh_token_masked})</span>` : ""}</label>
+      <input type="password" id="icRefreshToken" autocomplete="off" placeholder="${cred?.refresh_token_masked ? "Deixe em branco pra manter" : ""}" />
+
+      <label for="icAccountId">Conta/Loja (ID externo)</label>
+      <input type="text" id="icAccountId" autocomplete="off" value="${escapeHtml(cred?.external_account_id || "")}" />
+
+      <label for="icScopes">Escopos</label>
+      <input type="text" id="icScopes" autocomplete="off" value="${escapeHtml(cred?.scopes || "")}" placeholder="Ex.: read write" />
+
+      <p class="hint-text" style="margin-top:10px">A verificação automática de conexão com o provedor ainda não foi implementada nesta etapa — o status muda para "Conectada" só quando essa validação real existir. Até lá, salvar aqui deixa o status como "Configuração incompleta".</p>
+      <p class="error-box" id="icError" hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" id="icCancel">Cancelar</button>
+        <button type="submit" class="btn-primary" id="icSubmit">Salvar credenciais</button>
+      </div>
+    </form>`,
+    "intCredTitle"
+  );
+  const modalRoot = document.querySelector(".modal-overlay:last-of-type")!;
+  modalRoot.querySelector("#icCancel")!.addEventListener("click", close);
+  modalRoot.querySelector("#intCredForm")!.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = modalRoot.querySelector<HTMLElement>("#icError")!;
+    const submitBtn = modalRoot.querySelector<HTMLButtonElement>("#icSubmit")!;
+    errorEl.hidden = true;
+
+    const fields = {
+      client_id: (modalRoot.querySelector<HTMLInputElement>("#icClientId")!).value.trim(),
+      client_secret: (modalRoot.querySelector<HTMLInputElement>("#icClientSecret")!).value.trim(),
+      access_token: (modalRoot.querySelector<HTMLInputElement>("#icAccessToken")!).value.trim(),
+      refresh_token: (modalRoot.querySelector<HTMLInputElement>("#icRefreshToken")!).value.trim(),
+      external_account_id: (modalRoot.querySelector<HTMLInputElement>("#icAccountId")!).value.trim(),
+      scopes: (modalRoot.querySelector<HTMLInputElement>("#icScopes")!).value.trim(),
+    };
+    if (!Object.values(fields).some((v) => v)) {
+      errorEl.textContent = "Preencha pelo menos um campo.";
+      errorEl.hidden = false;
+      return;
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Salvando…";
+    try {
+      await saveIntegrationCredentials({ provider: meta.key, ...fields });
+      showToast("Credenciais salvas com segurança.", "success");
+      close();
+      await loadIntegrationsList(content);
+    } catch (err) {
+      errorEl.textContent = describeError(err);
+      errorEl.hidden = false;
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Salvar credenciais";
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Auditoria
 // ---------------------------------------------------------------------------
 async function renderAuditTab(content: HTMLElement): Promise<void> {
@@ -1077,6 +1257,8 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   group_deactivated: "Grupo desativado",
   admin_action_denied: "Tentativa administrativa negada",
   user_create_partial_failure: "Criação de usuário incompleta",
+  integration_credentials_saved: "Credenciais de integração salvas",
+  integration_credentials_cleared: "Credenciais de integração removidas",
 };
 
 async function loadAuditPage(content: HTMLElement): Promise<void> {
