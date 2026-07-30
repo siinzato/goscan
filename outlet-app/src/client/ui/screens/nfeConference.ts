@@ -26,6 +26,7 @@ import {
   listReceiptHistory,
   deleteReceipt,
   fetchAllNormalProducts,
+  confirmInvoiceReceiptTinyLaunch,
   type InvoiceReceipt,
   type InvoiceReceiptWithCreator,
   type InvoiceReceiptWithNames,
@@ -50,6 +51,7 @@ import { isVoiceCommandSupported, startPushToTalk, stopPushToTalk, isListening a
 import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
 import { confirmAction, chooseAction, promptText } from "../confirmModal.ts";
+import { getTinyWarehouses, launchInvoiceReceiptToTiny, TinyIntegrationError, type TinyWarehouse, type TinyLaunchOutcome } from "../../tinyIntegrationApi.ts";
 
 type NfeView = "upload" | "prep" | "mode" | "counting" | "result" | "history";
 
@@ -1746,6 +1748,8 @@ function renderResultView(root: HTMLElement): void {
       <p class="hint-text">Quantidade total NF: ${totalExpected} · Quantidade física: ${totalPhysical}</p>
     </div>
 
+    ${renderTinyLaunchCard(receipt, currentItems)}
+
     <div class="card" id="nfeReportTable">
       <div class="input-mode-switch" style="flex-wrap:wrap">
         ${(Object.keys(RESULT_FILTER_LABEL) as ResultFilter[])
@@ -1797,6 +1801,197 @@ function renderResultView(root: HTMLElement): void {
   searchInput.addEventListener("input", (e) => debouncedSearch((e.target as HTMLInputElement).value));
 
   wireRecountButtons(root);
+  wireTinyLaunchCard(root, receipt, currentItems);
+}
+
+// ---------------------------------------------------------------------------
+// EXPANSÃO GOSCAN — Lançamento de estoque no Tiny ao finalizar a conferência
+// por NF (ver migration 0051 e supabase/functions/tiny-integration/). Só
+// itens fisicamente confirmados (ok/sobra) com produto vinculado entram —
+// nunca o que faltou ou ficou sem vínculo, mesmo estando na NF original.
+// Mesmo padrão de logisticsQueue.ts: busca depósitos sob demanda (nunca ao
+// carregar a tela) + fallback manual sempre disponível.
+// ---------------------------------------------------------------------------
+let cachedTinyWarehousesNfe: TinyWarehouse[] | null = null;
+
+function eligibleForTinyLaunch(items: InvoiceReceiptItem[]): InvoiceReceiptItem[] {
+  return items.filter((i) => (i.status === "ok" || i.status === "surplus") && i.product_variant_id && (i.physical_quantity ?? 0) > 0);
+}
+
+function describeNfeLaunchOutcome(outcome: TinyLaunchOutcome): string {
+  const { summary } = outcome;
+  const parts = [`${summary.succeeded} lançado(s)`];
+  if (summary.alreadyDone > 0) parts.push(`${summary.alreadyDone} já lançado(s) antes`);
+  if (summary.failed > 0) parts.push(`${summary.failed} com falha`);
+  return parts.join(", ") + ".";
+}
+
+function renderTinyLaunchCard(receipt: InvoiceReceiptWithNames, items: InvoiceReceiptItem[]): string {
+  if (receipt.status !== "completed" && receipt.status !== "with_divergences") return "";
+
+  if (receipt.tiny_launch_status === "lancado") {
+    return `
+      <div class="card">
+        <h2>${Icon.link}Lançamento no Tiny</h2>
+        <p class="hint-text">${Icon.checkCircle} Lançada em ${formatDateTime(receipt.tiny_launched_at)} — depósito "${escapeHtml(receipt.tiny_launch_warehouse || "-")}".</p>
+      </div>`;
+  }
+
+  const eligible = eligibleForTinyLaunch(items);
+  if (eligible.length === 0) {
+    return `
+      <div class="card">
+        <h2>${Icon.link}Lançamento no Tiny</h2>
+        <p class="hint-text">Nenhum item fisicamente confirmado (OK/sobra) com produto vinculado pra lançar ainda.</p>
+      </div>`;
+  }
+
+  const eligibleUnits = eligible.reduce((acc, i) => acc + (i.physical_quantity ?? 0), 0);
+  return `
+    <div class="card">
+      <h2>${Icon.link}Lançar no Tiny</h2>
+      <p class="hint-text">${eligible.length} SKU(s) confirmados fisicamente (${eligibleUnits} unidade(s)) prontos pra lançar como entrada de estoque.</p>
+      <div id="nfeTinyAutoWrap">
+        <button type="button" class="btn-secondary btn-block" id="btnNfeLoadWarehouses">${Icon.refresh}Buscar depósitos do Tiny</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Ou registre manualmente</h3>
+      <div class="warning-box">${Icon.info} Esta confirmação informa que as quantidades foram lançadas manualmente no Tiny (por fora do GoScan). Ela não atualiza o estoque automaticamente.</div>
+      <label for="nfeManualWarehouse">Depósito utilizado</label>
+      <input type="text" id="nfeManualWarehouse" placeholder="Ex.: Depósito Central" />
+      <label for="nfeManualLaunchedAt">Data do lançamento</label>
+      <input type="datetime-local" id="nfeManualLaunchedAt" value="${new Date().toISOString().slice(0, 16)}" />
+      <label for="nfeManualNote">Observação (opcional)</label>
+      <textarea id="nfeManualNote" rows="2"></textarea>
+      <button class="btn-accent btn-block" id="btnNfeManualConfirm">Confirmar lançamento no Tiny</button>
+    </div>`;
+}
+
+function wireTinyLaunchCard(root: HTMLElement, receipt: InvoiceReceiptWithNames, items: InvoiceReceiptItem[]): void {
+  const loadBtn = root.querySelector<HTMLButtonElement>("#btnNfeLoadWarehouses");
+  if (loadBtn) {
+    loadBtn.addEventListener("click", async () => {
+      loadBtn.disabled = true;
+      loadBtn.textContent = "Buscando…";
+      try {
+        if (!cachedTinyWarehousesNfe) cachedTinyWarehousesNfe = await getTinyWarehouses();
+        renderNfeAutoLaunchForm(root, receipt, items);
+      } catch (err) {
+        if (err instanceof TinyIntegrationError && err.code === "NOT_CONFIGURED") {
+          showToast("Integração com o Tiny ainda não configurada — use a confirmação manual abaixo.", "error");
+        } else {
+          showToast("Erro ao buscar depósitos: " + describeError(err), "error");
+        }
+        loadBtn.disabled = false;
+        loadBtn.textContent = "Buscar depósitos do Tiny";
+      }
+    });
+  }
+
+  const manualBtn = root.querySelector<HTMLButtonElement>("#btnNfeManualConfirm");
+  if (manualBtn) {
+    manualBtn.addEventListener("click", async () => {
+      const warehouse = (root.querySelector("#nfeManualWarehouse") as HTMLInputElement).value;
+      const launchedAtRaw = (root.querySelector("#nfeManualLaunchedAt") as HTMLInputElement).value;
+      const note = (root.querySelector("#nfeManualNote") as HTMLTextAreaElement).value;
+      if (!warehouse.trim()) {
+        showToast("Informe o depósito utilizado.", "error");
+        return;
+      }
+      if (!launchedAtRaw) {
+        showToast("Informe a data do lançamento.", "error");
+        return;
+      }
+      const confirmed = await confirmAction({
+        title: "Confirmar lançamento?",
+        message: `Confirma que os itens conferidos foram lançados manualmente no depósito "${warehouse}"? Esta ação não pode ser desfeita.`,
+        confirmLabel: "Confirmar lançamento",
+      });
+      if (!confirmed) return;
+
+      manualBtn.disabled = true;
+      manualBtn.textContent = "Confirmando…";
+      try {
+        await confirmInvoiceReceiptTinyLaunch({ receiptId: receipt.id, warehouse, launchedAt: new Date(launchedAtRaw).toISOString(), note });
+        showToast("Lançamento confirmado.", "success");
+        await refreshReceiptAfterTinyLaunch(root, receipt.id);
+      } catch (err) {
+        showToast("Erro ao confirmar lançamento: " + describeError(err), "error");
+        manualBtn.disabled = false;
+        manualBtn.textContent = "Confirmar lançamento no Tiny";
+      }
+    });
+  }
+}
+
+function renderNfeAutoLaunchForm(root: HTMLElement, receipt: InvoiceReceiptWithNames, items: InvoiceReceiptItem[]): void {
+  const wrap = root.querySelector<HTMLElement>("#nfeTinyAutoWrap")!;
+  const warehouses = cachedTinyWarehousesNfe ?? [];
+  if (warehouses.length === 0) {
+    wrap.innerHTML = `<p class="hint-text">Nenhum depósito encontrado no Tiny.</p>`;
+    return;
+  }
+  const eligible = eligibleForTinyLaunch(items);
+  const eligibleUnits = eligible.reduce((acc, i) => acc + (i.physical_quantity ?? 0), 0);
+
+  wrap.innerHTML = `
+    <label for="nfeWarehouseSelect">Depósito (Tiny)</label>
+    <select id="nfeWarehouseSelect">${warehouses.map((w) => `<option value="${escapeHtml(w.id)}">${escapeHtml(w.name)}</option>`).join("")}</select>
+    <label for="nfeUnitPrice">Valor unitário — sobrescreve o valor da NF (opcional)</label>
+    <input type="number" id="nfeUnitPrice" min="0" step="0.01" placeholder="Usar valor da NF por item" />
+    <label for="nfeAutoNote">Observação (opcional)</label>
+    <textarea id="nfeAutoNote" rows="2"></textarea>
+    <button type="button" class="btn-accent btn-block" id="btnNfeLaunchViaApi">${Icon.link}Lançar ${eligible.length} SKU(s) / ${eligibleUnits} unidade(s) via Tiny</button>
+    <p class="hint-text" id="nfeTinyLaunchResult"></p>`;
+
+  wrap.querySelector("#btnNfeLaunchViaApi")!.addEventListener("click", async () => {
+    const select = wrap.querySelector<HTMLSelectElement>("#nfeWarehouseSelect")!;
+    const warehouseId = select.value;
+    const warehouseName = select.options[select.selectedIndex]?.text || "";
+    const unitPriceRaw = (wrap.querySelector<HTMLInputElement>("#nfeUnitPrice")!).value;
+    const note = (wrap.querySelector<HTMLTextAreaElement>("#nfeAutoNote")!).value;
+
+    const confirmed = await confirmAction({
+      title: "Lançar via API do Tiny?",
+      message: `O GoScan vai chamar a API do Tiny agora e criar a entrada de estoque real pra cada SKU confirmado desta NF no depósito "${warehouseName}". Isso não pode ser desfeito automaticamente.`,
+      confirmLabel: "Lançar agora",
+    });
+    if (!confirmed) return;
+
+    const btn = wrap.querySelector<HTMLButtonElement>("#btnNfeLaunchViaApi")!;
+    const resultEl = wrap.querySelector<HTMLElement>("#nfeTinyLaunchResult")!;
+    btn.disabled = true;
+    btn.textContent = "Lançando…";
+    try {
+      const outcome = await launchInvoiceReceiptToTiny(receipt.id, {
+        warehouseId,
+        warehouseName,
+        unitPrice: unitPriceRaw ? Number(unitPriceRaw) : undefined,
+        note: note || undefined,
+      });
+      showToast(describeNfeLaunchOutcome(outcome), outcome.summary.allSucceeded ? "success" : "error");
+      if (!outcome.summary.allSucceeded) {
+        const failedList = outcome.results
+          .filter((r) => r.status === "failed")
+          .map((r) => r.error)
+          .join(" | ");
+        resultEl.textContent = `Itens com falha: ${failedList}`;
+      }
+      await refreshReceiptAfterTinyLaunch(root, receipt.id);
+    } catch (err) {
+      showToast("Erro ao lançar via Tiny: " + describeError(err), "error");
+      btn.disabled = false;
+      btn.textContent = `Lançar ${eligible.length} SKU(s) / ${eligibleUnits} unidade(s) via Tiny`;
+    }
+  });
+}
+
+async function refreshReceiptAfterTinyLaunch(root: HTMLElement, receiptId: string): Promise<void> {
+  const { receipt, items } = await getReceipt(receiptId);
+  currentReceipt = receipt;
+  currentItems = items;
+  renderResultView(root);
 }
 
 function diffLabel(it: InvoiceReceiptItem): string {

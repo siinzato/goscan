@@ -70,7 +70,8 @@ export interface AuditLogRow {
   target_name: string | null;
 }
 
-async function describeEdgeError(error: { context?: unknown }): Promise<string> {
+/** Exportada pra ser reaproveitada por outros clientes de Edge Function (ver tinyIntegrationApi.ts) — mesmo formato de erro em toda invocação via supabase.functions.invoke(). */
+export async function describeEdgeError(error: { context?: unknown }): Promise<string> {
   const context = error?.context as { json?: () => Promise<unknown>; clone?: () => { json: () => Promise<unknown> } } | undefined;
   if (context && typeof context.json === "function") {
     try {

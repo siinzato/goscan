@@ -764,9 +764,14 @@ Deno.serve(async (req) => {
           .single();
         if (providerError) throw providerError;
 
-        const { error: credentialError } = await admin
-          .from("integration_credentials")
-          .upsert({ provider_id: providerRow.id, ...fields }, { onConflict: "provider_id" });
+        // Sempre que um access_token novo é salvo, assume que acabou de ser
+        // obtido agora (o admin geralmente cola o token logo depois do fluxo
+        // OAuth) e carimba a validade real do Tiny (4h) — sem isso,
+        // tiny-integration nunca saberia quando renovar via refresh_token.
+        const credentialPatch: Record<string, unknown> = { provider_id: providerRow.id, ...fields };
+        if (fields.access_token) credentialPatch.expires_at = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString();
+
+        const { error: credentialError } = await admin.from("integration_credentials").upsert(credentialPatch, { onConflict: "provider_id" });
         if (credentialError) throw credentialError;
 
         // Nunca grava o valor dos campos em si na auditoria — só QUAIS campos

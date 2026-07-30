@@ -27,6 +27,8 @@ export type ItemStatus = "pending" | "counted" | "ok" | "missing" | "surplus" | 
 // free = compartilhado sem bloqueio automático (só alerta visualmente via presença).
 export type WorkMode = "volume" | "product" | "free";
 
+export type TinyLaunchStatus = "nao_lancado" | "parcial" | "lancado";
+
 export interface InvoiceReceipt {
   id: string;
   invoice_key: string;
@@ -43,6 +45,12 @@ export interface InvoiceReceipt {
   updated_at: string;
   started_at: string | null;
   finished_at: string | null;
+  // EXPANSÃO GOSCAN — lançamento de estoque no Tiny (ver migration 0051).
+  tiny_launch_status: TinyLaunchStatus;
+  tiny_launched_at: string | null;
+  tiny_launched_by: string | null;
+  tiny_launch_warehouse: string | null;
+  tiny_launch_note: string | null;
 }
 
 export interface InvoiceReceiptItem {
@@ -718,6 +726,32 @@ export async function deleteReceipt(receiptId: string): Promise<void> {
   if (!data || data.length === 0) {
     throw new Error("Não foi possível excluir esta NF — ela já foi finalizada. Apenas um gerente/admin pode excluir notas finalizadas.");
   }
+}
+
+// ---------------------------------------------------------------------------
+// EXPANSÃO GOSCAN — Lançamento de estoque no Tiny (ver migration 0051 e
+// supabase/functions/tiny-integration/). Confirmação MANUAL, mesmo padrão de
+// confirmBatchTinyLaunch (returnsApi.ts) — nunca lança estoque de verdade
+// sozinha, só registra que foi feito (por fora, ou como passo final depois
+// de um lançamento real bem-sucedido via a Edge Function).
+// ---------------------------------------------------------------------------
+export interface ConfirmInvoiceTinyLaunchInput {
+  receiptId: string;
+  warehouse: string;
+  launchedAt: string;
+  note?: string | null;
+}
+
+export async function confirmInvoiceReceiptTinyLaunch(input: ConfirmInvoiceTinyLaunchInput): Promise<{ receipt_id: string; confirmed_quantities: unknown }> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.rpc("confirm_invoice_receipt_tiny_launch", {
+    p_receipt_id: input.receiptId,
+    p_warehouse: input.warehouse.trim(),
+    p_launched_at: input.launchedAt,
+    p_note: input.note?.trim() || null,
+  });
+  if (error) throw error;
+  return data as { receipt_id: string; confirmed_quantities: unknown };
 }
 
 export async function listReceiptHistory(limit = 20): Promise<ReceiptWithCounts[]> {

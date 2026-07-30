@@ -36,6 +36,7 @@ import {
   type IntegrationRow,
 } from "../../adminApi.ts";
 import { INTEGRATION_PROVIDER_META, INTEGRATION_STATUS_META, type ProviderInfo } from "./profileIntegrations.ts";
+import { testTinyConnection } from "../../tinyIntegrationApi.ts";
 
 const ROLE_LABELS: Record<Role, string> = {
   super_admin: "Super Administrador",
@@ -1079,6 +1080,23 @@ async function loadIntegrationsList(content: HTMLElement): Promise<void> {
       openIntegrationCredentialsModal(content, meta, byProvider.get(provider) ?? null);
     });
   });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-integration-test]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      const originalText = btn.textContent;
+      btn.textContent = "Testando…";
+      try {
+        const result = await testTinyConnection();
+        showToast(result.connected ? "Conexão com o Tiny confirmada." : "Não foi possível confirmar a conexão.", result.connected ? "success" : "error");
+      } catch (err) {
+        showToast("Falha ao testar conexão: " + describeError(err), "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+        await loadIntegrationsList(content);
+      }
+    });
+  });
   wrap.querySelectorAll<HTMLButtonElement>("[data-integration-clear]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const provider = btn.dataset.integrationClear as IntegrationProvider;
@@ -1128,6 +1146,11 @@ function renderIntegrationCard(meta: ProviderInfo, row: IntegrationRow | null): 
       ${summaryLines.length > 0 ? `<div class="product-card-meta">${summaryLines.map((l) => `<span>${l}</span>`).join("")}</div>` : ""}
       <div class="review-actions" style="margin-top:8px">
         <button type="button" class="btn-secondary" data-integration-configure="${meta.key}">${Icon.key}${cred ? "Editar credenciais" : "Configurar"}</button>
+        ${
+          cred && meta.key === "tiny"
+            ? `<button type="button" class="btn-secondary" data-integration-test="${meta.key}">${Icon.refresh}Testar conexão</button>`
+            : ""
+        }
         ${cred ? `<button type="button" class="btn-danger" data-integration-clear="${meta.key}">${Icon.trash}Remover</button>` : ""}
       </div>
     </div>`;

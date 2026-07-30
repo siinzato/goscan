@@ -7,7 +7,21 @@ import { confirmAction, promptText } from "../../confirmModal.ts";
 import { escapeHtml, describeError, renderErrorWithRetry, formatDateTime } from "../../../utils.ts";
 import { getAuthState, isManagerOrAdmin } from "../../../auth.ts";
 import { listBatches, getBatchDetail, confirmBatchTinyLaunch, reopenBatch, type ReturnBatchSummary, type BatchItemDetail, type ReturnBatchStatus } from "../../../returnsApi.ts";
+import { getTinyWarehouses, launchReturnBatchToTiny, TinyIntegrationError, type TinyWarehouse, type TinyLaunchOutcome } from "../../../tinyIntegrationApi.ts";
 import { MARKETPLACE_LABEL, batchStatusBadge, safeEanDisplay } from "./shared.ts";
+
+// Cache de sessão simples (mesmo padrão de cachedGroups em adminPanel.ts) —
+// a lista de depósitos do Tiny não muda a cada clique; evita bater na API de
+// novo toda vez que o admin abre o formulário automático de novo.
+let cachedTinyWarehouses: TinyWarehouse[] | null = null;
+
+function describeLaunchOutcome(outcome: TinyLaunchOutcome): string {
+  const { summary } = outcome;
+  const parts = [`${summary.succeeded} lançado(s)`];
+  if (summary.alreadyDone > 0) parts.push(`${summary.alreadyDone} já lançado(s) antes`);
+  if (summary.failed > 0) parts.push(`${summary.failed} com falha`);
+  return parts.join(", ") + ".";
+}
 
 export interface LogisticsNavContext {
   goToBatchDetail(batchId: string): void;
@@ -103,7 +117,10 @@ export async function renderBatchDetailView(root: HTMLElement, ctx: LogisticsNav
 
   const { profile } = getAuthState();
   const canReopen = isManagerOrAdmin(profile) && batch.status === "concluida";
-  const canConfirm = batch.status === "aguardando_lancamento";
+  // "lancada_tiny" = um lançamento automático anterior ficou parcial (alguns
+  // itens deram certo, outros não) — continua podendo confirmar/retentar,
+  // nunca trava o lote nesse estado intermediário.
+  const canConfirm = batch.status === "aguardando_lancamento" || batch.status === "lancada_tiny";
   const totalUnits = items.reduce((acc, it) => acc + it.total_quantity, 0);
 
   root.innerHTML = `
@@ -156,8 +173,15 @@ export async function renderBatchDetailView(root: HTMLElement, ctx: LogisticsNav
     ${
       canConfirm
         ? `<div class="card">
-            <h2>Confirmar lançamento no Tiny</h2>
-            <div class="warning-box">${Icon.info} Esta confirmação informa que as quantidades acima foram lançadas manualmente no Tiny. Ela não atualiza o estoque automaticamente.</div>
+            <h2>${Icon.link}Lançar automaticamente via API do Tiny</h2>
+            <p class="hint-text">Se a integração com o Tiny estiver configurada, o GoScan cria a movimentação de estoque de verdade — item a item — e só confirma o lote quando tudo for aceito pelo Tiny.</p>
+            <div id="tinyAutoLaunchWrap">
+              <button type="button" class="btn-secondary btn-block" id="btnLoadWarehouses">${Icon.refresh}Buscar depósitos do Tiny</button>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Ou registre manualmente</h2>
+            <div class="warning-box">${Icon.info} Esta confirmação informa que as quantidades acima foram lançadas manualmente no Tiny (por fora do GoScan). Ela não atualiza o estoque automaticamente.</div>
             <label for="bdWarehouse">Depósito utilizado</label>
             <input type="text" id="bdWarehouse" placeholder="Ex.: Depósito Central" />
             <label for="bdLaunchedAt">Data do lançamento</label>
@@ -187,6 +211,8 @@ export async function renderBatchDetailView(root: HTMLElement, ctx: LogisticsNav
   });
 
   if (canConfirm) {
+    wireAutoTinyLaunch(root, ctx, batch.id, batchId, totalUnits);
+
     root.querySelector("#btnConfirmLaunch")!.addEventListener("click", async () => {
       const warehouse = (root.querySelector("#bdWarehouse") as HTMLInputElement).value;
       const launchedAtRaw = (root.querySelector("#bdLaunchedAt") as HTMLInputElement).value;
@@ -234,4 +260,98 @@ export async function renderBatchDetailView(root: HTMLElement, ctx: LogisticsNav
       }
     });
   }
+}
+
+/**
+ * Botão "Buscar depósitos do Tiny" busca a lista real sob demanda (nunca ao
+ * carregar a tela — sem chamada externa desnecessária) e só então revela o
+ * formulário de lançamento automático. Se a integração não estiver
+ * configurada (NOT_CONFIGURED), avisa e mantém só a confirmação manual
+ * disponível — nunca trava o fluxo por falta de API.
+ */
+function wireAutoTinyLaunch(root: HTMLElement, ctx: LogisticsNavContext, batchId: string, batchIdForReload: string, totalUnits: number): void {
+  const wrap = root.querySelector<HTMLElement>("#tinyAutoLaunchWrap")!;
+  const loadBtn = root.querySelector<HTMLButtonElement>("#btnLoadWarehouses")!;
+
+  loadBtn.addEventListener("click", async () => {
+    loadBtn.disabled = true;
+    loadBtn.textContent = "Buscando…";
+    try {
+      if (!cachedTinyWarehouses) cachedTinyWarehouses = await getTinyWarehouses();
+      renderAutoLaunchForm(wrap, cachedTinyWarehouses, batchId, batchIdForReload, totalUnits, root, ctx);
+    } catch (err) {
+      if (err instanceof TinyIntegrationError && err.code === "NOT_CONFIGURED") {
+        showToast("Integração com o Tiny ainda não configurada — use a confirmação manual abaixo.", "error");
+      } else {
+        showToast("Erro ao buscar depósitos: " + describeError(err), "error");
+      }
+      loadBtn.disabled = false;
+      loadBtn.textContent = "Buscar depósitos do Tiny";
+    }
+  });
+}
+
+function renderAutoLaunchForm(
+  wrap: HTMLElement,
+  warehouses: TinyWarehouse[],
+  batchId: string,
+  batchIdForReload: string,
+  totalUnits: number,
+  root: HTMLElement,
+  ctx: LogisticsNavContext
+): void {
+  if (warehouses.length === 0) {
+    wrap.innerHTML = `<p class="hint-text">Nenhum depósito encontrado no Tiny.</p>`;
+    return;
+  }
+  wrap.innerHTML = `
+    <label for="tinyWarehouseSelect">Depósito (Tiny)</label>
+    <select id="tinyWarehouseSelect">${warehouses.map((w) => `<option value="${escapeHtml(w.id)}">${escapeHtml(w.name)}</option>`).join("")}</select>
+    <label for="tinyUnitPrice">Valor unitário (opcional)</label>
+    <input type="number" id="tinyUnitPrice" min="0" step="0.01" placeholder="0,00" />
+    <label for="tinyNote">Observação (opcional)</label>
+    <textarea id="tinyNote" rows="2"></textarea>
+    <button type="button" class="btn-accent btn-block" id="btnLaunchViaApi">${Icon.link}Lançar ${totalUnits} unidade(s) via Tiny</button>
+    <p class="hint-text" id="tinyLaunchResult"></p>`;
+
+  wrap.querySelector("#btnLaunchViaApi")!.addEventListener("click", async () => {
+    const select = wrap.querySelector<HTMLSelectElement>("#tinyWarehouseSelect")!;
+    const warehouseId = select.value;
+    const warehouseName = select.options[select.selectedIndex]?.text || "";
+    const unitPriceRaw = (wrap.querySelector<HTMLInputElement>("#tinyUnitPrice")!).value;
+    const note = (wrap.querySelector<HTMLTextAreaElement>("#tinyNote")!).value;
+
+    const confirmed = await confirmAction({
+      title: "Lançar via API do Tiny?",
+      message: `O GoScan vai chamar a API do Tiny agora e criar a entrada de estoque real pra cada SKU do lote no depósito "${warehouseName}". Isso não pode ser desfeito automaticamente.`,
+      confirmLabel: "Lançar agora",
+    });
+    if (!confirmed) return;
+
+    const btn = wrap.querySelector<HTMLButtonElement>("#btnLaunchViaApi")!;
+    const resultEl = wrap.querySelector<HTMLElement>("#tinyLaunchResult")!;
+    btn.disabled = true;
+    btn.textContent = "Lançando…";
+    try {
+      const outcome = await launchReturnBatchToTiny(batchId, {
+        warehouseId,
+        warehouseName,
+        unitPrice: unitPriceRaw ? Number(unitPriceRaw) : undefined,
+        note: note || undefined,
+      });
+      showToast(describeLaunchOutcome(outcome), outcome.summary.allSucceeded ? "success" : "error");
+      if (!outcome.summary.allSucceeded) {
+        const failedList = outcome.results
+          .filter((r) => r.status === "failed")
+          .map((r) => r.error)
+          .join(" | ");
+        resultEl.textContent = `Itens com falha: ${failedList}`;
+      }
+      void renderBatchDetailView(root, ctx, batchIdForReload);
+    } catch (err) {
+      showToast("Erro ao lançar via Tiny: " + describeError(err), "error");
+      btn.disabled = false;
+      btn.textContent = `Lançar ${totalUnits} unidade(s) via Tiny`;
+    }
+  });
 }
