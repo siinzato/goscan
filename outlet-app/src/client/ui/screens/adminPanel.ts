@@ -23,9 +23,13 @@ import {
   getUserPermissions,
   setUserPermissions,
   listAuditLogs,
-  listIntegrations,
-  saveIntegrationCredentials,
-  clearIntegrationCredentials,
+  listIntegrationConnections,
+  createIntegrationConnection,
+  updateIntegrationConnection,
+  setIntegrationConnectionActive,
+  removeIntegrationConnection,
+  saveIntegrationConnectionCredentials,
+  clearIntegrationConnectionCredentials,
   type Role,
   type AdminOverview,
   type AdminUserRow,
@@ -33,7 +37,8 @@ import {
   type PermissionRow,
   type AuditLogRow,
   type IntegrationProvider,
-  type IntegrationRow,
+  type IntegrationConnection,
+  type IntegrationProviderGroup,
 } from "../../adminApi.ts";
 import { INTEGRATION_PROVIDER_META, INTEGRATION_STATUS_META, type ProviderInfo } from "./profileIntegrations.ts";
 import { testTinyConnection } from "../../tinyIntegrationApi.ts";
@@ -1044,7 +1049,15 @@ async function loadPermissionsChecklist(content: HTMLElement): Promise<void> {
 
 // ---------------------------------------------------------------------------
 // Integrações — cadastro real das credenciais de API do ERP (Tiny/Olist) e
-// dos marketplaces. Todo o CRUD passa pela Edge Function admin-users
+// dos marketplaces. Cada marketplace suporta até 4 lojas/conexões
+// independentes (nome, credenciais, tokens, status e logs próprios — editar
+// ou remover uma nunca afeta as outras). O Tiny NÃO faz parte deste recurso
+// (pedido, seção 9: não é um marketplace, continua com exatamente 1 conexão,
+// UX inalterada) — a única distinção por provedor em toda esta tela é
+// `isTiny`, usada só pra decidir se mostra a lista de lojas + "Adicionar
+// loja" ou o card único de sempre; todo o resto (criar/editar/testar/
+// ativar/remover) é um único modelo genérico de conexão reutilizado por
+// qualquer provedor. Todo o CRUD passa pela Edge Function admin-users
 // (service_role) — nunca lê/escreve integration_credentials direto (essa
 // tabela tem RLS habilitado e ZERO policies, então nem conseguiria). Nenhum
 // segredo em texto puro chega aqui depois de salvo, só um resumo mascarado.
@@ -1053,7 +1066,7 @@ async function renderIntegrationsTab(content: HTMLElement): Promise<void> {
   content.innerHTML = `
     <div class="card">
       <h3>${Icon.link}Credenciais de integração</h3>
-      <p class="hint-text">Cadastre aqui as chaves de API do ERP e dos marketplaces. Elas ficam guardadas com segurança no backend — nunca aparecem novamente em texto completo, e nenhuma chamada externa é feita automaticamente só por estarem salvas aqui.</p>
+      <p class="hint-text">Cadastre aqui as chaves de API do ERP e as lojas de cada marketplace (até 4 lojas por marketplace). Elas ficam guardadas com segurança no backend — nunca aparecem novamente em texto completo, e nenhuma chamada externa é feita automaticamente só por estarem salvas aqui.</p>
     </div>
     <div id="integrationsListWrap"><div class="skeleton skeleton-card"></div></div>`;
 
@@ -1062,25 +1075,44 @@ async function renderIntegrationsTab(content: HTMLElement): Promise<void> {
 
 async function loadIntegrationsList(content: HTMLElement): Promise<void> {
   const wrap = content.querySelector<HTMLElement>("#integrationsListWrap")!;
-  let integrations: IntegrationRow[];
+  let providers: IntegrationProviderGroup[];
   try {
-    integrations = await listIntegrations();
+    providers = await listIntegrationConnections();
   } catch (err) {
     renderErrorWithRetry(wrap, "Erro ao carregar integrações: " + describeError(err), () => void loadIntegrationsList(content));
     return;
   }
 
-  const byProvider = new Map(integrations.map((i) => [i.provider, i]));
-  wrap.innerHTML = `<div class="product-card-list">${INTEGRATION_PROVIDER_META.map((meta) => renderIntegrationCard(meta, byProvider.get(meta.key) ?? null)).join("")}</div>`;
+  providersCache = providers;
+  const byProvider = new Map(providers.map((p) => [p.provider, p]));
+  wrap.innerHTML = INTEGRATION_PROVIDER_META.map((meta) =>
+    renderProviderGroup(meta, byProvider.get(meta.key) ?? { provider: meta.key, connections: [], count: 0, limit: 4 })
+  ).join("");
 
-  wrap.querySelectorAll<HTMLButtonElement>("[data-integration-configure]").forEach((btn) => {
+  wireIntegrationsListEvents(content, wrap);
+}
+
+function wireIntegrationsListEvents(content: HTMLElement, wrap: HTMLElement): void {
+  wrap.querySelectorAll<HTMLButtonElement>("[data-add-connection]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const provider = btn.dataset.integrationConfigure as IntegrationProvider;
+      const provider = btn.dataset.addConnection as IntegrationProvider;
       const meta = INTEGRATION_PROVIDER_META.find((m) => m.key === provider)!;
-      openIntegrationCredentialsModal(content, meta, byProvider.get(provider) ?? null);
+      openConnectionMetaModal(content, meta, null);
     });
   });
-  wrap.querySelectorAll<HTMLButtonElement>("[data-integration-test]").forEach((btn) => {
+  wrap.querySelectorAll<HTMLButtonElement>("[data-conn-rename]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const { meta, connection } = findConnectionContext(providersCache, btn.dataset.connRename!);
+      if (connection) openConnectionMetaModal(content, meta, connection);
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-conn-credentials]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const { meta, connection } = findConnectionContext(providersCache, btn.dataset.connCredentials!);
+      if (connection) openIntegrationCredentialsModal(content, meta, connection);
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-conn-test]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       btn.disabled = true;
       const originalText = btn.textContent;
@@ -1097,10 +1129,49 @@ async function loadIntegrationsList(content: HTMLElement): Promise<void> {
       }
     });
   });
-  wrap.querySelectorAll<HTMLButtonElement>("[data-integration-clear]").forEach((btn) => {
+  wrap.querySelectorAll<HTMLButtonElement>("[data-conn-test-stub]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const { meta } = findConnectionContext(providersCache, btn.dataset.connTestStub!);
+      showToast(`Verificação automática de conexão ainda não implementada para ${meta.name} — disponível hoje apenas para o Tiny.`, "default");
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-conn-toggle-active]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const provider = btn.dataset.integrationClear as IntegrationProvider;
-      const meta = INTEGRATION_PROVIDER_META.find((m) => m.key === provider)!;
+      const connectionId = btn.dataset.connToggleActive!;
+      const nextActive = btn.dataset.connActive !== "true";
+      try {
+        await setIntegrationConnectionActive(connectionId, nextActive);
+        showToast(nextActive ? "Loja ativada." : "Loja desativada.", "success");
+        await loadIntegrationsList(content);
+      } catch (err) {
+        showToast(describeError(err), "error");
+      }
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-conn-remove]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const { meta, connection } = findConnectionContext(providersCache, btn.dataset.connRemove!);
+      if (!connection) return;
+      const confirmed = await confirmAction({
+        title: "Remover loja?",
+        message: `A loja "${connection.display_name || meta.name}" e todas as credenciais salvas nela serão removidas. Esta ação não pode ser desfeita.`,
+        confirmLabel: "Remover",
+        danger: true,
+      });
+      if (!confirmed) return;
+      try {
+        await removeIntegrationConnection(connection.id);
+        showToast("Loja removida.", "success");
+        await loadIntegrationsList(content);
+      } catch (err) {
+        showToast(describeError(err), "error");
+      }
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-conn-clear-credentials]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const { meta, connection } = findConnectionContext(providersCache, btn.dataset.connClearCredentials!);
+      if (!connection) return;
       const confirmed = await confirmAction({
         title: "Remover credenciais?",
         message: `As credenciais salvas de "${meta.name}" serão apagadas e o status volta para "Não configurada". Esta ação não pode ser desfeita.`,
@@ -1109,7 +1180,7 @@ async function loadIntegrationsList(content: HTMLElement): Promise<void> {
       });
       if (!confirmed) return;
       try {
-        await clearIntegrationCredentials(provider);
+        await clearIntegrationConnectionCredentials(connection.id);
         showToast("Credenciais removidas.", "success");
         await loadIntegrationsList(content);
       } catch (err) {
@@ -1119,48 +1190,193 @@ async function loadIntegrationsList(content: HTMLElement): Promise<void> {
   });
 }
 
-function renderIntegrationCard(meta: ProviderInfo, row: IntegrationRow | null): string {
-  const status = row?.status ?? "not_configured";
-  const s = INTEGRATION_STATUS_META[status];
-  const cred = row?.credential;
-  const summaryLines: string[] = [];
-  if (cred) {
-    if (cred.client_id) summaryLines.push(`Client ID: ${escapeHtml(cred.client_id)}`);
-    if (cred.client_secret_masked) summaryLines.push(`Client Secret: ${cred.client_secret_masked}`);
-    if (cred.access_token_masked) summaryLines.push(`Token de acesso: ${cred.access_token_masked}`);
-    if (cred.refresh_token_masked) summaryLines.push(`Token de atualização: ${cred.refresh_token_masked}`);
-    if (cred.external_account_id) summaryLines.push(`Conta/Loja: ${escapeHtml(cred.external_account_id)}`);
-    if (cred.scopes) summaryLines.push(`Escopos: ${escapeHtml(cred.scopes)}`);
+/** Cache em memória da última listagem carregada — só pra resolver qual loja um botão da lista se refere sem re-buscar a rede a cada clique (a lista inteira já está na tela). Sempre reatribuído em loadIntegrationsList antes de renderizar. */
+let providersCache: IntegrationProviderGroup[] = [];
+
+function findConnectionContext(providers: IntegrationProviderGroup[], connectionId: string): { meta: ProviderInfo; connection: IntegrationConnection | null } {
+  for (const group of providers) {
+    const connection = group.connections.find((c) => c.id === connectionId);
+    if (connection) return { meta: INTEGRATION_PROVIDER_META.find((m) => m.key === group.provider)!, connection };
+  }
+  return { meta: INTEGRATION_PROVIDER_META[0], connection: null };
+}
+
+function renderProviderGroup(meta: ProviderInfo, group: IntegrationProviderGroup): string {
+  const isTiny = meta.key === "tiny";
+  if (isTiny) {
+    // Tiny sempre tem exatamente 1 conexão (garantida por migration 0052) — UX idêntica à de antes de existir múltiplas lojas.
+    const connection = group.connections[0] ?? null;
+    return `
+      <div class="card" data-provider-group="${meta.key}">
+        <div class="product-card-top">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="integration-provider-icon">${meta.icon}</span>
+            <p class="product-card-name">${escapeHtml(meta.name)}</p>
+          </div>
+        </div>
+        <p class="hint-text" style="margin:4px 0 10px">${escapeHtml(meta.description)}</p>
+        ${connection ? renderConnectionCard(meta, connection, { multiStore: false }) : `<p class="hint-text">Configuração ainda não disponível.</p>`}
+      </div>`;
   }
 
+  const reached = group.count >= group.limit;
   return `
-    <div class="product-card" data-integration-row="${meta.key}">
+    <div class="card" data-provider-group="${meta.key}">
       <div class="product-card-top">
         <div style="display:flex;align-items:center;gap:8px">
           <span class="integration-provider-icon">${meta.icon}</span>
           <p class="product-card-name">${escapeHtml(meta.name)}</p>
         </div>
+        <span class="status-badge info">${group.count} de ${group.limit} lojas</span>
+      </div>
+      <p class="hint-text" style="margin:4px 0 10px">${escapeHtml(meta.description)}</p>
+      <div class="product-card-list">
+        ${group.connections.map((c) => renderConnectionCard(meta, c, { multiStore: true })).join("")}
+      </div>
+      ${group.connections.length === 0 ? `<p class="hint-text" style="margin-top:8px">Nenhuma loja cadastrada ainda para ${escapeHtml(meta.name)}.</p>` : ""}
+      ${
+        reached
+          ? `<p class="hint-text" style="margin-top:10px">${Icon.alertTriangle}Limite de 4 lojas atingido para este marketplace.</p>`
+          : `<button type="button" class="btn-secondary" style="margin-top:10px" data-add-connection="${meta.key}">${Icon.plus}Adicionar loja</button>`
+      }
+    </div>`;
+}
+
+function renderConnectionCard(meta: ProviderInfo, c: IntegrationConnection, opts: { multiStore: boolean }): string {
+  const s = !c.is_active ? { text: "Desativada", badge: "offline", icon: Icon.pause } : INTEGRATION_STATUS_META[c.status];
+  const cred = c.credential;
+  const metaLine: string[] = [];
+  if (c.brand) metaLine.push(`Marca: ${escapeHtml(c.brand)}`);
+  if (c.branch) metaLine.push(`Unidade: ${escapeHtml(c.branch)}`);
+  if (c.fulfillment_mode) metaLine.push(`Modalidade: ${escapeHtml(c.fulfillment_mode)}`);
+  if (cred?.external_account_id) metaLine.push(`Conta/Loja: ${escapeHtml(cred.external_account_id)}`);
+  if (c.last_sync_at) metaLine.push(`Última sinc.: ${formatDateTime(c.last_sync_at)}`);
+  if (cred?.client_id) metaLine.push(`Client ID: ${escapeHtml(cred.client_id)}`);
+  if (cred?.client_secret_masked) metaLine.push(`Client Secret: ${cred.client_secret_masked}`);
+  if (cred?.access_token_masked) metaLine.push(`Token de acesso: ${cred.access_token_masked}`);
+  if (cred?.refresh_token_masked) metaLine.push(`Token de atualização: ${cred.refresh_token_masked}`);
+  if (cred?.scopes) metaLine.push(`Escopos: ${escapeHtml(cred.scopes)}`);
+  if (c.last_error) metaLine.push(`Último erro: ${escapeHtml(c.last_error)}`);
+
+  const credentialsLabel = cred ? (c.status === "auth_error" ? "Reconectar" : "Editar credenciais") : "Configurar";
+
+  return `
+    <div class="product-card" data-connection-row="${c.id}">
+      <div class="product-card-top">
+        <p class="product-card-name">${escapeHtml(c.display_name || meta.name)}</p>
         <span class="status-badge ${s.badge}">${s.icon}${s.text}</span>
       </div>
-      <p class="hint-text" style="margin:4px 0">${escapeHtml(meta.description)}</p>
-      ${summaryLines.length > 0 ? `<div class="product-card-meta">${summaryLines.map((l) => `<span>${l}</span>`).join("")}</div>` : ""}
+      ${metaLine.length > 0 ? `<div class="product-card-meta">${metaLine.map((l) => `<span>${l}</span>`).join("")}</div>` : ""}
       <div class="review-actions" style="margin-top:8px">
-        <button type="button" class="btn-secondary" data-integration-configure="${meta.key}">${Icon.key}${cred ? "Editar credenciais" : "Configurar"}</button>
+        <button type="button" class="btn-secondary" data-conn-credentials="${c.id}">${Icon.key}${credentialsLabel}</button>
+        ${opts.multiStore ? `<button type="button" class="btn-secondary" data-conn-rename="${c.id}">${Icon.pencil}Renomear</button>` : ""}
         ${
-          cred && meta.key === "tiny"
-            ? `<button type="button" class="btn-secondary" data-integration-test="${meta.key}">${Icon.refresh}Testar conexão</button>`
+          cred
+            ? meta.key === "tiny"
+              ? `<button type="button" class="btn-secondary" data-conn-test="${c.id}">${Icon.refresh}Testar conexão</button>`
+              : `<button type="button" class="btn-secondary" data-conn-test-stub="${c.id}">${Icon.refresh}Testar conexão</button>`
             : ""
         }
-        ${cred ? `<button type="button" class="btn-danger" data-integration-clear="${meta.key}">${Icon.trash}Remover</button>` : ""}
+        ${
+          opts.multiStore
+            ? `<button type="button" class="btn-secondary" data-conn-toggle-active="${c.id}" data-conn-active="${c.is_active}">${c.is_active ? `${Icon.userX}Desativar` : `${Icon.checkCircle}Ativar`}</button>`
+            : ""
+        }
+        ${
+          opts.multiStore
+            ? `<button type="button" class="btn-danger" data-conn-remove="${c.id}">${Icon.trash}Remover loja</button>`
+            : cred
+              ? `<button type="button" class="btn-danger" data-conn-clear-credentials="${c.id}">${Icon.trash}Remover</button>`
+              : ""
+        }
       </div>
     </div>`;
 }
 
-function openIntegrationCredentialsModal(content: HTMLElement, meta: ProviderInfo, existing: IntegrationRow | null): void {
-  const cred = existing?.credential;
-  const { close } = openModal(
+/** Criar loja (provider + null) ou editar nome/marca/unidade/modalidade de uma já existente (provider + existing) — mesmo modelo genérico de conexão, mesmo formulário. */
+function openConnectionMetaModal(content: HTMLElement, meta: ProviderInfo, existing: IntegrationConnection | null): void {
+  const isCreate = !existing;
+  const { overlay, close } = openModal(
     `
-    <h3 id="intCredTitle">${Icon.key}${escapeHtml(meta.name)}</h3>
+    <h3 id="connMetaTitle">${isCreate ? `${Icon.plus}Adicionar loja — ${escapeHtml(meta.name)}` : `${Icon.pencil}Editar loja`}</h3>
+    ${!isCreate ? `<p class="hint-text">Deixe um campo em branco pra manter o valor atual.</p>` : ""}
+    <form id="connMetaForm" novalidate>
+      <label for="cmName">Nome/apelido da loja</label>
+      <input type="text" id="cmName" autocomplete="off" value="${escapeHtml(existing?.display_name || "")}" placeholder="Ex.: Az — ML Fulfillment" />
+
+      <label for="cmBrand">Empresa/marca</label>
+      <input type="text" id="cmBrand" autocomplete="off" value="${escapeHtml(existing?.brand || "")}" placeholder="Ex.: az, gocase" />
+
+      <label for="cmBranch">Unidade/filial</label>
+      <input type="text" id="cmBranch" autocomplete="off" value="${escapeHtml(existing?.branch || "")}" placeholder="Ex.: principal, filial 02" />
+
+      <label for="cmFulfillment">Modalidade logística</label>
+      <input type="text" id="cmFulfillment" autocomplete="off" value="${escapeHtml(existing?.fulfillment_mode || "")}" placeholder="Ex.: fba_classic, fulfillment" />
+
+      <p class="error-box" id="cmError" hidden></p>
+      <div class="modal-actions">
+        <button type="button" class="btn-secondary" id="cmCancel">Cancelar</button>
+        <button type="submit" class="btn-primary" id="cmSubmit">${isCreate ? "Adicionar loja" : "Salvar"}</button>
+      </div>
+    </form>`,
+    "connMetaTitle"
+  );
+  overlay.querySelector("#cmCancel")!.addEventListener("click", close);
+  overlay.querySelector("#connMetaForm")!.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errorEl = overlay.querySelector<HTMLElement>("#cmError")!;
+    const submitBtn = overlay.querySelector<HTMLButtonElement>("#cmSubmit")!;
+    errorEl.hidden = true;
+
+    const display_name = overlay.querySelector<HTMLInputElement>("#cmName")!.value.trim();
+    const brand = overlay.querySelector<HTMLInputElement>("#cmBrand")!.value.trim();
+    const branch = overlay.querySelector<HTMLInputElement>("#cmBranch")!.value.trim();
+    const fulfillment_mode = overlay.querySelector<HTMLInputElement>("#cmFulfillment")!.value.trim();
+    if (isCreate && !display_name) {
+      errorEl.textContent = "Informe um nome para a loja.";
+      errorEl.hidden = false;
+      return;
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = isCreate ? "Adicionando…" : "Salvando…";
+    try {
+      if (isCreate) {
+        await createIntegrationConnection({
+          provider: meta.key,
+          display_name,
+          brand: brand || undefined,
+          branch: branch || undefined,
+          fulfillment_mode: fulfillment_mode || undefined,
+        });
+        showToast("Loja adicionada.", "success");
+      } else {
+        await updateIntegrationConnection({
+          connectionId: existing!.id,
+          display_name: display_name || undefined,
+          brand: brand || undefined,
+          branch: branch || undefined,
+          fulfillment_mode: fulfillment_mode || undefined,
+        });
+        showToast("Loja atualizada.", "success");
+      }
+      close();
+      await loadIntegrationsList(content);
+    } catch (err) {
+      errorEl.textContent = describeError(err);
+      errorEl.hidden = false;
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = isCreate ? "Adicionar loja" : "Salvar";
+    }
+  });
+}
+
+function openIntegrationCredentialsModal(content: HTMLElement, meta: ProviderInfo, existing: IntegrationConnection): void {
+  const cred = existing.credential;
+  const { overlay, close } = openModal(
+    `
+    <h3 id="intCredTitle">${Icon.key}${escapeHtml(existing.display_name || meta.name)}</h3>
     <p class="hint-text">Os campos abaixo já preenchidos com "•" ficam salvos — deixe em branco pra manter o valor atual, ou digite um novo valor pra substituí-lo.</p>
     <form id="intCredForm">
       <label for="icClientId">Client ID</label>
@@ -1190,21 +1406,20 @@ function openIntegrationCredentialsModal(content: HTMLElement, meta: ProviderInf
     </form>`,
     "intCredTitle"
   );
-  const modalRoot = document.querySelector(".modal-overlay:last-of-type")!;
-  modalRoot.querySelector("#icCancel")!.addEventListener("click", close);
-  modalRoot.querySelector("#intCredForm")!.addEventListener("submit", async (e) => {
+  overlay.querySelector("#icCancel")!.addEventListener("click", close);
+  overlay.querySelector("#intCredForm")!.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const errorEl = modalRoot.querySelector<HTMLElement>("#icError")!;
-    const submitBtn = modalRoot.querySelector<HTMLButtonElement>("#icSubmit")!;
+    const errorEl = overlay.querySelector<HTMLElement>("#icError")!;
+    const submitBtn = overlay.querySelector<HTMLButtonElement>("#icSubmit")!;
     errorEl.hidden = true;
 
     const fields = {
-      client_id: (modalRoot.querySelector<HTMLInputElement>("#icClientId")!).value.trim(),
-      client_secret: (modalRoot.querySelector<HTMLInputElement>("#icClientSecret")!).value.trim(),
-      access_token: (modalRoot.querySelector<HTMLInputElement>("#icAccessToken")!).value.trim(),
-      refresh_token: (modalRoot.querySelector<HTMLInputElement>("#icRefreshToken")!).value.trim(),
-      external_account_id: (modalRoot.querySelector<HTMLInputElement>("#icAccountId")!).value.trim(),
-      scopes: (modalRoot.querySelector<HTMLInputElement>("#icScopes")!).value.trim(),
+      client_id: overlay.querySelector<HTMLInputElement>("#icClientId")!.value.trim(),
+      client_secret: overlay.querySelector<HTMLInputElement>("#icClientSecret")!.value.trim(),
+      access_token: overlay.querySelector<HTMLInputElement>("#icAccessToken")!.value.trim(),
+      refresh_token: overlay.querySelector<HTMLInputElement>("#icRefreshToken")!.value.trim(),
+      external_account_id: overlay.querySelector<HTMLInputElement>("#icAccountId")!.value.trim(),
+      scopes: overlay.querySelector<HTMLInputElement>("#icScopes")!.value.trim(),
     };
     if (!Object.values(fields).some((v) => v)) {
       errorEl.textContent = "Preencha pelo menos um campo.";
@@ -1215,7 +1430,7 @@ function openIntegrationCredentialsModal(content: HTMLElement, meta: ProviderInf
     submitBtn.disabled = true;
     submitBtn.textContent = "Salvando…";
     try {
-      await saveIntegrationCredentials({ provider: meta.key, ...fields });
+      await saveIntegrationConnectionCredentials({ connectionId: existing.id, ...fields });
       showToast("Credenciais salvas com segurança.", "success");
       close();
       await loadIntegrationsList(content);
@@ -1282,6 +1497,11 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   user_create_partial_failure: "Criação de usuário incompleta",
   integration_credentials_saved: "Credenciais de integração salvas",
   integration_credentials_cleared: "Credenciais de integração removidas",
+  integration_connection_created: "Loja de integração criada",
+  integration_connection_updated: "Loja de integração editada",
+  integration_connection_activated: "Loja de integração ativada",
+  integration_connection_deactivated: "Loja de integração desativada",
+  integration_connection_removed: "Loja de integração removida",
 };
 
 async function loadAuditPage(content: HTMLElement): Promise<void> {

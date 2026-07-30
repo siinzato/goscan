@@ -120,9 +120,13 @@ export const ADMIN_ACTIONS = [
   "get_user_permissions",
   "set_user_permissions",
   "list_audit_logs",
-  "list_integrations",
-  "save_integration_credentials",
-  "clear_integration_credentials",
+  "list_integration_connections",
+  "create_integration_connection",
+  "update_integration_connection",
+  "set_integration_connection_active",
+  "remove_integration_connection",
+  "save_integration_connection_credentials",
+  "clear_integration_connection_credentials",
 ] as const;
 export type AdminAction = (typeof ADMIN_ACTIONS)[number];
 
@@ -198,4 +202,40 @@ export function maskSecret(value: string | null | undefined): string | null {
   if (!value) return null;
   if (value.length <= 4) return "••••";
   return `••••${value.slice(-4)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Múltiplas lojas por marketplace (até 4) — cada linha de integration_providers
+// agora é uma CONEXÃO/LOJA independente, nunca "Loja1/Loja2/.../Loja4" como
+// colunas fixas (ver migration 0052). Estes campos de identificação (nome,
+// marca, unidade, modalidade logística) são os mesmos pra qualquer provedor —
+// nunca um `if (provider === 'mercado_livre')` espalhado pelo código (pedido,
+// seção 10).
+// ---------------------------------------------------------------------------
+const CONNECTION_META_FIELDS = ["display_name", "brand", "branch", "fulfillment_mode"] as const;
+export type ConnectionMetaField = (typeof CONNECTION_META_FIELDS)[number];
+export type ConnectionMetaInput = Partial<Record<ConnectionMetaField, string>>;
+
+/** Mesmo padrão de sanitizeCredentialFields: só os 4 campos reconhecidos, aparados, nunca vazio — usado tanto pra criar quanto pra editar uma loja/conexão. */
+export function sanitizeConnectionMetaFields(body: Record<string, unknown>): ConnectionMetaInput {
+  const out: ConnectionMetaInput = {};
+  for (const field of CONNECTION_META_FIELDS) {
+    const value = body[field];
+    if (typeof value === "string" && value.trim()) out[field] = value.trim();
+  }
+  return out;
+}
+
+/**
+ * Limite real de lojas/conexões por marketplace por empresa (pedido, seção
+ * 1/12/17: até 4, independente do provedor). Mesmo valor de MAX_CONNECTIONS_PER_PROVIDER
+ * espelhado no trigger protect_integration_connection_limit (migration
+ * 0052) — aqui só devolve um erro amigável ANTES de tentar o insert; o
+ * trigger no banco é a garantia incondicional por baixo (mesmo padrão de
+ * defesa em profundidade de wouldLeaveZeroSuperAdmins + protect_last_super_admin).
+ */
+export const MAX_CONNECTIONS_PER_PROVIDER = 4;
+
+export function hasReachedConnectionLimit(currentCount: number): boolean {
+  return currentCount >= MAX_CONNECTIONS_PER_PROVIDER;
 }

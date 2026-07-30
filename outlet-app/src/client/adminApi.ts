@@ -224,12 +224,14 @@ export async function listAuditLogs(params: ListAuditParams): Promise<ListAuditR
 }
 
 // ---------------------------------------------------------------------------
-// Integrações (ERP/marketplace) — credenciais reais de API. Todo o CRUD passa
-// pela Edge Function (service_role) — integration_credentials tem RLS
-// habilitado e ZERO policies, então o Supabase client nunca consegue
-// ler/escrever essa tabela direto, com ou sem esta camada. O que volta aqui
-// nunca inclui o segredo em texto puro, só um resumo mascarado (ver
-// maskSecret em supabase/functions/admin-users/logic.ts).
+// Integrações (ERP/marketplace) — até 4 lojas/conexões independentes por
+// marketplace (nome, credenciais, tokens, status e logs próprios — nunca
+// colunas fixas Loja1/2/3/4, cada uma é um registro independente vinculado
+// ao provedor). Todo o CRUD passa pela Edge Function (service_role) —
+// integration_credentials tem RLS habilitado e ZERO policies, então o
+// Supabase client nunca consegue ler/escrever essa tabela direto, com ou sem
+// esta camada. O que volta aqui nunca inclui o segredo em texto puro, só um
+// resumo mascarado (ver maskSecret em supabase/functions/admin-users/logic.ts).
 // ---------------------------------------------------------------------------
 export type IntegrationProvider = "tiny" | "marketplace_mercado_livre" | "marketplace_shopee" | "marketplace_shein" | "marketplace_amazon" | "marketplace_tiktok";
 export type IntegrationStatus = "not_configured" | "configuration_incomplete" | "connected" | "auth_error" | "sync_paused";
@@ -245,18 +247,48 @@ export interface IntegrationCredentialSummary {
   updated_at: string;
 }
 
-export interface IntegrationRow {
+export interface IntegrationConnection {
+  id: string;
   provider: IntegrationProvider;
+  display_name: string | null;
+  brand: string | null;
+  branch: string | null;
+  fulfillment_mode: string | null;
   status: IntegrationStatus;
+  is_active: boolean;
   last_sync_at: string | null;
   next_retry_at: string | null;
   last_error: string | null;
-  updated_at: string | null;
+  created_at: string;
+  updated_at: string;
   credential: IntegrationCredentialSummary | null;
 }
 
-export interface SaveIntegrationCredentialsParams {
+export interface IntegrationProviderGroup {
   provider: IntegrationProvider;
+  connections: IntegrationConnection[];
+  count: number;
+  limit: number;
+}
+
+export interface CreateIntegrationConnectionParams {
+  provider: IntegrationProvider;
+  display_name: string;
+  brand?: string;
+  branch?: string;
+  fulfillment_mode?: string;
+}
+
+export interface UpdateIntegrationConnectionParams {
+  connectionId: string;
+  display_name?: string;
+  brand?: string;
+  branch?: string;
+  fulfillment_mode?: string;
+}
+
+export interface SaveIntegrationConnectionCredentialsParams {
+  connectionId: string;
   client_id?: string;
   client_secret?: string;
   access_token?: string;
@@ -265,15 +297,31 @@ export interface SaveIntegrationCredentialsParams {
   scopes?: string;
 }
 
-export async function listIntegrations(): Promise<IntegrationRow[]> {
-  const data = await invokeAdmin<{ integrations: IntegrationRow[] }>("list_integrations");
-  return data.integrations;
+export async function listIntegrationConnections(): Promise<IntegrationProviderGroup[]> {
+  const data = await invokeAdmin<{ providers: IntegrationProviderGroup[] }>("list_integration_connections");
+  return data.providers;
 }
 
-export async function saveIntegrationCredentials(params: SaveIntegrationCredentialsParams): Promise<void> {
-  await invokeAdmin("save_integration_credentials", params);
+export async function createIntegrationConnection(params: CreateIntegrationConnectionParams): Promise<{ connectionId: string }> {
+  return invokeAdmin("create_integration_connection", params);
 }
 
-export async function clearIntegrationCredentials(provider: IntegrationProvider): Promise<void> {
-  await invokeAdmin("clear_integration_credentials", { provider });
+export async function updateIntegrationConnection(params: UpdateIntegrationConnectionParams): Promise<void> {
+  await invokeAdmin("update_integration_connection", params);
+}
+
+export async function setIntegrationConnectionActive(connectionId: string, active: boolean): Promise<void> {
+  await invokeAdmin("set_integration_connection_active", { connectionId, active });
+}
+
+export async function removeIntegrationConnection(connectionId: string): Promise<void> {
+  await invokeAdmin("remove_integration_connection", { connectionId });
+}
+
+export async function saveIntegrationConnectionCredentials(params: SaveIntegrationConnectionCredentialsParams): Promise<void> {
+  await invokeAdmin("save_integration_connection_credentials", params);
+}
+
+export async function clearIntegrationConnectionCredentials(connectionId: string): Promise<void> {
+  await invokeAdmin("clear_integration_connection_credentials", { connectionId });
 }

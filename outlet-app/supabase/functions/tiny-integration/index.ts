@@ -107,8 +107,26 @@ Deno.serve(async (req) => {
     return data === true;
   }
 
+  /**
+   * O Tiny não faz parte do recurso de múltiplas lojas por marketplace
+   * (pedido explícito: "não presumir que o Tiny precisa de 4 conexões
+   * nesta etapa") — continua com exatamente 1 conexão real por empresa. Mas
+   * como integration_providers agora permite, estruturalmente, mais de uma
+   * linha por (company_id, provider) [migration 0052], troca .maybeSingle()
+   * (que quebraria se alguma dia existisse mais de uma) por "a conexão ativa
+   * mais antiga" — resultado idêntico hoje (só existe 1), e seguro mesmo se
+   * isso mudar no futuro.
+   */
   async function loadCredentials(): Promise<{ providerId: string; credentials: TinyCredentials } | null> {
-    const { data: providerRow } = await admin.from("integration_providers").select("id").eq("company_id", caller.company_id).eq("provider", "tiny").maybeSingle();
+    const { data: providerRows } = await admin
+      .from("integration_providers")
+      .select("id")
+      .eq("company_id", caller.company_id)
+      .eq("provider", "tiny")
+      .eq("is_active", true)
+      .order("created_at", { ascending: true })
+      .limit(1);
+    const providerRow = providerRows?.[0];
     if (!providerRow) return null;
     const { data: credRow } = await admin
       .from("integration_credentials")

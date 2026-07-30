@@ -16,6 +16,9 @@ import {
   sanitizeCredentialFields,
   hasAnyCredentialField,
   maskSecret,
+  sanitizeConnectionMetaFields,
+  hasReachedConnectionLimit,
+  MAX_CONNECTIONS_PER_PROVIDER,
 } from "../supabase/functions/admin-users/logic.ts";
 
 test("isValidRole aceita só os 4 papéis reais", () => {
@@ -218,4 +221,39 @@ test("maskSecret nunca inclui o valor original na saída (nem parcialmente além
   const secret = "sk_live_TOPSECRETVALUE9999";
   const masked = maskSecret(secret);
   assert.equal(masked.includes(secret.slice(0, -4)), false);
+});
+
+// ---------------------------------------------------------------------------
+// Múltiplas lojas por marketplace (até 4) — identificação de cada conexão.
+// ---------------------------------------------------------------------------
+test("sanitizeConnectionMetaFields aceita só os 4 campos reconhecidos, aparados, ignorando vazios e campos desconhecidos", () => {
+  const out = sanitizeConnectionMetaFields({
+    display_name: "  Az — FBA Classic  ",
+    brand: "az",
+    branch: "",
+    fulfillment_mode: "fba_classic",
+    provider: "marketplace_amazon", // reconhecido em outro contexto, mas não é campo de metadado de conexão
+    client_secret: "nunca-deveria-vazar-aqui",
+  });
+  assert.deepEqual(out, {
+    display_name: "Az — FBA Classic",
+    brand: "az",
+    fulfillment_mode: "fba_classic",
+  });
+  assert.equal("branch" in out, false);
+  assert.equal("provider" in out, false);
+  assert.equal("client_secret" in out, false);
+});
+
+test("sanitizeConnectionMetaFields devolve objeto vazio quando não há nenhum campo válido", () => {
+  assert.deepEqual(sanitizeConnectionMetaFields({}), {});
+  assert.deepEqual(sanitizeConnectionMetaFields({ display_name: 123, foo: "bar" }), {});
+});
+
+test("hasReachedConnectionLimit bloqueia a 5a loja, nunca a 4a", () => {
+  assert.equal(MAX_CONNECTIONS_PER_PROVIDER, 4);
+  assert.equal(hasReachedConnectionLimit(0), false);
+  assert.equal(hasReachedConnectionLimit(3), false);
+  assert.equal(hasReachedConnectionLimit(4), true);
+  assert.equal(hasReachedConnectionLimit(5), true);
 });

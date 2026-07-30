@@ -28,6 +28,9 @@ import {
   sanitizeCredentialFields,
   hasAnyCredentialField,
   maskSecret,
+  sanitizeConnectionMetaFields,
+  hasReachedConnectionLimit,
+  MAX_CONNECTIONS_PER_PROVIDER,
   INTEGRATION_PROVIDERS,
   type Role,
 } from "./logic.ts";
@@ -176,6 +179,22 @@ Deno.serve(async (req) => {
     const { data, error } = await admin.from("profiles").select("id, role, active, full_name, email").eq("id", userId).maybeSingle();
     if (error || !data) return null;
     return data as TargetProfile;
+  }
+
+  interface IntegrationConnectionRow {
+    id: string;
+    provider: string;
+    company_id: string;
+    display_name: string | null;
+  }
+
+  /** Carrega uma loja/conexão e confirma que pertence à empresa do chamador — nunca revela nem que uma conexão de outra empresa existe (mesmo NOT_FOUND pros dois casos, ver pedido seção 6). */
+  async function loadConnection(connectionId: unknown): Promise<IntegrationConnectionRow | null> {
+    if (typeof connectionId !== "string" || !connectionId) return null;
+    const { data, error } = await admin.from("integration_providers").select("id, provider, company_id, display_name").eq("id", connectionId).maybeSingle();
+    if (error || !data) return null;
+    if (data.company_id !== caller.company_id) return null;
+    return data as IntegrationConnectionRow;
   }
 
   /**
@@ -688,44 +707,54 @@ Deno.serve(async (req) => {
       }
 
       // -----------------------------------------------------------------
-      // Integrações (ERP/marketplace) — credenciais reais de API. Nunca
-      // devolve segredo em texto puro depois de salvo (só um resumo
-      // mascarado, ver maskSecret em logic.ts) — e nunca chama nenhuma API
-      // externa de verdade (isso continua fora de escopo até existir
-      // documentação/credenciais reais por provedor, ver migration 0049).
-      case "list_integrations": {
+      // Integrações (ERP/marketplace) — até 4 lojas/conexões independentes
+      // por marketplace (pedido: cada uma com nome, credenciais, tokens,
+      // status e logs próprios — editar/desativar/remover uma nunca afeta
+      // as outras). Nunca devolve segredo em texto puro depois de salvo (só
+      // um resumo mascarado, ver maskSecret em logic.ts) — e nunca chama
+      // nenhuma API externa de verdade por conta própria (isso continua
+      // fora de escopo até existir documentação/credenciais reais por
+      // provedor, ver migration 0049).
+      case "list_integration_connections": {
         if (!(await hasPermission("integrations.manage")))
           return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
 
-        const { data: providerRows, error: providersError } = await admin
+        const { data: connectionRows, error: connectionsError } = await admin
           .from("integration_providers")
-          .select("id, provider, status, last_sync_at, next_retry_at, last_error, updated_at")
-          .eq("company_id", caller.company_id);
-        if (providersError) throw providersError;
+          .select("id, provider, display_name, brand, branch, fulfillment_mode, status, is_active, last_sync_at, next_retry_at, last_error, created_at, updated_at")
+          .eq("company_id", caller.company_id)
+          .order("created_at", { ascending: true });
+        if (connectionsError) throw connectionsError;
 
-        const providerIds = (providerRows ?? []).map((p) => p.id);
+        const connectionIds = (connectionRows ?? []).map((c) => c.id);
         const { data: credentialRows, error: credentialsError } =
-          providerIds.length > 0
+          connectionIds.length > 0
             ? await admin
                 .from("integration_credentials")
                 .select("provider_id, client_id, client_secret, access_token, refresh_token, external_account_id, scopes, expires_at, updated_at")
-                .in("provider_id", providerIds)
+                .in("provider_id", connectionIds)
             : { data: [] as Record<string, unknown>[], error: null };
         if (credentialsError) throw credentialsError;
 
-        const credentialByProviderId = new Map((credentialRows ?? []).map((c) => [c.provider_id as string, c]));
-        const rowByProvider = new Map((providerRows ?? []).map((p) => [p.provider as string, p]));
-
-        const integrations = INTEGRATION_PROVIDERS.map((provider) => {
-          const providerRow = rowByProvider.get(provider);
-          const cred = providerRow ? credentialByProviderId.get(providerRow.id) : undefined;
-          return {
-            provider,
-            status: providerRow?.status ?? "not_configured",
-            last_sync_at: providerRow?.last_sync_at ?? null,
-            next_retry_at: providerRow?.next_retry_at ?? null,
-            last_error: providerRow?.last_error ?? null,
-            updated_at: providerRow?.updated_at ?? null,
+        const credentialByConnectionId = new Map((credentialRows ?? []).map((c) => [c.provider_id as string, c]));
+        const connectionsByProvider = new Map<string, Record<string, unknown>[]>();
+        for (const row of connectionRows ?? []) {
+          const cred = credentialByConnectionId.get(row.id as string);
+          const list = connectionsByProvider.get(row.provider as string) ?? [];
+          list.push({
+            id: row.id,
+            provider: row.provider,
+            display_name: row.display_name,
+            brand: row.brand,
+            branch: row.branch,
+            fulfillment_mode: row.fulfillment_mode,
+            status: row.status,
+            is_active: row.is_active,
+            last_sync_at: row.last_sync_at,
+            next_retry_at: row.next_retry_at,
+            last_error: row.last_error,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
             credential: cred
               ? {
                   client_id: (cred.client_id as string | null) ?? null,
@@ -738,74 +767,164 @@ Deno.serve(async (req) => {
                   updated_at: cred.updated_at,
                 }
               : null,
-          };
+          });
+          connectionsByProvider.set(row.provider as string, list);
+        }
+
+        const providers = INTEGRATION_PROVIDERS.map((provider) => {
+          const connections = connectionsByProvider.get(provider) ?? [];
+          return { provider, connections, count: connections.length, limit: MAX_CONNECTIONS_PER_PROVIDER };
         });
 
-        return jsonResponse({ success: true, integrations });
+        return jsonResponse({ success: true, providers });
       }
 
       // -----------------------------------------------------------------
-      case "save_integration_credentials": {
+      case "create_integration_connection": {
         if (!(await hasPermission("integrations.manage")))
           return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
 
         const provider = body.provider;
         if (!isValidIntegrationProvider(provider)) return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Provedor inválido." }, 400);
+
+        const fields = sanitizeConnectionMetaFields(body);
+        if (!fields.display_name) return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Informe um nome para a loja." }, 400);
+
+        // Checagem "amigável" ANTES do insert — o trigger protect_integration_connection_limit
+        // no banco (migration 0052) é quem garante isto de forma incondicional
+        // (inclusive contra uma corrida real de duas requisições simultâneas).
+        const { count, error: countError } = await admin
+          .from("integration_providers")
+          .select("id", { count: "exact", head: true })
+          .eq("company_id", caller.company_id)
+          .eq("provider", provider);
+        if (countError) throw countError;
+        if (hasReachedConnectionLimit(count ?? 0)) {
+          return jsonResponse({ success: false, code: "CONNECTION_LIMIT_REACHED", message: "Limite de 4 lojas atingido para este marketplace." }, 400);
+        }
+
+        const { data: created, error: createError } = await admin
+          .from("integration_providers")
+          .insert({ company_id: caller.company_id, provider, status: "not_configured", is_active: true, ...fields })
+          .select("id")
+          .single();
+        if (createError) {
+          if (/Limite de 4/.test(createError.message ?? "")) {
+            return jsonResponse({ success: false, code: "CONNECTION_LIMIT_REACHED", message: "Limite de 4 lojas atingido para este marketplace." }, 400);
+          }
+          throw createError;
+        }
+
+        await writeAudit("integration_connection_created", created.id, { provider, display_name: fields.display_name }, "integration_connection");
+        return jsonResponse({ success: true, connectionId: created.id });
+      }
+
+      // -----------------------------------------------------------------
+      case "update_integration_connection": {
+        if (!(await hasPermission("integrations.manage")))
+          return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
+
+        const connection = await loadConnection(body.connectionId);
+        if (!connection) return jsonResponse({ success: false, code: "NOT_FOUND", message: "Loja/conexão não encontrada." }, 404);
+
+        const fields = sanitizeConnectionMetaFields(body);
+        if (Object.keys(fields).length === 0) return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Informe pelo menos um campo para atualizar." }, 400);
+
+        const { error: updateError } = await admin.from("integration_providers").update(fields).eq("id", connection.id);
+        if (updateError) throw updateError;
+
+        await writeAudit("integration_connection_updated", connection.id, { provider: connection.provider, fields_changed: Object.keys(fields) }, "integration_connection");
+        return jsonResponse({ success: true });
+      }
+
+      // -----------------------------------------------------------------
+      case "set_integration_connection_active": {
+        if (!(await hasPermission("integrations.manage")))
+          return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
+
+        const connection = await loadConnection(body.connectionId);
+        if (!connection) return jsonResponse({ success: false, code: "NOT_FOUND", message: "Loja/conexão não encontrada." }, 404);
+
+        const active = body.active;
+        if (typeof active !== "boolean") return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Informe o novo estado (ativo/inativo)." }, 400);
+
+        const { error: updateError } = await admin.from("integration_providers").update({ is_active: active }).eq("id", connection.id);
+        if (updateError) throw updateError;
+
+        await writeAudit(active ? "integration_connection_activated" : "integration_connection_deactivated", connection.id, { provider: connection.provider }, "integration_connection");
+        return jsonResponse({ success: true });
+      }
+
+      // -----------------------------------------------------------------
+      case "remove_integration_connection": {
+        if (!(await hasPermission("integrations.manage")))
+          return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
+
+        const connection = await loadConnection(body.connectionId);
+        if (!connection) return jsonResponse({ success: false, code: "NOT_FOUND", message: "Loja/conexão não encontrada." }, 404);
+
+        // integration_credentials.provider_id tem "on delete cascade"
+        // (migration 0049) — a credencial desta conexão some junto, nunca
+        // fica órfã.
+        const { error: deleteError } = await admin.from("integration_providers").delete().eq("id", connection.id);
+        if (deleteError) throw deleteError;
+
+        await writeAudit("integration_connection_removed", connection.id, { provider: connection.provider, display_name: connection.display_name }, "integration_connection");
+        return jsonResponse({ success: true });
+      }
+
+      // -----------------------------------------------------------------
+      case "save_integration_connection_credentials": {
+        if (!(await hasPermission("integrations.manage")))
+          return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
+
+        const connection = await loadConnection(body.connectionId);
+        if (!connection) return jsonResponse({ success: false, code: "NOT_FOUND", message: "Loja/conexão não encontrada." }, 404);
 
         const fields = sanitizeCredentialFields(body);
         if (!hasAnyCredentialField(fields)) {
           return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Informe pelo menos um campo de credencial." }, 400);
         }
 
-        const { data: providerRow, error: providerError } = await admin
-          .from("integration_providers")
-          .upsert({ company_id: caller.company_id, provider, status: "configuration_incomplete" }, { onConflict: "company_id,provider" })
-          .select("id")
-          .single();
-        if (providerError) throw providerError;
-
         // Sempre que um access_token novo é salvo, assume que acabou de ser
         // obtido agora (o admin geralmente cola o token logo depois do fluxo
         // OAuth) e carimba a validade real do Tiny (4h) — sem isso,
         // tiny-integration nunca saberia quando renovar via refresh_token.
-        const credentialPatch: Record<string, unknown> = { provider_id: providerRow.id, ...fields };
+        const credentialPatch: Record<string, unknown> = { provider_id: connection.id, ...fields };
         if (fields.access_token) credentialPatch.expires_at = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString();
 
         const { error: credentialError } = await admin.from("integration_credentials").upsert(credentialPatch, { onConflict: "provider_id" });
         if (credentialError) throw credentialError;
 
+        // Nunca "connected" só por ter salvo — o status só vira "connected"
+        // depois de uma validação real (Testar conexão, quando existir pra
+        // este provedor) — mesma regra de sempre (ver 0049).
+        await admin.from("integration_providers").update({ status: "configuration_incomplete" }).eq("id", connection.id);
+
         // Nunca grava o valor dos campos em si na auditoria — só QUAIS campos
         // foram alterados (o segredo em si não pertence nem ao log).
-        await writeAudit("integration_credentials_saved", providerRow.id, { provider, fields_changed: Object.keys(fields) }, "integration_provider");
+        await writeAudit("integration_credentials_saved", connection.id, { provider: connection.provider, fields_changed: Object.keys(fields) }, "integration_connection");
         return jsonResponse({ success: true });
       }
 
       // -----------------------------------------------------------------
-      case "clear_integration_credentials": {
+      case "clear_integration_connection_credentials": {
         if (!(await hasPermission("integrations.manage")))
           return await denyAndAudit("missing_integrations_manage", null, "Você não tem permissão para gerenciar credenciais de integrações.");
 
-        const provider = body.provider;
-        if (!isValidIntegrationProvider(provider)) return jsonResponse({ success: false, code: "VALIDATION_ERROR", message: "Provedor inválido." }, 400);
+        const connection = await loadConnection(body.connectionId);
+        if (!connection) return jsonResponse({ success: false, code: "NOT_FOUND", message: "Loja/conexão não encontrada." }, 404);
 
-        const { data: providerRow } = await admin
-          .from("integration_providers")
-          .select("id")
-          .eq("company_id", caller.company_id)
-          .eq("provider", provider)
-          .maybeSingle();
-        if (!providerRow) return jsonResponse({ success: true }); // nada configurado — já está no estado desejado
-
-        const { error: deleteError } = await admin.from("integration_credentials").delete().eq("provider_id", providerRow.id);
+        const { error: deleteError } = await admin.from("integration_credentials").delete().eq("provider_id", connection.id);
         if (deleteError) throw deleteError;
 
         const { error: resetError } = await admin
           .from("integration_providers")
           .update({ status: "not_configured", last_error: null, last_sync_at: null, next_retry_at: null })
-          .eq("id", providerRow.id);
+          .eq("id", connection.id);
         if (resetError) throw resetError;
 
-        await writeAudit("integration_credentials_cleared", providerRow.id, { provider }, "integration_provider");
+        await writeAudit("integration_credentials_cleared", connection.id, { provider: connection.provider }, "integration_connection");
         return jsonResponse({ success: true });
       }
 

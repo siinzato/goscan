@@ -50,6 +50,36 @@ function providerRow(p: ProviderInfo, status: string | null): string {
     </div>`;
 }
 
+interface ConnectionSummary {
+  display_name: string | null;
+  status: string;
+}
+
+/** Cada loja aparece indentada sob o cabeçalho do marketplace — até 4 por provedor (ver Administração > Integrações pra cadastrar/editar). Só visível pra quem já enxerga integration_providers via RLS (managers/admins); operadores continuam vendo só o rótulo genérico (fallback em renderProfileIntegrations). */
+function connectionRow(displayName: string, status: string): string {
+  const s = INTEGRATION_STATUS_META[(status || "not_configured") as IntegrationStatus] || INTEGRATION_STATUS_META.not_configured;
+  return `
+    <div class="integration-provider-card" style="padding-left:36px">
+      <div class="integration-provider-info">
+        <strong>${escapeHtml(displayName)}</strong>
+      </div>
+      <span class="status-badge ${s.badge}">${s.icon}${s.text}</span>
+    </div>`;
+}
+
+function providerGroupRows(p: ProviderInfo, connections: ConnectionSummary[]): string {
+  const header = `
+    <div class="integration-provider-card">
+      <span class="integration-provider-icon">${p.icon}</span>
+      <div class="integration-provider-info">
+        <strong>${escapeHtml(p.name)}</strong>
+        <span>${escapeHtml(p.description)}</span>
+      </div>
+      <span class="status-badge info">${connections.length} loja${connections.length > 1 ? "s" : ""}</span>
+    </div>`;
+  return header + connections.map((c) => connectionRow(c.display_name || p.name, c.status)).join("");
+}
+
 export async function renderProfileIntegrations(root: HTMLElement): Promise<void> {
   const { profile } = getAuthState();
   const canManage = isManagerOrAdmin(profile);
@@ -91,15 +121,29 @@ export async function renderProfileIntegrations(root: HTMLElement): Promise<void
     const supabase = getSupabase();
     const [flagsRes, providersRes] = await Promise.all([
       supabase.from("integration_feature_flags").select("key, enabled"),
-      supabase.from("integration_providers").select("provider, status"),
+      supabase.from("integration_providers").select("provider, display_name, status"),
     ]);
     const flagMap = new Map<string, boolean>(((flagsRes.data as { key: string; enabled: boolean }[]) || []).map((f) => [f.key, f.enabled]));
-    const statusMap = new Map<string, string>(((providersRes.data as { provider: string; status: string }[]) || []).map((r) => [r.provider, r.status]));
+
+    // Sem visibilidade real de integration_providers (RLS exige is_manager_or_admin —
+    // ver 0049), providersRes.data vem vazio pra operador/visualizador: nesse caso
+    // cada provedor cai no fallback derivado só das feature flags, igual sempre foi.
+    const connectionsByProvider = new Map<string, ConnectionSummary[]>();
+    for (const row of (providersRes.data as { provider: string; display_name: string | null; status: string }[]) || []) {
+      const list = connectionsByProvider.get(row.provider) ?? [];
+      list.push({ display_name: row.display_name, status: row.status });
+      connectionsByProvider.set(row.provider, list);
+    }
+
     if (!root.isConnected) return;
     listEl.innerHTML = INTEGRATION_PROVIDER_META.map((p) => {
-      const knownStatus = statusMap.get(p.key);
+      const connections = connectionsByProvider.get(p.key) ?? [];
       const fallback = flagMap.get(p.flagKey) ? "configuration_incomplete" : "not_configured";
-      return providerRow(p, knownStatus || fallback);
+      // Tiny não faz parte do recurso de múltiplas lojas (não é um marketplace) —
+      // continua com o rótulo único de sempre, nunca o agrupamento "N lojas".
+      if (p.key === "tiny") return providerRow(p, connections[0]?.status ?? fallback);
+      if (connections.length > 0) return providerGroupRows(p, connections);
+      return providerRow(p, fallback);
     }).join("");
   } catch {
     // Falha de rede/RLS nunca trava a tela — mantém "Não configurada" em todos, que já é o real hoje (ver seção 20.12 do pedido).
