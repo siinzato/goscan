@@ -20,6 +20,22 @@ test("resolveInvoiceItem cai para EAN exato quando o código da NF não bate com
 });
 
 // ---------------------------------------------------------------------------
+// CORREÇÃO — gtin_normalized não tem constraint de unicidade no banco
+// (diferente de sku_code): dois produtos ATIVOS distintos cadastrados por
+// engano com o mesmo EAN nunca podem ser escolhidos silenciosamente — antes
+// o .find() pegava o primeiro da lista sem avisar ninguém.
+// ---------------------------------------------------------------------------
+test("resolveInvoiceItem NUNCA vincula sozinho quando o EAN bate em mais de um produto ativo (EAN duplicado)", () => {
+  const duplicated = [
+    { variant_id: "v3", sku_code: "AAA-1", gtin_normalized: "1112223334445" },
+    { variant_id: "v4", sku_code: "BBB-1", gtin_normalized: "1112223334445" },
+  ];
+  const result = resolveInvoiceItem({ invoice_product_code: "CODIGO-DESCONHECIDO", ean: "1112223334445" }, duplicated);
+  assert.equal(result.variant_id, null);
+  assert.equal(result.link_source, null);
+});
+
+// ---------------------------------------------------------------------------
 // CORREÇÃO — causa raiz do bug relatado ("EAN já cadastrado não vincula
 // automaticamente"): o EAN da NF pode chegar com espaço/pontuação/traço que o
 // EAN cadastrado (já normalizado em gtin_normalized) não tem — a comparação

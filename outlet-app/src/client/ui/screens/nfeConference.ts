@@ -3,7 +3,7 @@
 // fluxo totalmente separado do reconhecimento visual/matching Outlet — não
 // reaproveita conferences/conference_items, tem suas próprias tabelas
 // (invoice_receipts/invoice_receipt_items/receipt_counts).
-import { escapeHtml, debounce, formatDateTime, describeError, initials, normalizeEan } from "../../utils.ts";
+import { escapeHtml, debounce, formatDateTime, describeError, initials, normalizeEan, isValidEanFormat } from "../../utils.ts";
 import { parseNfeXml, diagnoseNfeXml, type NfeXmlDiagnostics } from "../../nfeParser.ts";
 import { normalizeKey, suggestBestMatch } from "../../nfeMatching.ts";
 import { getAuthState, isAdmin, isManagerOrAdmin } from "../../auth.ts";
@@ -26,6 +26,7 @@ import {
   listReceiptHistory,
   deleteReceipt,
   fetchAllNormalProducts,
+  fetchNormalCandidates,
   confirmInvoiceReceiptTinyLaunch,
   type InvoiceReceipt,
   type InvoiceReceiptWithCreator,
@@ -831,6 +832,7 @@ async function renderPrepView(root: HTMLElement): Promise<void> {
 
   if (pending.length > 0) {
     void renderPendingSuggestions(root, pending);
+    void renderPendingEanDiagnostics(root, pending);
   }
 
   root.querySelector("#btnStartCounting")!.addEventListener("click", () => {
@@ -956,6 +958,49 @@ async function renderPendingSuggestions(root: HTMLElement, pending: InvoiceRecei
   }
 }
 
+/**
+ * CORREÇÃO — diferencia, para itens PENDENTES que já têm um EAN válido (a
+ * ausência/invalidez de EAN já é tratada de forma síncrona em
+ * renderPendingItemCard), dois casos que antes recebiam a mesma tela sem
+ * explicação nenhuma: "EAN válido mas não cadastrado em nenhum produto" e
+ * "EAN válido cadastrado em mais de um produto" (o que agora nunca vincula
+ * sozinho — ver resolveInvoiceItem em nfeMatching.ts). Reconsulta o
+ * catálogo AGORA (não reaproveita o resultado da importação) porque o
+ * catálogo pode ter mudado desde então; uma única busca em lote reaproveita
+ * fetchNormalCandidates (mesma função/normalização usada na importação),
+ * nunca uma consulta por item.
+ */
+async function renderPendingEanDiagnostics(root: HTMLElement, pending: InvoiceReceiptItem[]): Promise<void> {
+  const withEan = pending.filter((it) => it.ean && isValidEanFormat(normalizeEan(it.ean)));
+  if (withEan.length === 0) return;
+
+  let candidates;
+  try {
+    candidates = await fetchNormalCandidates([], withEan.map((it) => it.ean!));
+  } catch {
+    return; // diagnóstico é só informativo — nunca trava a tela de pendências se a consulta falhar
+  }
+  if (!root.isConnected) return;
+
+  const countByEan = new Map<string, number>();
+  for (const c of candidates) {
+    if (!c.gtin_normalized) continue;
+    countByEan.set(c.gtin_normalized, (countByEan.get(c.gtin_normalized) ?? 0) + 1);
+  }
+
+  for (const it of withEan) {
+    const container = root.querySelector<HTMLElement>(`#pendingEanNote-${it.id}`);
+    if (!container) continue;
+    const count = countByEan.get(normalizeEan(it.ean)) ?? 0;
+    if (count === 0) {
+      container.innerHTML = `<p class="hint-text">O EAN ${escapeHtml(it.ean!)} é válido, mas não foi encontrado na base de produtos.</p>`;
+    } else if (count > 1) {
+      container.innerHTML = `<p class="hint-text">O EAN ${escapeHtml(it.ean!)} está associado a mais de um produto e precisa de confirmação manual.</p>`;
+    }
+    // count === 1 e ainda pendente seria inesperado (teria sido vinculado na importação) — não mostra nada de errado, só deixa a busca manual disponível normalmente.
+  }
+}
+
 function renderPendingItemCard(it: InvoiceReceiptItem): string {
   return `
     <div class="pending-item-card" data-pending-item="${it.id}">
@@ -969,7 +1014,7 @@ function renderPendingItemCard(it: InvoiceReceiptItem): string {
       ${
         !it.ean
           ? `<p class="hint-text">Este item da NF não possui EAN válido. Pesquise pelo nome, SKU ou código do fornecedor para vinculá-lo.</p>`
-          : ""
+          : `<div id="pendingEanNote-${it.id}"></div>`
       }
       <div id="pendingSuggestion-${it.id}"></div>
       <div class="sku-picker" data-pending-idx="${it.id}">

@@ -155,7 +155,8 @@ interface NormalVariantRow {
  * filtra por gtin_normalized (mantida por trigger — ver migration 0046),
  * usando exatamente a mesma normalização (normalizeEan) do lado da NF.
  */
-async function fetchNormalCandidates(codes: string[], eans: string[]): Promise<NormalVariantCandidate[]> {
+/** Exportada — também reaproveitada pela tela de pendências (nfeConference.ts) pra diferenciar "EAN não cadastrado" de "EAN cadastrado em mais de um produto", sem duplicar a lógica de busca/normalização. */
+export async function fetchNormalCandidates(codes: string[], eans: string[]): Promise<NormalVariantCandidate[]> {
   const supabase = getSupabase();
   const cleanCodes = Array.from(new Set(codes.filter((c) => c && c.trim())));
   const cleanEans = Array.from(new Set(eans.map(normalizeEan).filter((e) => isValidEanFormat(e))));

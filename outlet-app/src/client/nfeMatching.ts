@@ -71,8 +71,14 @@ export function resolveInvoiceItem(item: InvoiceItemKey, candidates: NormalVaria
   }
 
   if (ean && isValidEanFormat(ean)) {
-    const byEan = candidates.find((c) => c.gtin_normalized === ean);
-    if (byEan) return { variant_id: byEan.variant_id, link_source: "ean" };
+    // CORREÇÃO — gtin_normalized não tem constraint de unicidade no banco
+    // (diferente de sku_code, que tem): se dois produtos ativos distintos
+    // estiverem cadastrados com o mesmo EAN (erro de cadastro), o antigo
+    // `.find()` escolhia o primeiro silenciosamente. Agora, mais de uma
+    // correspondência nunca vincula sozinho — vai para pendência, igual a
+    // "não encontrado" (ver mensagem diferenciada na UI).
+    const byEan = candidates.filter((c) => c.gtin_normalized === ean);
+    if (byEan.length === 1) return { variant_id: byEan[0].variant_id, link_source: "ean" };
   }
 
   if (aliases) {
