@@ -2,10 +2,11 @@ import { defineConfig } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 
 const API_PORT = process.env.API_PORT || "8788";
+const PORT = Number(process.env.PORT) || 5173;
 
 export default defineConfig({
   server: {
-    port: 5173,
+    port: PORT,
     proxy: {
       "/api": {
         target: `http://localhost:${API_PORT}`,
