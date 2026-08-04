@@ -829,6 +829,23 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   padding: 0;
   font-weight: 600;
 }
+/* Atalhos de incremento rápido (+5/+10/+15/+20) — ficam fora de .qty-stepper
+   (que é overflow:hidden e gap:0) pra não virarem "segmentos" da pílula
+   existente; reaproveitam as mesmas cores/tokens do stepper. */
+.qty-bump-row { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.qty-bump-row button {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  height: 36px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-on-soft);
+  cursor: pointer;
+}
+.qty-bump-row button:hover { background: var(--accent-soft-bg); }
+.qty-bump-row button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ---------------------------------------------------------------------- */
 /* Product cards (mobile) — conferência e catálogo                        */

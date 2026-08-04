@@ -669,6 +669,21 @@ function wireCandidateActions(root: HTMLElement): void {
   });
 }
 
+// EXPANSÃO GOSCAN — atalhos de incremento rápido ao lado do stepper -/+.
+// Chamam a MESMA updateItemQuantity(uiId, delta) já usada pelo "+" (ver
+// wiring em renderSessionItems), só com um delta maior — nenhuma lógica de
+// confirmação/saldo é tocada.
+const QTY_BUMP_VALUES = [5, 10, 15, 20];
+
+function renderQtyBumpRow(uiId: string): string {
+  return `
+        <div class="qty-bump-row">
+          ${QTY_BUMP_VALUES.map(
+            (v) => `<button type="button" data-qty-bump="${uiId}" data-qty-bump-value="${v}" aria-label="Adicionar ${v} unidades">+${v}</button>`
+          ).join("")}
+        </div>`;
+}
+
 function renderSessionItemCard(it: SessionItem): string {
   return `
     <div class="product-card">
@@ -691,6 +706,7 @@ function renderSessionItemCard(it: SessionItem): string {
           <input type="text" inputmode="numeric" aria-label="Quantidade" value="${it.quantity}" readonly />
           <button type="button" data-qty-inc="${it.uiId}" aria-label="Aumentar quantidade">${Icon.plus}</button>
         </div>
+        ${renderQtyBumpRow(it.uiId)}
         <div class="product-card-actions">
           <button class="icon-btn danger" data-remove-id="${it.uiId}" aria-label="Remover item">${Icon.trash}</button>
         </div>
@@ -709,6 +725,7 @@ function renderSessionItemRow(it: SessionItem): string {
           <input type="text" inputmode="numeric" aria-label="Quantidade" value="${it.quantity}" readonly />
           <button type="button" data-qty-inc="${it.uiId}" aria-label="Aumentar quantidade">${Icon.plus}</button>
         </div>
+        ${renderQtyBumpRow(it.uiId)}
       </td>
       <td class="sku-code">
         ${escapeHtml(it.sku_code || "-")}
@@ -823,6 +840,13 @@ function renderSessionItems(root: HTMLElement, session: Session): void {
     btn.addEventListener("click", () => {
       const it = session.items.find((i) => i.uiId === btn.dataset.qtyInc);
       if (it) void updateItemQuantity(it.uiId, 1);
+    });
+  });
+  wrap.querySelectorAll<HTMLButtonElement>("[data-qty-bump]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const it = session.items.find((i) => i.uiId === btn.dataset.qtyBump);
+      const delta = Number(btn.dataset.qtyBumpValue);
+      if (it) void updateItemQuantity(it.uiId, delta);
     });
   });
 

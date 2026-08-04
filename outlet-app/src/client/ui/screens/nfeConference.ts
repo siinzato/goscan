@@ -1488,6 +1488,13 @@ function wireCountingCards(root: HTMLElement, scope: ParentNode): void {
       input.value = String(Number(input.value || 0) + 1);
     });
   });
+  scope.querySelectorAll<HTMLButtonElement>("[data-qty-bump]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const input = scope.querySelector<HTMLInputElement>(`[data-qty-input="${btn.dataset.qtyBump}"]`)!;
+      const delta = Number(btn.dataset.qtyBumpValue);
+      input.value = String(Number(input.value || 0) + delta);
+    });
+  });
   // EXPANSÃO GOSCAN — copiar EAN do card (nunca bloqueia a bipagem: falha de
   // clipboard só mostra um toast de erro, não interrompe a contagem).
   scope.querySelectorAll<HTMLButtonElement>("[data-copy-ean]").forEach((btn) => {
@@ -1667,6 +1674,24 @@ function renderEanChip(it: InvoiceReceiptItem): string {
   return `<button type="button" class="ean-copy-chip" data-copy-ean="${escapeHtml(ean)}" aria-label="Copiar EAN ${escapeHtml(ean)}">EAN: ${escapeHtml(ean)}</button>`;
 }
 
+// EXPANSÃO GOSCAN — atalhos de incremento rápido ao lado do stepper -/+ da
+// contagem cega. Chamam a MESMA operação local já usada pelo "+" (soma no
+// input, ver wireCountingCards) com um delta maior — nada é enviado ao
+// servidor aqui, exatamente como o "+" atual: só "Confirmar item" envia.
+const QTY_BUMP_VALUES = [5, 10, 15, 20];
+
+function renderQtyBumpRow(itemId: string, disabled: boolean): string {
+  return `
+        <div class="qty-bump-row">
+          ${QTY_BUMP_VALUES.map(
+            (v) =>
+              `<button type="button" data-qty-bump="${itemId}" data-qty-bump-value="${v}" aria-label="Adicionar ${v} unidades" ${
+                disabled ? "disabled" : ""
+              }>+${v}</button>`
+          ).join("")}
+        </div>`;
+}
+
 function renderCountingCard(it: InvoiceReceiptItem): string {
   const { session } = getAuthState();
   const myId = session?.user.id;
@@ -1690,6 +1715,7 @@ function renderCountingCard(it: InvoiceReceiptItem): string {
           <input type="number" min="0" inputmode="numeric" value="${it.physical_quantity ?? 0}" data-qty-input="${it.id}" aria-label="Quantidade física" ${isLockedByOther ? "disabled" : ""} />
           <button type="button" data-qty-inc="${it.id}" aria-label="Aumentar quantidade" ${isLockedByOther ? "disabled" : ""}>${Icon.plus}</button>
         </div>
+        ${renderQtyBumpRow(it.id, isLockedByOther)}
         <button class="btn-primary" data-confirm-count="${it.id}" ${isLockedByOther ? "disabled" : ""}>Confirmar item</button>
       </div>
       ${canUndo ? `<button type="button" class="btn-secondary btn-block" data-undo-item="${it.id}" style="margin-top:8px">${Icon.undo2}Desfazer minha última bipagem</button>` : ""}
