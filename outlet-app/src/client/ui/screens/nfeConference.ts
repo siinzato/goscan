@@ -1524,6 +1524,109 @@ function wireCountingCards(root: HTMLElement, scope: ParentNode): void {
   scope.querySelectorAll<HTMLButtonElement>("[data-undo-item]").forEach((btn) => {
     btn.addEventListener("click", () => void handleUndoClick(root, btn.dataset.undoItem!));
   });
+  wireCountingItemEdit(root, scope);
+}
+
+/**
+ * "Editar" na contagem cega — mesmo buscador/endpoint de vínculo manual da
+ * tela de pendências (searchSkuForPicker + resolveItemManually), só que
+ * escondido por padrão dentro do card e revelado ao clicar no lápis.
+ */
+function wireCountingItemEdit(root: HTMLElement, scope: ParentNode): void {
+  scope.querySelectorAll<HTMLButtonElement>("[data-edit-link]").forEach((btn) => {
+    const itemId = btn.dataset.editLink!;
+    btn.addEventListener("click", () => {
+      const picker = scope.querySelector<HTMLElement>(`[data-edit-picker="${itemId}"]`);
+      if (!picker) return;
+      picker.hidden = !picker.hidden;
+      if (!picker.hidden) picker.querySelector<HTMLInputElement>("[data-edit-input]")?.focus();
+    });
+  });
+
+  scope.querySelectorAll<HTMLInputElement>("[data-edit-input]").forEach((input) => {
+    const itemId = input.dataset.editInput!;
+    const resultsBox = input.parentElement!.querySelector<HTMLDivElement>(".sku-picker-results")!;
+    let activeController: AbortController | null = null;
+
+    const runSearch = async (q: string): Promise<void> => {
+      activeController?.abort();
+      if (!q.trim()) {
+        resultsBox.hidden = true;
+        return;
+      }
+      const controller = new AbortController();
+      activeController = controller;
+      resultsBox.hidden = false;
+      resultsBox.innerHTML = `<div class="sku-picker-empty">Buscando…</div>`;
+      let rows: CatalogRow[];
+      try {
+        rows = await searchSkuForPicker(q, 15, "normal", controller.signal);
+      } catch {
+        if (controller.signal.aborted) return;
+        renderError(q);
+        return;
+      }
+      if (controller.signal.aborted) return;
+      renderResults(rows);
+    };
+    const search = debounce(runSearch, 300);
+    input.addEventListener("input", () => void search(input.value));
+
+    function renderError(q: string): void {
+      resultsBox.innerHTML = `<div class="sku-picker-empty">Erro ao consultar a base. <button type="button" class="link-btn" data-picker-retry>Tentar novamente</button></div>`;
+      resultsBox.hidden = false;
+      resultsBox.querySelector("[data-picker-retry]")?.addEventListener("click", () => void runSearch(q));
+    }
+
+    function renderResults(rows: CatalogRow[]): void {
+      if (rows.length === 0) {
+        resultsBox.innerHTML = `<div class="sku-picker-empty">Nenhum produto normal encontrado.</div>`;
+        resultsBox.hidden = false;
+        return;
+      }
+      resultsBox.innerHTML = rows
+        .map((r) => {
+          const badge =
+            r.match_type === "exact_ean"
+              ? `<span class="status-badge success">EAN exato</span>`
+              : r.match_type === "exact_sku"
+                ? `<span class="status-badge success">SKU exato</span>`
+                : "";
+          return `<button type="button" class="sku-picker-item" data-variant="${r.variant_id}" data-produto="${escapeHtml(r.produto)}" data-sku="${escapeHtml(r.sku_code)}" data-ean="${escapeHtml(r.gtin || "")}">
+              <span class="sku-picker-item-info">
+                <span class="product-card-name">${escapeHtml(r.produto)}</span>
+                <span class="sku-code">${escapeHtml(r.sku_code)}${r.gtin ? ` · EAN ${escapeHtml(r.gtin)}` : ""}</span>
+              </span>
+              ${badge}
+            </button>`;
+        })
+        .join("");
+      resultsBox.hidden = false;
+      resultsBox.querySelectorAll<HTMLButtonElement>(".sku-picker-item").forEach((resultBtn) => {
+        resultBtn.addEventListener("click", async () => {
+          const item = currentItems.find((i) => i.id === itemId);
+          if (!item) return;
+          const memorize = (scope.querySelector(`[data-edit-memorize="${itemId}"]`) as HTMLInputElement)?.checked ?? false;
+          try {
+            const updated = await resolveItemManually(itemId, resultBtn.dataset.variant!, {
+              memorize,
+              invoiceProductCode: item.invoice_product_code,
+              ean: item.ean,
+            });
+            currentItems = currentItems.map((i) =>
+              i.id === itemId
+                ? { ...i, ...updated, sku_code: resultBtn.dataset.sku!, produto: resultBtn.dataset.produto!, catalog_ean: resultBtn.dataset.ean || null }
+                : i
+            );
+            showToast(`Vinculado a "${resultBtn.dataset.produto}".`, "success");
+            if (!updateSingleCountingCard(root, itemId)) renderCountingList(root);
+          } catch (err) {
+            showToast("Erro ao vincular: " + describeError(err), "error");
+          }
+        });
+      });
+    }
+  });
 }
 
 function renderCountingList(root: HTMLElement): void {
@@ -1692,6 +1795,15 @@ function renderQtyBumpRow(itemId: string, disabled: boolean): string {
         </div>`;
 }
 
+// EXPANSÃO GOSCAN — correção do produto vinculado direto na contagem cega.
+// O vínculo automático/manual pode ter acertado o produto errado (nome
+// parecido, EAN de outro item etc.) e isso só costuma ser percebido quando o
+// operador tem o item físico na mão. "Editar" reaproveita EXATAMENTE o mesmo
+// buscador/endpoint do vínculo manual da tela de pendências
+// (wirePendingItemPickers/resolveItemManually) — nenhuma lógica nova de
+// vínculo, só um outro lugar de acioná-la. resolveItemManually já marca
+// status:'pending' (nunca mantém "Contado" pro produto errado) sem tocar em
+// expected_quantity (a quantidade da NF pra aquela linha não muda).
 function renderCountingCard(it: InvoiceReceiptItem): string {
   const { session } = getAuthState();
   const myId = session?.user.id;
@@ -1702,13 +1814,24 @@ function renderCountingCard(it: InvoiceReceiptItem): string {
     <div class="product-card ${isLockedByOther ? "product-card-locked" : ""}" data-item-row="${it.id}">
       <div class="product-card-top">
         <p class="product-card-name">${escapeHtml(itemTitle(it))}</p>
-        ${itemStamp(it.status)}
+        <div class="product-card-top-actions">
+          ${itemStamp(it.status)}
+          <button type="button" class="icon-btn" data-edit-link="${it.id}" aria-label="Editar produto vinculado" ${isLockedByOther ? "disabled" : ""}>${Icon.pencil}</button>
+        </div>
       </div>
       <div class="product-card-meta">
         <span class="sku-code">${escapeHtml(itemCodeLabel(it))}</span>
         ${renderEanChip(it)}
       </div>
       ${isLockedByOther ? `<div class="warning-box reservation-banner">${Icon.lock}Em conferência por ${escapeHtml(reservation!.fullName)}</div>` : ""}
+      <div class="sku-picker" data-edit-picker="${it.id}" hidden>
+        <p class="hint-text">Produto errado? Busque e escolha o produto correto pra este item da NF.</p>
+        <input type="text" class="sku-picker-input" aria-label="Buscar produto correto" placeholder="Buscar por nome, SKU ou EAN…" data-edit-input="${it.id}" />
+        <div class="sku-picker-results" hidden></div>
+        <label class="hint-text" style="display:flex;align-items:center;gap:6px;margin-top:6px">
+          <input type="checkbox" data-edit-memorize="${it.id}" /> Memorizar associação para próximas notas
+        </label>
+      </div>
       <div class="product-card-bottom">
         <div class="qty-stepper">
           <button type="button" data-qty-dec="${it.id}" aria-label="Diminuir quantidade" ${isLockedByOther ? "disabled" : ""}>${Icon.minus}</button>
