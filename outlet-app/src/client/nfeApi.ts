@@ -197,17 +197,24 @@ interface NormalProductNameRow {
  * 1000, mesmo pedindo mais via .limit()/.range()) — com o catálogo real de
  * ~2.650 produtos normais já importados, uma única chamada só trazia os
  * primeiros 1000 e "esquecia" o resto silenciosamente, sem erro nenhum.
- * Agora pagina em blocos de 1000 até a página vir incompleta (fim dos dados).
+ * Agora pagina em blocos de 1000.
+ *
+ * PERFORMANCE — causa raiz medida do "tempo de busca pra relacionar produtos"
+ * lento na importação de NF: com o catálogo real (4.018 produtos normais
+ * ativos hoje), a paginação SEQUENCIAL antiga (aguardar cada página antes de
+ * pedir a próxima) fazia 5 idas-e-voltas de rede em série — cada uma paga o
+ * RTT completo. Agora conta o total uma vez (1 ida) e dispara todas as
+ * páginas em paralelo (Promise.all) — o tempo de rede vira ~1 RTT em vez de
+ * N RTTs, o que pesa muito mais numa conexão real de operador (4G/wifi de
+ * depósito) do que numa rede rápida de desenvolvimento. Se a contagem falhar
+ * por qualquer motivo, cai pro modo sequencial antigo (nunca perde dados).
  */
 export async function fetchAllNormalProducts(): Promise<NameCandidate[]> {
   const supabase = getSupabase();
   const PAGE_SIZE = 1000;
-  const rows: NormalProductNameRow[] = [];
 
-  for (let page = 0; ; page++) {
-    const from = page * PAGE_SIZE;
-    const to = from + PAGE_SIZE - 1;
-    const { data, error } = await supabase
+  const baseQuery = () =>
+    supabase
       .from("product_variants")
       .select("id, sku_code, gtin, products!inner(name, product_type)")
       .eq("products.product_type", "normal")
@@ -216,13 +223,35 @@ export async function fetchAllNormalProducts(): Promise<NameCandidate[]> {
       // ordem de linhas entre chamadas .range() separadas — linhas podiam
       // aparecer em duas páginas (duplicadas) ou em nenhuma (perdidas).
       // order() por uma coluna estável (id) torna a paginação determinística.
-      .order("id")
-      .range(from, to);
-    if (error) throw error;
+      .order("id");
 
-    const batch = (data as unknown as NormalProductNameRow[]) || [];
-    rows.push(...batch);
-    if (batch.length < PAGE_SIZE) break;
+  const { count, error: countError } = await supabase
+    .from("product_variants")
+    .select("id, products!inner(product_type)", { count: "exact", head: true })
+    .eq("products.product_type", "normal")
+    .eq("active", true);
+
+  const rows: NormalProductNameRow[] = [];
+  if (!countError && count !== null) {
+    const totalPages = Math.max(1, Math.ceil(count / PAGE_SIZE));
+    const pages = await Promise.all(
+      Array.from({ length: totalPages }, (_, page) => baseQuery().range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1))
+    );
+    for (const { data, error } of pages) {
+      if (error) throw error;
+      rows.push(...((data as unknown as NormalProductNameRow[]) || []));
+    }
+  } else {
+    // Fallback sequencial (contagem indisponível) — mesmo comportamento de antes.
+    for (let page = 0; ; page++) {
+      const from = page * PAGE_SIZE;
+      const to = from + PAGE_SIZE - 1;
+      const { data, error } = await baseQuery().range(from, to);
+      if (error) throw error;
+      const batch = (data as unknown as NormalProductNameRow[]) || [];
+      rows.push(...batch);
+      if (batch.length < PAGE_SIZE) break;
+    }
   }
 
   return rows.map((row) => {

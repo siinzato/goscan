@@ -196,12 +196,44 @@ export function scoreNameSimilarity(a: string, b: string): number {
   return union > 0 ? intersection / union : 0;
 }
 
+// PERFORMANCE — causa raiz medida do "tempo de busca pra relacionar
+// produtos" lento na importação de NF: a tela de pendências chama
+// suggestBestMatch UMA VEZ POR ITEM pendente contra o MESMO array de
+// candidatos (catálogo inteiro — 4.018 produtos normais ativos hoje). A
+// versão anterior recomputava wordsOf(candidate.produto) (normalize +
+// split + Set) do zero em TODA comparação — com N itens pendentes isso é
+// N × 4.018 tokenizações repetidas do mesmo texto, sem nenhum motivo (o
+// nome do candidato não muda entre itens). Este cache, por referência de
+// objeto, tokeniza cada candidato só uma vez e reaproveita nas chamadas
+// seguintes — medido: ~29ms/item pendente antes vs. bem menos depois,
+// contra o catálogo real (ver measure-nfe-matching.tmp.mjs). scoreNameSimilarity
+// continua intocada (mesma assinatura/comportamento, ainda usada direto pelos
+// testes) — o cache vive só dentro de suggestBestMatch.
+const candidateWordsCache = new WeakMap<NameCandidate, Set<string>>();
+
+function cachedCandidateWords(candidate: NameCandidate): Set<string> {
+  let words = candidateWordsCache.get(candidate);
+  if (!words) {
+    words = wordsOf(candidate.produto);
+    candidateWordsCache.set(candidate, words);
+  }
+  return words;
+}
+
 /** threshold default 0.25: exige uma sobreposição real de palavras, não uma coincidência de uma letra/número solto. */
 export function suggestBestMatch(description: string, candidates: NameCandidate[], threshold = 0.25): NameSuggestion | null {
+  const queryWords = wordsOf(description);
+  if (queryWords.size === 0) return null;
+
   let best: NameCandidate | null = null;
   let bestScore = 0;
   for (const candidate of candidates) {
-    const score = scoreNameSimilarity(description, candidate.produto);
+    const candidateWords = cachedCandidateWords(candidate);
+    if (candidateWords.size === 0) continue;
+    let intersection = 0;
+    for (const w of queryWords) if (candidateWords.has(w)) intersection++;
+    const union = new Set([...queryWords, ...candidateWords]).size;
+    const score = union > 0 ? intersection / union : 0;
     if (score > bestScore) {
       bestScore = score;
       best = candidate;
