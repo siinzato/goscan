@@ -36,6 +36,39 @@ test("resolveInvoiceItem NUNCA vincula sozinho quando o EAN bate em mais de um p
 });
 
 // ---------------------------------------------------------------------------
+// CORREÇÃO — cProd-como-EAN: medido contra o backlog real de pendências do
+// usuário, 27 de 31 itens sem EAN declarado (cEAN "SEM GTIN") tinham cProd
+// batendo com EXATAMENTE 1 produto ativo cadastrado por gtin_normalized —
+// fornecedores importadores gravam o GTIN de verdade do fabricante em cProd
+// quando não preenchem cEAN/cEANTrib. Vincula automaticamente só quando a NF
+// não declarou EAN nenhum e a correspondência por cProd-como-EAN é única.
+// ---------------------------------------------------------------------------
+test("resolveInvoiceItem vincula por cProd-como-EAN quando a NF não declara EAN nenhum e o código do fornecedor bate com o GTIN de exatamente um produto ativo", () => {
+  const result = resolveInvoiceItem({ invoice_product_code: "6902048304918", ean: null }, [
+    { variant_id: "v5", sku_code: "CCNKM3GA17-1", gtin_normalized: "6902048304918" },
+  ]);
+  assert.equal(result.variant_id, "v5");
+  assert.equal(result.link_source, "cprod_ean");
+});
+
+test("resolveInvoiceItem NUNCA usa cProd-como-EAN se a NF já declarou um EAN próprio (mesmo que esse EAN não resolva sozinho)", () => {
+  const result = resolveInvoiceItem({ invoice_product_code: "6902048304918", ean: "0000000000000" }, [
+    { variant_id: "v5", sku_code: "CCNKM3GA17-1", gtin_normalized: "6902048304918" },
+  ]);
+  assert.equal(result.variant_id, null);
+  assert.equal(result.link_source, null);
+});
+
+test("resolveInvoiceItem NUNCA vincula sozinho por cProd-como-EAN quando bate em mais de um produto ativo", () => {
+  const result = resolveInvoiceItem({ invoice_product_code: "6902048304918", ean: null }, [
+    { variant_id: "v5", sku_code: "CCNKM3GA17-1", gtin_normalized: "6902048304918" },
+    { variant_id: "v6", sku_code: "OUTRO-1", gtin_normalized: "6902048304918" },
+  ]);
+  assert.equal(result.variant_id, null);
+  assert.equal(result.link_source, null);
+});
+
+// ---------------------------------------------------------------------------
 // CORREÇÃO — causa raiz do bug relatado ("EAN já cadastrado não vincula
 // automaticamente"): o EAN da NF pode chegar com espaço/pontuação/traço que o
 // EAN cadastrado (já normalizado em gtin_normalized) não tem — a comparação
@@ -158,4 +191,26 @@ test("suggestBestMatch retorna null quando nada passa do limiar (nunca sugere qu
 
 test("suggestBestMatch retorna null pra lista vazia de candidatos", () => {
   assert.equal(suggestBestMatch("Bolsa Térmica Mix", []), null);
+});
+
+// ---------------------------------------------------------------------------
+// CORREÇÃO — causa raiz de "sugere produto errado": duas variantes (cor/
+// tamanho) do mesmo produto-base compartilham o campo `produto`, então
+// empatam na similaridade de nome contra a mesma descrição da NF. Escolher
+// a de maior score sozinha vira um cara-ou-coroa que erra a variante — igual
+// ao EAN duplicado, quando ambíguo não deve sugerir, só pedir busca manual.
+// ---------------------------------------------------------------------------
+test("suggestBestMatch NUNCA sugere quando duas variantes empatam de perto na similaridade (ambíguo)", () => {
+  const tiedVariants = [
+    { variant_id: "v-azul", sku_code: "BTM-AZ", produto: "Bolsa Térmica Mix" },
+    { variant_id: "v-verde", sku_code: "BTM-VD", produto: "Bolsa Térmica Mix" },
+  ];
+  const result = suggestBestMatch("BOLSA TERMICA MIX BB BRUTA MARROM", tiedVariants);
+  assert.equal(result, null, "esperava null por ambiguidade entre variantes empatadas");
+});
+
+test("suggestBestMatch ainda sugere normalmente quando o 2º colocado fica bem abaixo do 1º (não é empate)", () => {
+  const result = suggestBestMatch("BOLSA TERMICA MIX BB BRUTA MARROM", normalCandidates);
+  assert.ok(result, "esperava uma sugestão quando não há ambiguidade real");
+  assert.equal(result.candidate.sku_code, "BTM-1");
 });

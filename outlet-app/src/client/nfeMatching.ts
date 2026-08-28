@@ -6,7 +6,7 @@
 // esta função só decide, dentro do que já veio filtrado, qual candidato bate.
 import { normalize, normalizeEan, isValidEanFormat } from "./utils.ts";
 
-export type LinkSource = "sku" | "ean" | "alias" | null;
+export type LinkSource = "sku" | "ean" | "cprod_ean" | "alias" | null;
 
 export interface InvoiceItemKey {
   invoice_product_code: string;
@@ -79,6 +79,27 @@ export function resolveInvoiceItem(item: InvoiceItemKey, candidates: NormalVaria
     // "não encontrado" (ver mensagem diferenciada na UI).
     const byEan = candidates.filter((c) => c.gtin_normalized === ean);
     if (byEan.length === 1) return { variant_id: byEan[0].variant_id, link_source: "ean" };
+  }
+
+  // CORREÇÃO — vários fornecedores (confirmado com dados reais: importadoras
+  // que despacham via DI, cEAN/cEANTrib gravados como "SEM GTIN") colocam o
+  // GTIN/EAN de verdade do FABRICANTE em cProd (invoice_product_code) — não
+  // um código interno arbitrário. Medido contra o backlog real de pendências
+  // do usuário: 27 de 31 itens sem EAN declarado tinham cProd batendo com
+  // EXATAMENTE 1 produto ativo cadastrado por gtin_normalized, zero
+  // ambíguos — não é coincidência de dígitos, é o EAN de verdade vindo por
+  // outro campo. SÓ tenta este fallback quando a NF não declarou EAN
+  // nenhum (ean ausente) — nunca compete com um EAN realmente declarado,
+  // mesmo que esse não tenha resolvido sozinho (evita confundir os dois
+  // motivos de pendência). Mesma regra de segurança do EAN declarado: só
+  // vincula sozinho com correspondência única; duas ou mais vai pra
+  // pendência igual a qualquer outro caso ambíguo.
+  if (!ean && code) {
+    const codeAsEan = normalizeEan(item.invoice_product_code);
+    if (isValidEanFormat(codeAsEan)) {
+      const byCodeEan = candidates.filter((c) => c.gtin_normalized === codeAsEan);
+      if (byCodeEan.length === 1) return { variant_id: byCodeEan[0].variant_id, link_source: "cprod_ean" };
+    }
   }
 
   if (aliases) {
@@ -220,6 +241,19 @@ function cachedCandidateWords(candidate: NameCandidate): Set<string> {
   return words;
 }
 
+/**
+ * Margem mínima entre o 1º e o 2º colocado pra considerar a sugestão
+ * inequívoca. CORREÇÃO — causa raiz de "sugere produto errado": o catálogo
+ * tem muitas variantes (cor/tamanho) do mesmo produto-base com o nome quase
+ * idêntico, então duas ou mais linhas frequentemente empatam (ou quase) na
+ * similaridade de nome contra a MESMA descrição da NF — o antigo código
+ * pegava só o maior score e ignorava o empate, então "qual variante" virava
+ * um cara-ou-coroa que às vezes acertava a cor errada. Mesma lógica já
+ * aplicada ao EAN duplicado (resolveInvoiceItem, acima): quando ambíguo,
+ * nunca escolhe sozinho — melhor pedir busca manual do que arriscar errar.
+ */
+const AMBIGUITY_GAP = 0.05;
+
 /** threshold default 0.25: exige uma sobreposição real de palavras, não uma coincidência de uma letra/número solto. */
 export function suggestBestMatch(description: string, candidates: NameCandidate[], threshold = 0.25): NameSuggestion | null {
   const queryWords = wordsOf(description);
@@ -227,6 +261,7 @@ export function suggestBestMatch(description: string, candidates: NameCandidate[
 
   let best: NameCandidate | null = null;
   let bestScore = 0;
+  let secondScore = 0;
   for (const candidate of candidates) {
     const candidateWords = cachedCandidateWords(candidate);
     if (candidateWords.size === 0) continue;
@@ -235,9 +270,14 @@ export function suggestBestMatch(description: string, candidates: NameCandidate[
     const union = new Set([...queryWords, ...candidateWords]).size;
     const score = union > 0 ? intersection / union : 0;
     if (score > bestScore) {
+      secondScore = bestScore;
       bestScore = score;
       best = candidate;
+    } else if (score > secondScore) {
+      secondScore = score;
     }
   }
-  return best && bestScore >= threshold ? { candidate: best, score: bestScore } : null;
+  if (!best || bestScore < threshold) return null;
+  if (secondScore >= threshold && bestScore - secondScore < AMBIGUITY_GAP) return null;
+  return { candidate: best, score: bestScore };
 }

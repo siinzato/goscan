@@ -316,7 +316,15 @@ export async function createReceiptFromParsed(parsed: NfeParsed, xml: string): P
 
   const codes = parsed.items.map((i) => i.invoice_product_code);
   const eans = parsed.items.map((i) => i.ean).filter((e): e is string => !!e);
-  const [candidates, aliases] = await Promise.all([fetchNormalCandidates(codes, eans), fetchAliasMaps(codes, eans)]);
+  // CORREÇÃO — cProd-como-EAN (ver resolveInvoiceItem em nfeMatching.ts):
+  // só busca candidatos por gtin_normalized=cProd pra itens que NÃO
+  // declararam EAN nenhum (cEAN "SEM GTIN"/ausente) — nunca para os que já
+  // têm EAN próprio, mesmo que esse não resolva sozinho.
+  const codesAsEanFallback = parsed.items.filter((i) => !i.ean).map((i) => i.invoice_product_code).filter((c) => isValidEanFormat(normalizeEan(c)));
+  const [candidates, aliases] = await Promise.all([
+    fetchNormalCandidates(codes, [...eans, ...codesAsEanFallback]),
+    fetchAliasMaps(codes, eans),
+  ]);
 
   const { data: receiptRow, error: receiptError } = await supabase
     .from("invoice_receipts")
