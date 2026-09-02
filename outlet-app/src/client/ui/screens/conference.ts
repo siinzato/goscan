@@ -567,13 +567,22 @@ function wireSkuPickers(wrap: Element): void {
   wrap.querySelectorAll<HTMLInputElement>(".sku-picker-input").forEach((input) => {
     const idx = Number(input.dataset.idx);
     const resultsBox = input.parentElement!.querySelector<HTMLDivElement>(".sku-picker-results")!;
+    // PERFORMANCE — faltava cancelar a busca anterior: sem abortSignal, cada
+    // tecla empilhava uma busca nova sem cancelar as anteriores ainda em
+    // voo, e uma resposta antiga podia chegar DEPOIS da mais recente e
+    // sobrescrevê-la (mesmo padrão já usado em nfeConference.ts).
+    let activeController: AbortController | null = null;
 
     const search = debounce(async (query: string) => {
+      activeController?.abort();
       if (!query.trim()) {
         resultsBox.hidden = true;
         return;
       }
-      const rows = await searchSkuForPicker(query, 15, "outlet");
+      const controller = new AbortController();
+      activeController = controller;
+      const rows = await searchSkuForPicker(query, 15, "outlet", controller.signal, false);
+      if (controller.signal.aborted) return;
       renderResults(rows);
     }, 300);
 
@@ -743,13 +752,21 @@ function wireItemSkuFix(wrap: Element): void {
   wrap.querySelectorAll<HTMLInputElement>("[data-item-fix-input]").forEach((input) => {
     const uiId = input.dataset.itemFixInput!;
     const resultsBox = input.parentElement!.querySelector<HTMLDivElement>(".sku-picker-results")!;
+    // PERFORMANCE — mesma correção de wireSkuPickers: cancela a busca
+    // anterior a cada nova tecla, nunca deixa uma resposta velha sobrescrever
+    // a mais recente.
+    let activeController: AbortController | null = null;
 
     const search = debounce(async (query: string) => {
+      activeController?.abort();
       if (!query.trim()) {
         resultsBox.hidden = true;
         return;
       }
-      const rows = await searchSkuForPicker(query, 15, "outlet");
+      const controller = new AbortController();
+      activeController = controller;
+      const rows = await searchSkuForPicker(query, 15, "outlet", controller.signal, false);
+      if (controller.signal.aborted) return;
       renderResults(rows);
     }, 300);
 

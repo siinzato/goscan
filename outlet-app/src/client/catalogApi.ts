@@ -70,8 +70,8 @@ export function invalidateSearchCache(): void {
   searchCache.clear();
 }
 
-function cacheKey(query: string, page: number, pageSize: number, productType?: ProductType): string {
-  return `${productType ?? "*"}::${page}::${pageSize}::${query.trim().toLowerCase()}`;
+function cacheKey(query: string, page: number, pageSize: number, productType?: ProductType, includeThumbnails = true): string {
+  return `${productType ?? "*"}::${page}::${pageSize}::${includeThumbnails ? "thumb" : "nothumb"}::${query.trim().toLowerCase()}`;
 }
 
 /**
@@ -94,9 +94,15 @@ export async function searchCatalog(
   page = 0,
   pageSize = 50,
   productType?: ProductType,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  // PERFORMANCE — vários pickers de SKU (busca de vínculo manual na
+  // conferência/NF-e/devolução) renderizam só texto (produto/cor/SKU), nunca
+  // a miniatura — mas pagavam a mesma 3ª ida-e-volta de rede (product_images)
+  // do catálogo visual, que É quem precisa da miniatura. false pula essa
+  // consulta inteira pra quem não vai exibir a imagem mesmo.
+  includeThumbnails = true
 ): Promise<CatalogPage> {
-  const key = cacheKey(query, page, pageSize, productType);
+  const key = cacheKey(query, page, pageSize, productType, includeThumbnails);
   const cached = searchCache.get(key);
   if (cached) return cached;
 
@@ -180,11 +186,7 @@ export async function searchCatalog(
   if (error) throw error;
 
   const variantRows = (data as unknown as VariantJoinRow[]) || [];
-  const thumbnails = await fetchPrimaryThumbnails(
-    supabase,
-    variantRows.map((r) => r.id),
-    signal
-  );
+  const thumbnails = includeThumbnails ? await fetchPrimaryThumbnails(supabase, variantRows.map((r) => r.id), signal) : new Map<string, string>();
 
   let rows: CatalogRow[] = variantRows.map((r) => {
     const product = productJoin(r);
@@ -247,8 +249,20 @@ async function fetchPrimaryThumbnails(supabase: ReturnType<typeof getSupabase>, 
   return map;
 }
 
-/** Combobox de SKU/EAN com busca — nunca renderiza milhares de <option>. Usado na revisão manual (Resolver pendências) e no Modo Scan. */
-export async function searchSkuForPicker(query: string, limit = 20, productType?: ProductType, signal?: AbortSignal): Promise<CatalogRow[]> {
-  const page = await searchCatalog(query, 0, limit, productType, signal);
+/**
+ * Combobox de SKU/EAN com busca — nunca renderiza milhares de <option>. Usado
+ * na revisão manual (Resolver pendências) e no Modo Scan.
+ * `includeThumbnails` default true (Modo Scan exibe miniatura); os pickers
+ * só-texto (conferência Outlet, edição de vínculo na NF-e, devolução) passam
+ * false — ver comentário de performance em searchCatalog.
+ */
+export async function searchSkuForPicker(
+  query: string,
+  limit = 20,
+  productType?: ProductType,
+  signal?: AbortSignal,
+  includeThumbnails = true
+): Promise<CatalogRow[]> {
+  const page = await searchCatalog(query, 0, limit, productType, signal, includeThumbnails);
   return page.rows;
 }

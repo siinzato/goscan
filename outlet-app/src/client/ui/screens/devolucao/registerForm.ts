@@ -575,7 +575,7 @@ function wireManualPicker(container: HTMLElement, onPick: (variant: CatalogRow) 
     controller?.abort();
     controller = new AbortController();
     try {
-      const rows = await searchSkuForPicker(query, 15, undefined, controller.signal);
+      const rows = await searchSkuForPicker(query, 15, undefined, controller.signal, false);
       renderResults(rows);
     } catch {
       // busca cancelada/abortada — ignora silenciosamente

@@ -1126,10 +1126,22 @@ function renderTrainingProductSelect(body: HTMLElement): void {
   const input = body.querySelector<HTMLInputElement>("#trainProductSearch")!;
   const results = body.querySelector("#trainProductResults")!;
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  // PERFORMANCE — mesma correção do picker de conferência: cancela a busca
+  // anterior a cada nova tecla (nunca deixa uma resposta velha sobrescrever a
+  // mais recente) e pula a miniatura (renderTrainingProductResults é só texto).
+  let activeController: AbortController | null = null;
   input.addEventListener("input", () => {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(async () => {
-      const rows = input.value.trim() ? await searchSkuForPicker(input.value, 15, "outlet") : [];
+      activeController?.abort();
+      if (!input.value.trim()) {
+        renderTrainingProductResults(results, [], body);
+        return;
+      }
+      const controller = new AbortController();
+      activeController = controller;
+      const rows = await searchSkuForPicker(input.value, 15, "outlet", controller.signal, false);
+      if (controller.signal.aborted) return;
       renderTrainingProductResults(results, rows, body);
     }, 300);
   });

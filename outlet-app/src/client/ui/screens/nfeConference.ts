@@ -1053,7 +1053,7 @@ function wirePendingItemPickers(root: HTMLElement): void {
       resultsBox.innerHTML = `<div class="sku-picker-empty">Buscando…</div>`;
       let rows: CatalogRow[];
       try {
-        rows = await searchSkuForPicker(q, 15, "normal", controller.signal);
+        rows = await searchSkuForPicker(q, 15, "normal", controller.signal, false);
       } catch {
         if (controller.signal.aborted) return;
         renderError(q);
@@ -1560,7 +1560,7 @@ function wireCountingItemEdit(root: HTMLElement, scope: ParentNode): void {
       resultsBox.innerHTML = `<div class="sku-picker-empty">Buscando…</div>`;
       let rows: CatalogRow[];
       try {
-        rows = await searchSkuForPicker(q, 15, "normal", controller.signal);
+        rows = await searchSkuForPicker(q, 15, "normal", controller.signal, false);
       } catch {
         if (controller.signal.aborted) return;
         renderError(q);
