@@ -935,10 +935,17 @@ async function renderPendingSuggestions(root: HTMLElement, pending: InvoiceRecei
       </div>`;
 
     container.querySelector(`[data-suggestion-yes="${item.id}"]`)!.addEventListener("click", async () => {
-      const memorize = (root.querySelector(`[data-pending-memorize="${item.id}"]`) as HTMLInputElement)?.checked ?? false;
+      // CORREÇÃO — memorizar deixou de ser opt-in (checkbox quase nunca
+      // marcada na prática, medido contra o histórico real: dezenas de
+      // códigos de fornecedor resolvidos manualmente sem gerar alias,
+      // forçando o operador a resolver o MESMO item de novo em toda NF
+      // seguinte). Toda vinculação manual/confirmação de sugestão passa a
+      // sempre memorizar — memorizeAlias já é um upsert, então uma escolha
+      // posterior sempre sobrescreve a anterior sem risco de travar num
+      // erro antigo.
       try {
         const updated = await resolveItemManually(item.id, suggestion.candidate.variant_id, {
-          memorize,
+          memorize: true,
           invoiceProductCode: item.invoice_product_code,
           ean: item.ean,
         });
@@ -1021,9 +1028,7 @@ function renderPendingItemCard(it: InvoiceReceiptItem): string {
         <input type="text" class="sku-picker-input" aria-label="Buscar produto normal" placeholder="Buscar por palavra-chave do nome, SKU ou EAN…" data-pending-input="${it.id}" />
         <div class="sku-picker-results" hidden></div>
       </div>
-      <label class="hint-text" style="display:flex;align-items:center;gap:6px;margin-top:6px">
-        <input type="checkbox" data-pending-memorize="${it.id}" /> Memorizar associação para próximas notas
-      </label>
+      <p class="hint-text" style="margin-top:6px">Ao vincular, esta associação é memorizada automaticamente pra próximas notas deste fornecedor.</p>
     </div>`;
 }
 
@@ -1098,10 +1103,9 @@ function wirePendingItemPickers(root: HTMLElement): void {
       resultsBox.querySelectorAll<HTMLButtonElement>(".sku-picker-item").forEach((btn) => {
         btn.addEventListener("click", async () => {
           const item = currentItems.find((i) => i.id === itemId)!;
-          const memorize = (root.querySelector(`[data-pending-memorize="${itemId}"]`) as HTMLInputElement)?.checked ?? false;
           try {
             const updated = await resolveItemManually(itemId, btn.dataset.variant!, {
-              memorize,
+              memorize: true,
               invoiceProductCode: item.invoice_product_code,
               ean: item.ean,
             });
@@ -1606,10 +1610,9 @@ function wireCountingItemEdit(root: HTMLElement, scope: ParentNode): void {
         resultBtn.addEventListener("click", async () => {
           const item = currentItems.find((i) => i.id === itemId);
           if (!item) return;
-          const memorize = (scope.querySelector(`[data-edit-memorize="${itemId}"]`) as HTMLInputElement)?.checked ?? false;
           try {
             const updated = await resolveItemManually(itemId, resultBtn.dataset.variant!, {
-              memorize,
+              memorize: true,
               invoiceProductCode: item.invoice_product_code,
               ean: item.ean,
             });
@@ -1828,9 +1831,7 @@ function renderCountingCard(it: InvoiceReceiptItem): string {
         <p class="hint-text">Produto errado? Busque e escolha o produto correto pra este item da NF.</p>
         <input type="text" class="sku-picker-input" aria-label="Buscar produto correto" placeholder="Buscar por nome, SKU ou EAN…" data-edit-input="${it.id}" />
         <div class="sku-picker-results" hidden></div>
-        <label class="hint-text" style="display:flex;align-items:center;gap:6px;margin-top:6px">
-          <input type="checkbox" data-edit-memorize="${it.id}" /> Memorizar associação para próximas notas
-        </label>
+        <p class="hint-text" style="margin-top:6px">Ao vincular, esta associação é memorizada automaticamente pra próximas notas deste fornecedor.</p>
       </div>
       <div class="product-card-bottom">
         <div class="qty-stepper">
