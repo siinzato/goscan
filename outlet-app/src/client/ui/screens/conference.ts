@@ -1,4 +1,4 @@
-import { escapeHtml, debounce, renderErrorWithRetry } from "../../utils.ts";
+import { escapeHtml, debounce, renderErrorWithRetry, describeError } from "../../utils.ts";
 import { matchItems, matchItem, type MatchResult } from "../../matching.ts";
 import { parseImagesLocally } from "../../ocr.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
@@ -301,10 +301,22 @@ function wireInputModeSwitch(root: HTMLElement): void {
         const container = root.querySelector<HTMLElement>("#nfeConferenceRoot")!;
         if (!nfeConferenceMounted) {
           nfeConferenceMounted = true;
-          void (nfeConferenceModule ? Promise.resolve(nfeConferenceModule) : import("./nfeConference.ts")).then((m) => {
-            nfeConferenceModule = m;
-            void m.renderNfeConference(container);
-          });
+          // CORREÇÃO — falha no import/render (ex.: erro de rede baixando o
+          // chunk, ou uma exceção dentro do módulo) deixava a tela em branco
+          // PRA SEMPRE: a flag nfeConferenceMounted já tinha virado true, e
+          // nada tratava o reject, então nunca mais tentava de novo nem
+          // avisava o operador — só um refresh completo da página resolvia.
+          // Agora mostra erro com "Tentar novamente" e libera a flag pra
+          // permitir nova tentativa.
+          void (nfeConferenceModule ? Promise.resolve(nfeConferenceModule) : import("./nfeConference.ts"))
+            .then((m) => {
+              nfeConferenceModule = m;
+              return m.renderNfeConference(container);
+            })
+            .catch((err) => {
+              nfeConferenceMounted = false;
+              renderErrorWithRetry(container, "Erro ao carregar a Conferência por Nota Fiscal: " + describeError(err), () => btn.click());
+            });
         }
       }
 
