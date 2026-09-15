@@ -68,6 +68,7 @@ const SEARCH_CACHE_MAX = 200;
 
 export function invalidateSearchCache(): void {
   searchCache.clear();
+  pickerRpcCache.clear();
 }
 
 function cacheKey(query: string, page: number, pageSize: number, productType?: ProductType, includeThumbnails = true): string {
@@ -249,12 +250,117 @@ async function fetchPrimaryThumbnails(supabase: ReturnType<typeof getSupabase>, 
   return map;
 }
 
+// ---------------------------------------------------------------------------
+// PERFORMANCE — RPC do picker de SKU (ver migration
+// 0054_search_sku_picker_rpc.sql): colapsa as 2 idas-e-voltas de
+// searchCatalog (achar product_id por nome/categoria/família/capacidade,
+// SÓ DEPOIS buscar as variantes) numa única .rpc(), para quem não precisa
+// de miniatura/paginação/count — só os pickers de vínculo manual
+// (conferência Outlet, NF-e, devolução, treino visual). Reaproveita
+// EXATAMENTE os mesmos valores já normalizados que searchCatalog calcula
+// (normalize()/normalizeEan()/isValidEanFormat() — nenhuma segunda regra de
+// normalização). searchCatalog continua intocada para catálogo/paginação/
+// contagem/miniatura.
+// ---------------------------------------------------------------------------
+interface SearchSkuPickerRpcRow {
+  variant_id: string;
+  product_id: string;
+  sku_code: string;
+  color: string | null;
+  gtin: string | null;
+  gtin_normalized: string | null;
+  produto: string;
+  category: string | null;
+  visual_family_key: string | null;
+  capacity_ml: number | null;
+  product_type: ProductType;
+  match_type: CatalogMatchType;
+}
+
+const pickerRpcCache = new Map<string, CatalogRow[]>();
+const PICKER_RPC_CACHE_MAX = 200;
+
+function pickerRpcCacheKey(query: string, limit: number, productType?: ProductType): string {
+  return `${productType ?? "*"}::${limit}::${query.trim().toLowerCase()}`;
+}
+
+async function searchSkuForPickerRpc(query: string, limit: number, productType: ProductType | undefined, signal: AbortSignal | undefined): Promise<CatalogRow[]> {
+  const key = pickerRpcCacheKey(query, limit, productType);
+  const cached = pickerRpcCache.get(key);
+  if (cached) return cached;
+
+  const supabase = getSupabase();
+  const q = query.trim();
+  const safeQ = q.replace(/[,()%]/g, "");
+  const normalizedEanQuery = normalizeEan(safeQ);
+  const looksLikeFullEan = isValidEanFormat(normalizedEanQuery);
+  const eanPrefix = !looksLikeFullEan && normalizedEanQuery.length >= 6 ? normalizedEanQuery : null;
+  const upperSafeQ = safeQ.toUpperCase();
+  const lowerQ = normalize(safeQ);
+  const digitsOnly = safeQ.match(/\d+/)?.[0];
+  const nameWords = lowerQ.split(" ").filter(Boolean);
+  // CORREÇÃO — um EAN completo (13+ dígitos) também "parece" um grupo
+  // numérico de capacidade pro regex acima; sem este limite, o valor
+  // estourava o range de integer do Postgres (p_capacity_ml integer) e
+  // derrubava a chamada RPC inteira antes de sequer tentar o match por
+  // gtin_normalized. Fora do range válido de integer, capacidade
+  // simplesmente não é um critério aplicável — vai null, a busca por
+  // SKU/EAN/texto continua normalmente pelos outros critérios.
+  const PG_INTEGER_MAX = 2147483647;
+  const capacityCandidate = digitsOnly ? Number(digitsOnly) : null;
+  const capacityMl = capacityCandidate !== null && Number.isSafeInteger(capacityCandidate) && capacityCandidate <= PG_INTEGER_MAX ? capacityCandidate : null;
+
+  let builder = supabase.rpc("search_sku_picker", {
+    p_name_words: nameWords,
+    p_category_ilike: `%${lowerQ}%`,
+    p_family_ilike: `%${lowerQ}%`,
+    p_capacity_ml: capacityMl,
+    p_sku_ilike: `%${safeQ}%`,
+    p_gtin_exact: looksLikeFullEan ? normalizedEanQuery : null,
+    p_gtin_prefix_ilike: eanPrefix ? `${eanPrefix}%` : null,
+    p_product_type: productType ?? null,
+    p_upper_sku: upperSafeQ,
+    p_limit: limit,
+  });
+  if (signal) builder = builder.abortSignal(signal);
+
+  const { data, error } = await builder;
+  if (error) throw error;
+
+  const rows: CatalogRow[] = ((data as unknown as SearchSkuPickerRpcRow[]) || []).map((r) => ({
+    variant_id: r.variant_id,
+    product_id: r.product_id,
+    produto: r.produto,
+    base: r.produto,
+    cor: r.color,
+    sku_code: r.sku_code,
+    gtin: r.gtin,
+    category: r.category,
+    visual_family_key: r.visual_family_key,
+    capacity_ml: r.capacity_ml,
+    thumbnail_path: null,
+    product_type: r.product_type,
+    match_type: r.match_type,
+  }));
+
+  pickerRpcCache.set(key, rows);
+  if (pickerRpcCache.size > PICKER_RPC_CACHE_MAX) pickerRpcCache.clear();
+  return rows;
+}
+
 /**
  * Combobox de SKU/EAN com busca — nunca renderiza milhares de <option>. Usado
  * na revisão manual (Resolver pendências) e no Modo Scan.
  * `includeThumbnails` default true (Modo Scan exibe miniatura); os pickers
  * só-texto (conferência Outlet, edição de vínculo na NF-e, devolução) passam
  * false — ver comentário de performance em searchCatalog.
+ *
+ * PERFORMANCE — quando includeThumbnails é false, tenta primeiro a RPC de
+ * busca em ida única (ver bloco acima). Se ela falhar por qualquer motivo
+ * que não seja o próprio cancelamento do operador (função ainda não
+ * migrada pro banco dessa instalação, erro pontual etc.), cai pro caminho
+ * antigo (searchCatalog) sem quebrar o picker nem mostrar erro técnico —
+ * nunca deixa o GoScan parar de funcionar por causa desta otimização.
  */
 export async function searchSkuForPicker(
   query: string,
@@ -263,6 +369,17 @@ export async function searchSkuForPicker(
   signal?: AbortSignal,
   includeThumbnails = true
 ): Promise<CatalogRow[]> {
+  if (!includeThumbnails && query.trim()) {
+    try {
+      return await searchSkuForPickerRpc(query, limit, productType, signal);
+    } catch (err) {
+      if (signal?.aborted) throw err; // cancelamento do operador — nunca é "falha da RPC", deixa o chamador tratar como sempre tratou
+      if (import.meta.env.DEV) {
+        console.warn("[GoScan] search_sku_picker RPC indisponível, usando busca antiga:", err);
+      }
+      // cai pro caminho antigo — nunca quebra o picker por causa desta otimização.
+    }
+  }
   const page = await searchCatalog(query, 0, limit, productType, signal, includeThumbnails);
   return page.rows;
 }
