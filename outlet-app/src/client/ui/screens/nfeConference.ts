@@ -38,6 +38,7 @@ import {
   type CountEventOptions,
   type ReceiptVolume,
   type ReservationConflictInfo,
+  type AliasMemorizeOutcome,
 } from "../../nfeApi.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
 import { exportNfeReportToXlsx } from "../../exporter.ts";
@@ -55,6 +56,23 @@ import { confirmAction, chooseAction, promptText } from "../confirmModal.ts";
 import { getTinyWarehouses, launchInvoiceReceiptToTiny, TinyIntegrationError, type TinyWarehouse, type TinyLaunchOutcome } from "../../tinyIntegrationApi.ts";
 
 type NfeView = "upload" | "prep" | "mode" | "counting" | "result" | "history";
+
+/**
+ * FASE 3 — vínculo e memorização são operações distintas (ver
+ * resolveItemManually em nfeApi.ts): o vínculo já foi salvo com sucesso
+ * sempre que chegamos aqui, então NUNCA mostra "Erro ao vincular" por causa
+ * da memorização — só avisa quando ela não pôde ser salva/gerou conflito,
+ * sem nunca esconder isso do operador.
+ */
+function toastLinkResult(produto: string, aliasOutcome: AliasMemorizeOutcome | undefined): void {
+  if (aliasOutcome === "conflict") {
+    showToast(`Vinculado a "${produto}". Já existe uma associação memorizada diferente para este código — mantida como estava.`, "default");
+  } else if (aliasOutcome === "error") {
+    showToast(`Vinculado a "${produto}", mas não foi possível memorizar para próximas notas.`, "default");
+  } else {
+    showToast(`Vinculado a "${produto}".`, "success");
+  }
+}
 
 let view: NfeView = "upload";
 let currentReceipt: InvoiceReceiptWithNames | null = null;
@@ -940,9 +958,9 @@ async function renderPendingSuggestions(root: HTMLElement, pending: InvoiceRecei
       // códigos de fornecedor resolvidos manualmente sem gerar alias,
       // forçando o operador a resolver o MESMO item de novo em toda NF
       // seguinte). Toda vinculação manual/confirmação de sugestão passa a
-      // sempre memorizar — memorizeAlias já é um upsert, então uma escolha
-      // posterior sempre sobrescreve a anterior sem risco de travar num
-      // erro antigo.
+      // sempre memorizar — nunca sobrescreve uma associação conflitante (ver
+      // memorizeAlias em nfeApi.ts) e nunca reporta "erro ao vincular" só
+      // porque a memorização falhou (ver toastLinkResult acima).
       try {
         const updated = await resolveItemManually(item.id, suggestion.candidate.variant_id, {
           memorize: true,
@@ -952,7 +970,7 @@ async function renderPendingSuggestions(root: HTMLElement, pending: InvoiceRecei
         currentItems = currentItems.map((i) =>
           i.id === item.id ? { ...i, ...updated, sku_code: suggestion.candidate.sku_code, produto: suggestion.candidate.produto, catalog_ean: suggestion.candidate.gtin } : i
         );
-        showToast(`Vinculado a "${suggestion.candidate.produto}".`, "success");
+        toastLinkResult(suggestion.candidate.produto, updated.aliasOutcome);
         void renderNfeConference(root);
       } catch (err) {
         showToast("Erro ao vincular: " + (describeError(err)), "error");
@@ -1115,7 +1133,7 @@ function wirePendingItemPickers(root: HTMLElement): void {
             currentItems = currentItems.map((i) =>
               i.id === itemId ? { ...i, ...updated, sku_code: btn.dataset.sku!, produto: btn.dataset.produto!, catalog_ean: btn.dataset.ean || null } : i
             );
-            showToast(`Vinculado a "${btn.dataset.produto}".`, "success");
+            toastLinkResult(btn.dataset.produto!, updated.aliasOutcome);
             void renderNfeConference(root);
           } catch (err) {
             showToast("Erro ao vincular: " + (describeError(err)), "error");
@@ -1621,7 +1639,7 @@ function wireCountingItemEdit(root: HTMLElement, scope: ParentNode): void {
                 ? { ...i, ...updated, sku_code: resultBtn.dataset.sku!, produto: resultBtn.dataset.produto!, catalog_ean: resultBtn.dataset.ean || null }
                 : i
             );
-            showToast(`Vinculado a "${resultBtn.dataset.produto}".`, "success");
+            toastLinkResult(resultBtn.dataset.produto!, updated.aliasOutcome);
             if (!updateSingleCountingCard(root, itemId)) renderCountingList(root);
           } catch (err) {
             showToast("Erro ao vincular: " + describeError(err), "error");

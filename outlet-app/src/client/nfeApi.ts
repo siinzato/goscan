@@ -413,12 +413,24 @@ export async function createReceiptFromParsed(parsed: NfeParsed, xml: string): P
   return { receipt, items: (insertedItems as InvoiceReceiptItem[]) || [] };
 }
 
-/** Vínculo manual (busca do operador na tela de preparação) — sempre marca link_source='manual'. */
+/** FASE 3 — resultado da tentativa de memorizar, nunca lançado como erro pra não confundir "vínculo falhou" com "aprendizado não pôde ser salvo" (ver resolveItemManually). */
+export type AliasMemorizeOutcome = "created" | "already_correct" | "conflict" | "error" | "skipped";
+
+/**
+ * Vínculo manual (busca do operador na tela de preparação) — sempre marca
+ * link_source='manual'.
+ *
+ * FASE 3 — CORREÇÃO: o vínculo do item (sempre bem-sucedido se chegou aqui)
+ * nunca deve aparecer como "Erro ao vincular" só porque a MEMORIZAÇÃO
+ * falhou depois — são duas operações distintas. `aliasOutcome` no retorno
+ * deixa o chamador decidir como avisar o operador, sem nunca reverter ou
+ * esconder o vínculo que já foi salvo com sucesso.
+ */
 export async function resolveItemManually(
   itemId: string,
   variantId: string,
   opts?: { memorize?: boolean; invoiceProductCode?: string | null; ean?: string | null }
-): Promise<InvoiceReceiptItem> {
+): Promise<InvoiceReceiptItem & { aliasOutcome?: AliasMemorizeOutcome }> {
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from("invoice_receipt_items")
@@ -428,28 +440,64 @@ export async function resolveItemManually(
     .single();
   if (error) throw error;
 
-  if (opts?.memorize) {
-    await memorizeAlias({ invoiceProductCode: opts.invoiceProductCode ?? null, ean: opts.ean ?? null, variantId });
-  }
+  const item = data as InvoiceReceiptItem;
+  if (!opts?.memorize) return item;
 
-  return data as InvoiceReceiptItem;
+  let aliasOutcome: AliasMemorizeOutcome;
+  try {
+    aliasOutcome = await memorizeAlias({ invoiceProductCode: opts.invoiceProductCode ?? null, ean: opts.ean ?? null, variantId });
+  } catch {
+    // Nunca deixa uma falha de memorização (ex.: RLS, rede) derrubar um
+    // vínculo que JÁ foi salvo com sucesso na linha acima.
+    aliasOutcome = "error";
+  }
+  return { ...item, aliasOutcome };
 }
 
-/** "Memorizar associação" — só usada como fallback em NFs futuras (ver resolveInvoiceItem), nunca sobrepõe SKU/EAN exatos. */
-export async function memorizeAlias(input: { invoiceProductCode: string | null; ean: string | null; variantId: string }): Promise<void> {
+/**
+ * "Memorizar associação" — só usada como fallback em NFs futuras (ver
+ * resolveInvoiceItem), nunca sobrepõe SKU/EAN exatos.
+ *
+ * FASE 3 — CORREÇÃO DE SEGURANÇA/RLS (causa raiz confirmada): a policy de
+ * UPDATE de invoice_sku_aliases exige is_manager_or_admin(), mas INSERT
+ * permite qualquer usuário ativo (ver 0023_nfe_receipts.sql). O antigo
+ * `.upsert(..., {onConflict})` vira `INSERT ... ON CONFLICT DO UPDATE` no
+ * Postgres — quando o conflito realmente acontecia (código já memorizado
+ * antes), o caminho de UPDATE rodava e um operador comum tomava erro de
+ * RLS, mesmo o vínculo do item já tendo sido salvo (ver resolveItemManually).
+ * Agora nunca faz UPDATE: lê o alias existente primeiro — inexistente
+ * insere (sempre permitido), aponta pra mesma variante é no-op seguro,
+ * aponta pra variante DIFERENTE é conflito explícito e NUNCA sobrescrito
+ * automaticamente (exige ação administrativa separada, fora desta fase).
+ */
+export async function memorizeAlias(input: { invoiceProductCode: string | null; ean: string | null; variantId: string }): Promise<AliasMemorizeOutcome> {
   const supabase = getSupabase();
   const createdBy = requireUserId();
   const code = input.invoiceProductCode?.trim() || null;
   const ean = input.ean?.trim() || null;
-  if (!code && !ean) return;
+  if (!code && !ean) return "skipped";
 
   // Índices únicos parciais são separados (invoice_product_code / ean) — só dá pra
-  // dar onConflict em um de cada vez. Prioriza o código (mais específico ao fornecedor).
-  const conflictTarget = code ? "invoice_product_code" : "ean";
-  const { error } = await supabase
-    .from("invoice_sku_aliases")
-    .upsert({ invoice_product_code: code, ean: code ? null : ean, product_variant_id: input.variantId, created_by: createdBy }, { onConflict: conflictTarget });
-  if (error) throw error;
+  // filtrar por um de cada vez. Prioriza o código (mais específico ao fornecedor).
+  const column = code ? "invoice_product_code" : "ean";
+  const key = code ?? (ean as string);
+
+  const { data: existing, error: selectError } = await supabase.from("invoice_sku_aliases").select("product_variant_id").eq(column, key).maybeSingle();
+  if (selectError) throw selectError;
+
+  if (!existing) {
+    const { error: insertError } = await supabase
+      .from("invoice_sku_aliases")
+      .insert({ invoice_product_code: code, ean: code ? null : ean, product_variant_id: input.variantId, created_by: createdBy });
+    if (insertError) throw insertError;
+    return "created";
+  }
+
+  if (existing.product_variant_id === input.variantId) return "already_correct";
+
+  // Conflito real — nunca sobrescreve silenciosamente (e nem poderia: essa
+  // linha exigiria UPDATE, que RLS restringe a manager/admin de propósito).
+  return "conflict";
 }
 
 /** Chamado ao entrar na tela de contagem — no-op se já não estiver 'not_started'. Marca started_at só na 1ª vez (usado no cabeçalho do relatório final). */
