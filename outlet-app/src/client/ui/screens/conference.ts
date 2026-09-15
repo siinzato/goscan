@@ -1,4 +1,4 @@
-import { escapeHtml, debounce, renderErrorWithRetry, describeError } from "../../utils.ts";
+import { escapeHtml, debounce, renderErrorWithRetry, describeError, parseConferirHash, type ConferirHashInfo } from "../../utils.ts";
 import { matchItems, matchItem, type MatchResult } from "../../matching.ts";
 import { parseImagesLocally } from "../../ocr.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
@@ -102,7 +102,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
         <div class="input-mode-switch">
           <button class="mode-btn active" data-mode="imagens">${Icon.camera}Prints (imagens)</button>
           <button class="mode-btn" data-mode="texto">${Icon.type}Colar texto</button>
-          <button class="mode-btn" data-mode="nfe">${Icon.receipt}Nota Fiscal</button>
+          <a class="mode-btn" data-mode="nfe" href="#/conferir/nfe">${Icon.receipt}Nota Fiscal</a>
           <button class="mode-btn" data-mode="devolucao">${Icon.undo2}Devolução</button>
         </div>
 
@@ -159,7 +159,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
       </div>
     </section>`;
 
-  wireInputModeSwitch(root);
+  wireInputModeSwitch(root, parseConferirHash(window.location.hash));
   wireImageInput(root);
   wireTextInput(root);
   wireCandidateActions(root);
@@ -280,58 +280,105 @@ export function teardownConference(): void {
   devolucaoModule?.teardownDevolucao();
 }
 
-function wireInputModeSwitch(root: HTMLElement): void {
+/**
+ * FASE 4 — navegação desktop: extraído do listener de clique pra poder ser
+ * chamado tanto por um clique real (mouse/touch) quanto programaticamente
+ * no mount inicial, quando o hash já pede `#/conferir/nfe` (deep
+ * link/F5/nova aba) — nunca duplica a lógica de montagem dos módulos NF-e/
+ * Devolução, só reusa exatamente o mesmo caminho de sempre.
+ * `hashInfo` reflete o hash no momento em que esta tela montou; o receiptId
+ * só é consumido na PRIMEIRA vez que o modo NF é montado nesta instância da
+ * tela (troca de sub-modo depois disso nunca reabre um receiptId antigo à
+ * toa).
+ */
+function wireInputModeSwitch(root: HTMLElement, hashInfo: ConferirHashInfo): void {
   const extraCards = root.querySelector<HTMLElement>("#outletExtraCards")!;
-  root.querySelectorAll<HTMLButtonElement>(".mode-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      root.querySelectorAll(".mode-btn").forEach((b) => b.classList.remove("active"));
-      root.querySelectorAll(".mode-panel").forEach((p) => p.classList.remove("active"));
-      btn.classList.add("active");
-      root.querySelector(`#mode-${btn.dataset.mode}`)?.classList.add("active");
+  let pendingNfeReceiptId = hashInfo.nfeReceiptId;
 
-      const isNfe = btn.dataset.mode === "nfe";
-      const isDevolucao = btn.dataset.mode === "devolucao";
-      // Cards "2. Revise antes de adicionar" e "3. Itens da conferência" são
-      // específicos do fluxo de correspondência por texto/print (Outlet) —
-      // não fazem sentido na Conferência por Nota Fiscal nem na Devolução,
-      // que têm seu próprio fluxo dentro do respectivo módulo.
-      extraCards.hidden = isNfe || isDevolucao;
+  function selectMode(mode: string, btn: HTMLElement): void {
+    root.querySelectorAll(".mode-btn").forEach((b) => b.classList.remove("active"));
+    root.querySelectorAll(".mode-panel").forEach((p) => p.classList.remove("active"));
+    btn.classList.add("active");
+    root.querySelector(`#mode-${mode}`)?.classList.add("active");
 
-      if (isNfe) {
-        const container = root.querySelector<HTMLElement>("#nfeConferenceRoot")!;
-        if (!nfeConferenceMounted) {
-          nfeConferenceMounted = true;
-          // CORREÇÃO — falha no import/render (ex.: erro de rede baixando o
-          // chunk, ou uma exceção dentro do módulo) deixava a tela em branco
-          // PRA SEMPRE: a flag nfeConferenceMounted já tinha virado true, e
-          // nada tratava o reject, então nunca mais tentava de novo nem
-          // avisava o operador — só um refresh completo da página resolvia.
-          // Agora mostra erro com "Tentar novamente" e libera a flag pra
-          // permitir nova tentativa.
-          void (nfeConferenceModule ? Promise.resolve(nfeConferenceModule) : import("./nfeConference.ts"))
-            .then((m) => {
-              nfeConferenceModule = m;
-              return m.renderNfeConference(container);
-            })
-            .catch((err) => {
-              nfeConferenceMounted = false;
-              renderErrorWithRetry(container, "Erro ao carregar a Conferência por Nota Fiscal: " + describeError(err), () => btn.click());
+    const isNfe = mode === "nfe";
+    const isDevolucao = mode === "devolucao";
+    // Cards "2. Revise antes de adicionar" e "3. Itens da conferência" são
+    // específicos do fluxo de correspondência por texto/print (Outlet) —
+    // não fazem sentido na Conferência por Nota Fiscal nem na Devolução,
+    // que têm seu próprio fluxo dentro do respectivo módulo.
+    extraCards.hidden = isNfe || isDevolucao;
+
+    if (isNfe) {
+      const container = root.querySelector<HTMLElement>("#nfeConferenceRoot")!;
+      if (!nfeConferenceMounted) {
+        nfeConferenceMounted = true;
+        // CORREÇÃO — falha no import/render (ex.: erro de rede baixando o
+        // chunk, ou uma exceção dentro do módulo) deixava a tela em branco
+        // PRA SEMPRE: a flag nfeConferenceMounted já tinha virado true, e
+        // nada tratava o reject, então nunca mais tentava de novo nem
+        // avisava o operador — só um refresh completo da página resolvia.
+        // Agora mostra erro com "Tentar novamente" e libera a flag pra
+        // permitir nova tentativa.
+        void (nfeConferenceModule ? Promise.resolve(nfeConferenceModule) : import("./nfeConference.ts"))
+          .then((m) => {
+            nfeConferenceModule = m;
+            return m.renderNfeConference(container).then(() => {
+              // FASE 4 — deep link: só depois do módulo NF já estar montado e
+              // renderizado é que dá pra abrir um receiptId específico
+              // (reaproveita getReceipt/decideViewForReceipt/goTo de dentro
+              // de nfeConference.ts, nunca duplica essa lógica aqui).
+              if (pendingNfeReceiptId) {
+                const id = pendingNfeReceiptId;
+                pendingNfeReceiptId = null;
+                return m.openReceiptFromRoute(container, id);
+              }
             });
-        }
-      }
-
-      if (isDevolucao) {
-        const container = root.querySelector<HTMLElement>("#devolucaoRoot")!;
-        if (!devolucaoMounted) {
-          devolucaoMounted = true;
-          void (devolucaoModule ? Promise.resolve(devolucaoModule) : import("./devolucao/index.ts")).then((m) => {
-            devolucaoModule = m;
-            void m.renderDevolucao(container);
+          })
+          .catch((err) => {
+            nfeConferenceMounted = false;
+            renderErrorWithRetry(container, "Erro ao carregar a Conferência por Nota Fiscal: " + describeError(err), () => selectMode("nfe", btn));
           });
-        }
       }
+    }
+
+    if (isDevolucao) {
+      const container = root.querySelector<HTMLElement>("#devolucaoRoot")!;
+      if (!devolucaoMounted) {
+        devolucaoMounted = true;
+        void (devolucaoModule ? Promise.resolve(devolucaoModule) : import("./devolucao/index.ts")).then((m) => {
+          devolucaoModule = m;
+          void m.renderDevolucao(container);
+        });
+      }
+    }
+  }
+
+  root.querySelectorAll<HTMLElement>(".mode-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      // FASE 4 — "Nota Fiscal" virou <a href="#/conferir/nfe"> pra permitir
+      // Ctrl/Cmd+click, botão do meio e "abrir em nova aba" nativos. Só
+      // intercepta (preventDefault) o clique NORMAL, sem modificador, pra
+      // preservar o comportamento atual (trocar de modo na mesma aba sem
+      // navegação de página inteira) — clique modificado nunca é
+      // interceptado, o navegador abre a URL nativamente numa aba nova.
+      if (btn.tagName === "A") {
+        const me = e as MouseEvent;
+        if (me.ctrlKey || me.metaKey || me.shiftKey || me.altKey || me.button !== 0) return;
+        e.preventDefault();
+      }
+      selectMode(btn.dataset.mode!, btn);
     });
   });
+
+  // FASE 4 — deep link/F5/nova aba: se o hash já pedia o módulo NF no
+  // momento em que esta tela montou, seleciona o modo automaticamente —
+  // sem isso, abrir #/conferir/nfe(/<id>) direto sempre caía no modo padrão
+  // "imagens" e escondia a NF pedida atrás de um clique manual.
+  if (hashInfo.mode === "nfe") {
+    const nfeBtn = root.querySelector<HTMLElement>('[data-mode="nfe"]');
+    if (nfeBtn) selectMode("nfe", nfeBtn);
+  }
 }
 
 function wireImageInput(root: HTMLElement): void {

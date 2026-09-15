@@ -220,6 +220,7 @@ async function renderNfeHistoryTab(root: HTMLElement): Promise<void> {
                   <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
                     <span class="status-badge ${receiptBadgeClass(r.status)}">${escapeHtml(RECEIPT_STATUS_LABEL[r.status])}</span>
                     <span class="hint-text" style="margin:0">${r.item_count} item(ns)</span>
+                    <a class="link-btn" style="padding:2px 4px;width:auto" href="#/conferir/nfe/${r.id}" data-open-receipt-link>Abrir NF</a>
                   </div>
                 </li>`
                 )
@@ -231,6 +232,15 @@ async function renderNfeHistoryTab(root: HTMLElement): Promise<void> {
 
   root.querySelectorAll<HTMLElement>("[data-open-nfe]").forEach((li) => {
     li.addEventListener("click", () => void showNfeDetail(root, li.dataset.openNfe!));
+  });
+  // FASE 4 — "Abrir NF" é um link real de propósito (Ctrl/Cmd+click, botão do
+  // meio, menu de contexto e copiar endereço funcionam nativamente) — só
+  // impede que o clique NORMAL borbulhe pro <li> e dispare TAMBÉM o detalhe
+  // inline acima (os dois comportamentos nunca devem acontecer juntos).
+  root.querySelectorAll<HTMLAnchorElement>("[data-open-receipt-link]").forEach((a) => {
+    a.addEventListener("click", (e) => {
+      e.stopPropagation();
+    });
   });
 }
 

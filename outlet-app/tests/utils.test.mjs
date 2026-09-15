@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalize, escapeHtml, debounce, normalizeEan, isValidEanFormat } from "../src/client/utils.ts";
+import { normalize, escapeHtml, debounce, normalizeEan, isValidEanFormat, parseConferirHash } from "../src/client/utils.ts";
 
 test("normalize strips accents, case and punctuation", () => {
   assert.equal(normalize("Preço: Rosa e Lilás!"), "preco rosa e lilas");
@@ -72,4 +72,38 @@ test("debounce only invokes the last call within the window", async () => {
 
   assert.equal(calls, 1);
   assert.equal(lastArg, "c");
+});
+
+// ---------------------------------------------------------------------------
+// FASE 4 — rota canônica da NF-e (#/conferir/nfe/<id>). Função pura, sem DOM.
+// ---------------------------------------------------------------------------
+test("parseConferirHash: #/conferir vira modo imagens (comportamento atual preservado)", () => {
+  const result = parseConferirHash("#/conferir");
+  assert.equal(result.mode, "imagens");
+  assert.equal(result.nfeReceiptId, null);
+});
+
+test("parseConferirHash: #/conferir/nfe seleciona o modo Nota Fiscal sem receipt", () => {
+  const result = parseConferirHash("#/conferir/nfe");
+  assert.equal(result.mode, "nfe");
+  assert.equal(result.nfeReceiptId, null);
+});
+
+test("parseConferirHash: #/conferir/nfe/<uuid> preserva o receiptId no modo Nota Fiscal", () => {
+  const result = parseConferirHash("#/conferir/nfe/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+  assert.equal(result.mode, "nfe");
+  assert.equal(result.nfeReceiptId, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+});
+
+test("parseConferirHash nunca lança exceção pra hash ausente/vazio/malformado", () => {
+  assert.doesNotThrow(() => parseConferirHash(""));
+  assert.doesNotThrow(() => parseConferirHash("#"));
+  assert.doesNotThrow(() => parseConferirHash("#/"));
+  assert.doesNotThrow(() => parseConferirHash("lixo-qualquer"));
+  assert.equal(parseConferirHash("#/conferir/nfe/").nfeReceiptId, null); // receiptId ausente nunca vira string vazia
+});
+
+test("parseConferirHash ignora outras rotas (nunca confunde com o módulo NF)", () => {
+  assert.equal(parseConferirHash("#/historico").mode, "imagens");
+  assert.equal(parseConferirHash("#/conferir/devolucao").mode, "imagens");
 });

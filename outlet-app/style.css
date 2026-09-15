@@ -243,6 +243,8 @@ h1, h2, h3 { font-family: var(--font-ui); font-weight: 700; color: var(--text-pr
   font-weight: 500;
   cursor: pointer;
   padding: 6px 4px;
+  /* FASE 4 — a maioria virou <a> (link real de navegação); reset do sublinhado/cor padrão de link, mesmo visual de antes. */
+  text-decoration: none;
 }
 
 .bottom-nav-icon { display: flex; align-items: center; justify-content: center; }
@@ -675,6 +677,8 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   margin-bottom: 8px;
 }
 .recent-list li strong { display: block; font-size: 14px; font-weight: 600; }
+/* FASE 4 — abertura de NF do histórico interno virou <a> real (Ctrl/Cmd+click, nova aba, copiar endereço); reset de cor/sublinhado, mesmo visual do texto antes do link. */
+.recent-list-link { display: block; color: inherit; text-decoration: none; min-width: 0; }
 
 .empty-state {
   text-align: center;
@@ -761,6 +765,8 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
   align-items: center;
   justify-content: center;
   gap: 6px;
+  /* FASE 4 — "Nota Fiscal" virou <a> (link real); reset do sublinhado padrão de link, mesmo visual de antes. */
+  text-decoration: none;
 }
 .mode-btn svg { width: 16px; height: 16px; }
 

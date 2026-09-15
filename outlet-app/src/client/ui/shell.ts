@@ -85,26 +85,38 @@ export function mountShell(root: HTMLElement): void {
         </header>
         <main id="screen-content" class="screen-content"></main>
         <nav class="bottom-nav" aria-label="Navegação principal">
-          ${TABS.map(
-            (t) => `
+          ${TABS.map((t) =>
+            // FASE 4 — navegação desktop: todas as abas viram links reais
+            // (Ctrl/Cmd+click, botão do meio, "abrir em nova aba" e menu de
+            // contexto funcionam nativamente) EXCETO "Escanear", que precisa
+            // continuar sendo um <button> — unlockScanSound() só destrava o
+            // áudio do beep se rodar SÍNCRONO dentro do gesto de clique real
+            // (ver comentário em unlockScanSound); um <a> normal navegaria
+            // via hashchange antes dessa chamada terminar, arriscando perder
+            // a janela de gesto do usuário em aparelhos mais lentos.
+            t.route === "escanear"
+              ? `
             <button class="bottom-nav-btn" data-route="${t.route}" aria-label="${t.label}">
               <span class="bottom-nav-icon" aria-hidden="true">${t.icon}</span>
               <span class="bottom-nav-label">${escapeHtml(t.label)}</span>
             </button>`
+              : `
+            <a class="bottom-nav-btn" data-route="${t.route}" aria-label="${t.label}" href="#/${t.route}">
+              <span class="bottom-nav-icon" aria-hidden="true">${t.icon}</span>
+              <span class="bottom-nav-label">${escapeHtml(t.label)}</span>
+            </a>`
           ).join("")}
         </nav>
       </div>`;
 
-  root.querySelectorAll<HTMLButtonElement>(".bottom-nav-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      // Precisa acontecer dentro deste clique (gesto real do usuário) — é a
-      // única chance de "destravar" o áudio do beep de reconhecimento antes
-      // do primeiro achado, já que o navegador bloqueia play() assíncrono
-      // sem gesto (ver unlockScanSound). scan.ts nunca é lazy-loaded — ver
-      // comentário acima — exatamente para essa chamada poder ser síncrona.
-      if (btn.dataset.route === "escanear") unlockScanSound();
-      window.location.hash = `/${btn.dataset.route}`;
-    });
+  root.querySelector<HTMLButtonElement>('.bottom-nav-btn[data-route="escanear"]')?.addEventListener("click", () => {
+    // Precisa acontecer dentro deste clique (gesto real do usuário) — é a
+    // única chance de "destravar" o áudio do beep de reconhecimento antes
+    // do primeiro achado, já que o navegador bloqueia play() assíncrono
+    // sem gesto (ver unlockScanSound). scan.ts nunca é lazy-loaded — ver
+    // comentário acima — exatamente para essa chamada poder ser síncrona.
+    unlockScanSound();
+    window.location.hash = "/escanear";
   });
 
   window.addEventListener("hashchange", renderCurrentScreen);

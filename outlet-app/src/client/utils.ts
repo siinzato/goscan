@@ -141,6 +141,31 @@ export function isValidEanFormat(normalized: string): boolean {
   return normalized.length === 8 || normalized.length === 12 || normalized.length === 13 || normalized.length === 14;
 }
 
+// ---------------------------------------------------------------------------
+// FASE 4 — navegação desktop/tablet: rota canônica da NF-e dentro do módulo
+// "Conferir" (hash routing existente, sem router novo). shell.ts já só olha
+// o PRIMEIRO segmento do hash pra escolher a aba (currentRoute()) — esta
+// função lê os segmentos SEGUINTES (`conferir/nfe` ou `conferir/nfe/<id>`)
+// pra decidir o sub-modo e o deep link, do mesmo jeito que profile.ts já faz
+// pras próprias sub-rotas. Função pura (recebe a string, não lê
+// window.location) — só pra ser testável sem DOM.
+// ---------------------------------------------------------------------------
+export interface ConferirHashInfo {
+  mode: "imagens" | "nfe";
+  nfeReceiptId: string | null;
+}
+
+/** Nunca lança exceção — hash ausente/malformado sempre cai no modo padrão ("imagens"), igual ao comportamento atual sem nenhum segmento extra. */
+export function parseConferirHash(hash: string): ConferirHashInfo {
+  const raw = (hash || "").replace(/^#\/?/, "");
+  const segments = raw.split("/").filter(Boolean);
+  if (segments[1] === "nfe") {
+    const id = segments[2]?.trim();
+    return { mode: "nfe", nfeReceiptId: id ? id : null };
+  }
+  return { mode: "imagens", nfeReceiptId: null };
+}
+
 let retryHandlerSeq = 0;
 
 /**

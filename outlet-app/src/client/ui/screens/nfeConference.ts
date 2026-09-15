@@ -3,7 +3,7 @@
 // fluxo totalmente separado do reconhecimento visual/matching Outlet — não
 // reaproveita conferences/conference_items, tem suas próprias tabelas
 // (invoice_receipts/invoice_receipt_items/receipt_counts).
-import { escapeHtml, debounce, formatDateTime, describeError, initials, normalizeEan, isValidEanFormat } from "../../utils.ts";
+import { escapeHtml, debounce, formatDateTime, describeError, initials, normalizeEan, isValidEanFormat, renderErrorWithRetry } from "../../utils.ts";
 import { parseNfeXml, diagnoseNfeXml, type NfeXmlDiagnostics } from "../../nfeParser.ts";
 import { normalizeKey, suggestBestMatch } from "../../nfeMatching.ts";
 import { getAuthState, isAdmin, isManagerOrAdmin } from "../../auth.ts";
@@ -470,6 +470,23 @@ export function teardownNfeConference(): void {
   stopCollabSession();
 }
 
+/**
+ * FASE 4 — mantém a URL sincronizada com a NF atual (deep link/F5/copiar
+ * endereço/nova aba), sem router novo: `#/conferir/nfe` fica como URL
+ * neutra (sem NF aberta), `#/conferir/nfe/<id>` quando há uma NF atual.
+ * `history.replaceState` NUNCA dispara `hashchange` — por isso nunca causa
+ * o remonte completo de conference.ts que um `location.hash = ...` causaria
+ * (shell.ts re-renderiza a rota inteira em QUALQUER hashchange, mesmo
+ * trocando só o sub-segmento). Vira no-op se a URL já é a esperada (evita
+ * uma entrada nova no histórico do navegador a cada re-render da mesma NF).
+ */
+function syncNfeUrl(): void {
+  const target = currentReceipt ? `#/conferir/nfe/${currentReceipt.id}` : "#/conferir/nfe";
+  if (window.location.hash !== target) {
+    history.replaceState(null, "", target);
+  }
+}
+
 function goTo(root: HTMLElement, next: NfeView): void {
   // Saindo da tela de contagem: libera minha reserva ativa (se houver),
   // para o heartbeat e encerra qualquer captura de voz em andamento — nunca
@@ -480,6 +497,7 @@ function goTo(root: HTMLElement, next: NfeView): void {
     stopPushToTalk();
   }
   view = next;
+  syncNfeUrl();
   // Entra/mantém a colaboração em tempo real desta NF em prep/modo/contagem/
   // relatório; qualquer outra tela (upload/histórico) encerra a subscription
   // — nunca fica ouvindo mudanças de uma NF que o usuário já não está vendo.
@@ -490,6 +508,44 @@ function goTo(root: HTMLElement, next: NfeView): void {
     stopVoiceQueue();
   }
   void renderNfeConference(root);
+}
+
+/**
+ * FASE 4 — deep link: abre uma NF específica por `receiptId` (vindo da URL
+ * `#/conferir/nfe/<id>`, do histórico interno como link real, ou de
+ * qualquer chamador futuro). Reaproveita EXATAMENTE o mesmo caminho já usado
+ * ao abrir uma NF pelo histórico interno (getReceipt + decideViewForReceipt
+ * + goTo) — nenhuma regra de status/contagem cega duplicada aqui. `goTo` já
+ * sincroniza a URL e entra na colaboração em tempo real quando aplicável.
+ * Nunca deixa a tela em branco: receipt inexistente/sem permissão/ID
+ * inválido caem no mesmo padrão de erro-com-ação já usado no resto do app,
+ * com uma saída seguravel de volta pro módulo (nunca expõe stack trace).
+ */
+export async function openReceiptFromRoute(root: HTMLElement, receiptId: string): Promise<void> {
+  const id = receiptId?.trim();
+  if (!id) {
+    // receiptId ausente/vazio nunca tenta carregar nada — só entra no
+    // módulo NF normalmente (mesmo estado de "#/conferir/nfe" sem NF).
+    goTo(root, "upload");
+    return;
+  }
+  try {
+    const { receipt, items } = await getReceipt(id);
+    currentReceipt = receipt;
+    currentItems = items;
+    goTo(root, decideViewForReceipt(receipt, items));
+  } catch (err) {
+    currentReceipt = null;
+    currentItems = [];
+    renderErrorWithRetry(
+      root,
+      "Não foi possível abrir esta Nota Fiscal (ela pode não existir mais, ou você não tem permissão para vê-la): " + describeError(err),
+      () => {
+        history.replaceState(null, "", "#/conferir/nfe");
+        goTo(root, "upload");
+      }
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2360,11 +2416,13 @@ async function renderHistoryView(root: HTMLElement): Promise<void> {
           // confuso pro operador.
           const canDelete = canManage;
           return `
-        <li data-open-receipt="${r.id}" style="cursor:pointer">
-          <div>
-            <strong>NF ${escapeHtml(r.invoice_number || "-")} — ${escapeHtml(r.supplier_name || "-")}</strong>
-            <span class="hint-text" style="margin:0">${formatDateTime(r.created_at)} · ${escapeHtml(r.operator_name || "-")}</span>
-          </div>
+        <li>
+          <a class="recent-list-link" href="#/conferir/nfe/${r.id}" data-open-receipt="${r.id}">
+            <div>
+              <strong>NF ${escapeHtml(r.invoice_number || "-")} — ${escapeHtml(r.supplier_name || "-")}</strong>
+              <span class="hint-text" style="margin:0">${formatDateTime(r.created_at)} · ${escapeHtml(r.operator_name || "-")}</span>
+            </div>
+          </a>
           <div style="display:flex;align-items:center;gap:10px">
             <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
               <span class="status-badge ${r.status === "completed" ? "success" : r.status === "with_divergences" ? "warning" : "info"}">${escapeHtml(RECEIPT_STATUS_LABEL[r.status])}</span>
@@ -2377,17 +2435,15 @@ async function renderHistoryView(root: HTMLElement): Promise<void> {
         .join("")}
     </ul>`;
 
-  wrap.querySelectorAll<HTMLElement>("[data-open-receipt]").forEach((li) => {
-    li.addEventListener("click", async () => {
-      const id = li.dataset.openReceipt!;
-      try {
-        const { receipt, items } = await getReceipt(id);
-        currentReceipt = receipt;
-        currentItems = items;
-        goTo(root, decideViewForReceipt(receipt, items));
-      } catch (err) {
-        showToast("Erro ao abrir NF: " + (describeError(err)), "error");
-      }
+  // FASE 4 — link real (Ctrl/Cmd+click, botão do meio, menu de contexto e
+  // copiar endereço funcionam nativamente): só intercepta o clique NORMAL,
+  // sem modificador, pra reaproveitar openReceiptFromRoute sem descartar o
+  // estado da aba atual com uma navegação de página inteira.
+  wrap.querySelectorAll<HTMLAnchorElement>("[data-open-receipt]").forEach((a) => {
+    a.addEventListener("click", (e) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      e.preventDefault();
+      void openReceiptFromRoute(root, a.dataset.openReceipt!);
     });
   });
 
