@@ -10,6 +10,16 @@ export interface NfeParsedItem {
   invoice_product_code: string;
   description: string;
   ean: string | null;
+  /**
+   * FASE 2 — cEANTrib (EAN tributável), só quando válido e DIFERENTE do
+   * `ean` já escolhido (cEAN comercial tem prioridade — ver `ean` acima).
+   * Confirmado com dados reais: existem casos onde cEAN é válido mas não
+   * está cadastrado em nenhum produto, e cEANTrib é válido e bate com
+   * exatamente um produto — sem isso, esse segundo identificador nunca
+   * chegava ao matcher. Null quando ausente/inválido/igual ao `ean`
+   * (nunca duplica o mesmo identificador em dois campos).
+   */
+  ean_tributable: string | null;
   unit: string | null;
   quantity: number;
   unit_value: number | null;
@@ -202,11 +212,20 @@ export function parseNfeXml(xml: string): NfeParsed {
     // Prioriza cEAN; cai para cEANTrib (EAN tributável) só quando o primeiro
     // está ausente/"SEM GTIN"/inválido — nunca o contrário (cEAN sempre vence
     // quando é um código real).
-    const ean = validEanCandidate(text(prod.cEAN)) ?? validEanCandidate(text(prod.cEANTrib));
+    const cEanValid = validEanCandidate(text(prod.cEAN));
+    const cEanTribValid = validEanCandidate(text(prod.cEANTrib));
+    const ean = cEanValid ?? cEanTribValid;
+    // FASE 2 — preserva cEANTrib separadamente quando os dois são válidos E
+    // diferentes (Caso C do diagnóstico: iguais após normalizar = mesmo
+    // identificador, não duplica). Quando cEAN já era inválido, cEANTrib
+    // virou `ean` acima — aqui fica null pra não duplicar o mesmo valor.
+    const ean_tributable =
+      cEanValid && cEanTribValid && normalizeEan(cEanValid) !== normalizeEan(cEanTribValid) ? cEanTribValid : null;
     return {
       invoice_product_code: text(prod.cProd) || "",
       description: text(prod.xProd) || "",
       ean,
+      ean_tributable,
       unit: text(prod.uCom),
       quantity: toNumber(prod.qCom) ?? 0,
       unit_value: toNumber(prod.vUnCom),

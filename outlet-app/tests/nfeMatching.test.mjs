@@ -36,6 +36,73 @@ test("resolveInvoiceItem NUNCA vincula sozinho quando o EAN bate em mais de um p
 });
 
 // ---------------------------------------------------------------------------
+// FASE 2 — CORREÇÃO cEANTrib: confirmado com dados reais (4 casos históricos)
+// que cEAN válido às vezes não bate em NADA do catálogo, enquanto cEANTrib
+// válido bate com exatamente um produto — sem isso, esse segundo
+// identificador nunca chegava ao matcher (nfeParser descartava). Só usa
+// quando cEAN não achou NENHUM candidato (nunca compete com um cEAN que já
+// resolveu ou que é ambíguo).
+// ---------------------------------------------------------------------------
+test("resolveInvoiceItem vincula por EAN tributável quando o cEAN comercial é válido mas não bate em nenhum produto", () => {
+  const result = resolveInvoiceItem(
+    { invoice_product_code: "CODIGO-DESCONHECIDO", ean: "9999999999999", ean_tributable: "7891234567890" },
+    candidates
+  );
+  assert.equal(result.variant_id, "v1");
+  assert.equal(result.link_source, "ean");
+});
+
+test("resolveInvoiceItem NUNCA usa EAN tributável se o cEAN comercial já resolveu sozinho (cEAN sempre vence)", () => {
+  const conflitantes = [
+    { variant_id: "v1", sku_code: "TCGCM42-1", gtin_normalized: "7891234567890" },
+    { variant_id: "v9", sku_code: "OUTRO-9", gtin_normalized: "1231231231231" },
+  ];
+  const result = resolveInvoiceItem(
+    { invoice_product_code: "CODIGO-DESCONHECIDO", ean: "7891234567890", ean_tributable: "1231231231231" },
+    conflitantes
+  );
+  assert.equal(result.variant_id, "v1");
+  assert.equal(result.link_source, "ean");
+});
+
+test("resolveInvoiceItem NUNCA usa EAN tributável pra desempatar quando o cEAN comercial é ambíguo (2+ produtos)", () => {
+  const duplicated = [
+    { variant_id: "v3", sku_code: "AAA-1", gtin_normalized: "1112223334445" },
+    { variant_id: "v4", sku_code: "BBB-1", gtin_normalized: "1112223334445" },
+    { variant_id: "v9", sku_code: "OUTRO-9", gtin_normalized: "9998887776665" },
+  ];
+  const result = resolveInvoiceItem(
+    { invoice_product_code: "CODIGO-DESCONHECIDO", ean: "1112223334445", ean_tributable: "9998887776665" },
+    duplicated
+  );
+  assert.equal(result.variant_id, null);
+  assert.equal(result.link_source, null);
+});
+
+test("resolveInvoiceItem NUNCA decide arbitrariamente quando cEAN e cEANTrib apontam pra produtos DIFERENTES (ambos batem em algo)", () => {
+  const doisProdutos = [
+    { variant_id: "vA", sku_code: "PRODUTO-A", gtin_normalized: "1111111111111" },
+    { variant_id: "vB", sku_code: "PRODUTO-B", gtin_normalized: "2222222222222" },
+  ];
+  const result = resolveInvoiceItem(
+    { invoice_product_code: "CODIGO-DESCONHECIDO", ean: "1111111111111", ean_tributable: "2222222222222" },
+    doisProdutos
+  );
+  // cEAN já bate sozinho (byEan.length === 1) — vence, não é ambíguo de verdade.
+  assert.equal(result.variant_id, "vA");
+  assert.equal(result.link_source, "ean");
+});
+
+test("resolveInvoiceItem ignora EAN tributável igual ao cEAN após normalização (não é um segundo identificador)", () => {
+  const result = resolveInvoiceItem(
+    { invoice_product_code: "CODIGO-DESCONHECIDO", ean: "9999999999999", ean_tributable: "9999999999999" },
+    candidates
+  );
+  assert.equal(result.variant_id, null);
+  assert.equal(result.link_source, null);
+});
+
+// ---------------------------------------------------------------------------
 // CORREÇÃO — cProd-como-EAN: medido contra o backlog real de pendências do
 // usuário, 27 de 31 itens sem EAN declarado (cEAN "SEM GTIN") tinham cProd
 // batendo com EXATAMENTE 1 produto ativo cadastrado por gtin_normalized —

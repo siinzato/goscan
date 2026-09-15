@@ -162,12 +162,17 @@ export async function fetchNormalCandidates(codes: string[], eans: string[]): Pr
   const cleanEans = Array.from(new Set(eans.map(normalizeEan).filter((e) => isValidEanFormat(e))));
   if (cleanCodes.length === 0 && cleanEans.length === 0) return [];
 
+  // FASE 2 — CORREÇÃO DE SEGURANÇA: faltava `active = true` aqui — uma
+  // variante desativada podia entrar como candidata e ser escolhida por
+  // SKU/EAN exato automaticamente. Catálogo real de hoje não tem nenhuma
+  // variante normal inativa (então não gerou incidente ainda), mas o código
+  // não se protegia contra isso. Nunca vincula sozinho a algo desativado.
   const [byCode, byEan] = await Promise.all([
     cleanCodes.length > 0
-      ? supabase.from("product_variants").select("id, sku_code, gtin_normalized, products!inner(product_type)").eq("products.product_type", "normal").in("sku_code", cleanCodes)
+      ? supabase.from("product_variants").select("id, sku_code, gtin_normalized, products!inner(product_type)").eq("products.product_type", "normal").eq("active", true).in("sku_code", cleanCodes)
       : Promise.resolve({ data: [] as unknown[], error: null }),
     cleanEans.length > 0
-      ? supabase.from("product_variants").select("id, sku_code, gtin_normalized, products!inner(product_type)").eq("products.product_type", "normal").in("gtin_normalized", cleanEans)
+      ? supabase.from("product_variants").select("id, sku_code, gtin_normalized, products!inner(product_type)").eq("products.product_type", "normal").eq("active", true).in("gtin_normalized", cleanEans)
       : Promise.resolve({ data: [] as unknown[], error: null }),
   ]);
   if (byCode.error) throw byCode.error;
@@ -263,11 +268,13 @@ export async function fetchAllNormalProducts(): Promise<NameCandidate[]> {
 interface AliasCodeRow {
   invoice_product_code: string | null;
   product_variant_id: string;
+  product_variants: { active: boolean; products: { product_type: string } | { product_type: string }[] | null } | null;
 }
 
 interface AliasEanRow {
   ean_normalized: string | null;
   product_variant_id: string;
+  product_variants: { active: boolean; products: { product_type: string } | { product_type: string }[] | null } | null;
 }
 
 /**
@@ -275,6 +282,15 @@ interface AliasEanRow {
  * pela coluna crua, então uma associação memorizada com EAN formatado
  * diferente do que vem na NF nunca era encontrada. Agora usa ean_normalized
  * (mantida por trigger — migration 0046) dos dois lados da comparação.
+ *
+ * FASE 2 — CORREÇÃO DE SEGURANÇA: uma associação aprendida (alias) nunca
+ * pode ser usada automaticamente se o produto de destino não existir mais
+ * como ele era quando foi memorizada — desativado, ou reclassificado pra
+ * Outlet. Antes o alias era usado às cegas (só o `product_variant_id`, sem
+ * checar estado atual). Agora o JOIN até product_variants/products filtra
+ * isso NA ORIGEM: um alias "stale" nunca entra nem no Map, então nunca é
+ * usado no vínculo automático — sem alterar `resolveInvoiceItem` (que
+ * continua confiando cegamente no Map, agora sempre pré-filtrado).
  */
 async function fetchAliasMaps(codes: string[], eans: string[]): Promise<AliasMaps> {
   const supabase = getSupabase();
@@ -286,10 +302,20 @@ async function fetchAliasMaps(codes: string[], eans: string[]): Promise<AliasMap
 
   const [codeRes, eanRes] = await Promise.all([
     cleanCodes.length > 0
-      ? supabase.from("invoice_sku_aliases").select("invoice_product_code, product_variant_id").in("invoice_product_code", cleanCodes)
+      ? supabase
+          .from("invoice_sku_aliases")
+          .select("invoice_product_code, product_variant_id, product_variants!inner(active, products!inner(product_type))")
+          .eq("product_variants.active", true)
+          .eq("product_variants.products.product_type", "normal")
+          .in("invoice_product_code", cleanCodes)
       : Promise.resolve({ data: [] as unknown[], error: null }),
     cleanEans.length > 0
-      ? supabase.from("invoice_sku_aliases").select("ean_normalized, product_variant_id").in("ean_normalized", cleanEans)
+      ? supabase
+          .from("invoice_sku_aliases")
+          .select("ean_normalized, product_variant_id, product_variants!inner(active, products!inner(product_type))")
+          .eq("product_variants.active", true)
+          .eq("product_variants.products.product_type", "normal")
+          .in("ean_normalized", cleanEans)
       : Promise.resolve({ data: [] as unknown[], error: null }),
   ]);
   if (codeRes.error) throw codeRes.error;
@@ -316,13 +342,17 @@ export async function createReceiptFromParsed(parsed: NfeParsed, xml: string): P
 
   const codes = parsed.items.map((i) => i.invoice_product_code);
   const eans = parsed.items.map((i) => i.ean).filter((e): e is string => !!e);
+  // FASE 2 — inclui cEANTrib na busca de candidatos (ver resolveInvoiceItem
+  // em nfeMatching.ts) — sem isso, o produto que o cEANTrib aponta nunca
+  // nem entrava em `candidates`.
+  const eanTributables = parsed.items.map((i) => i.ean_tributable).filter((e): e is string => !!e);
   // CORREÇÃO — cProd-como-EAN (ver resolveInvoiceItem em nfeMatching.ts):
   // só busca candidatos por gtin_normalized=cProd pra itens que NÃO
   // declararam EAN nenhum (cEAN "SEM GTIN"/ausente) — nunca para os que já
   // têm EAN próprio, mesmo que esse não resolva sozinho.
   const codesAsEanFallback = parsed.items.filter((i) => !i.ean).map((i) => i.invoice_product_code).filter((c) => isValidEanFormat(normalizeEan(c)));
   const [candidates, aliases] = await Promise.all([
-    fetchNormalCandidates(codes, [...eans, ...codesAsEanFallback]),
+    fetchNormalCandidates(codes, [...eans, ...eanTributables, ...codesAsEanFallback]),
     fetchAliasMaps(codes, eans),
   ]);
 
@@ -345,7 +375,11 @@ export async function createReceiptFromParsed(parsed: NfeParsed, xml: string): P
   const receipt = receiptRow as InvoiceReceipt;
 
   const itemRows = parsed.items.map((item) => {
-    const resolved = resolveInvoiceItem({ invoice_product_code: item.invoice_product_code, ean: item.ean }, candidates, aliases);
+    const resolved = resolveInvoiceItem(
+      { invoice_product_code: item.invoice_product_code, ean: item.ean, ean_tributable: item.ean_tributable },
+      candidates,
+      aliases
+    );
     // Diagnóstico (seção 14 do pedido) — só em desenvolvimento, nunca exposto ao operador.
     if (import.meta.env.DEV) {
       console.debug("[GoScan NF Match]", {
@@ -353,6 +387,7 @@ export async function createReceiptFromParsed(parsed: NfeParsed, xml: string): P
         cProd: item.invoice_product_code,
         eanOriginal: item.ean,
         eanNormalizado: normalizeEan(item.ean),
+        eanTributavel: item.ean_tributable,
         encontrado: resolved.variant_id !== null,
         criterio: resolved.link_source,
       });

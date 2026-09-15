@@ -71,6 +71,7 @@ test("parseNfeXml extrai todos os itens com código/descrição/EAN/quantidade/v
     invoice_product_code: "TCGCM42-1",
     description: "Copo Termico Life 880ml Preto",
     ean: "7891234567890",
+    ean_tributable: null,
     unit: "UN",
     quantity: 10,
     unit_value: 25,
@@ -84,6 +85,53 @@ test("parseNfeXml extrai todos os itens com código/descrição/EAN/quantidade/v
 test("parseNfeXml trata 'SEM GTIN' como EAN ausente (null), nunca como texto literal", () => {
   const parsed = parseNfeXml(REAL_SHAPED_NFE);
   assert.equal(parsed.items[1].ean, null);
+});
+
+// ---------------------------------------------------------------------------
+// FASE 2 — cEAN + cEANTrib: antes o parser descartava cEANTrib sempre que
+// cEAN era válido (ainda que não estivesse cadastrado em nenhum produto).
+// Confirmado com dados reais: existem casos onde só o cEANTrib resolve.
+// ---------------------------------------------------------------------------
+function itemXml({ cEAN, cEANTrib }) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<NFe xmlns="http://www.portalfiscal.inf.br/nfe">
+  <infNFe Id="NFe1234567890">
+    <ide><nNF>1</nNF><dhEmi>2026-01-01T00:00:00-03:00</dhEmi></ide>
+    <emit><CNPJ>00000000000000</CNPJ><xNome>Fornecedor</xNome></emit>
+    <det nItem="1">
+      <prod><cProd>ABC-1</cProd><xProd>Produto</xProd>${cEAN !== undefined ? `<cEAN>${cEAN}</cEAN>` : ""}${cEANTrib !== undefined ? `<cEANTrib>${cEANTrib}</cEANTrib>` : ""}<uCom>UN</uCom><qCom>5</qCom><vUnCom>10</vUnCom><vProd>50</vProd></prod>
+    </det>
+  </infNFe>
+</NFe>`;
+}
+
+test("parseNfeXml — Caso A: cEAN válido, cEANTrib ausente -> ean=cEAN, ean_tributable=null", () => {
+  const parsed = parseNfeXml(itemXml({ cEAN: "7891234567890" }));
+  assert.equal(parsed.items[0].ean, "7891234567890");
+  assert.equal(parsed.items[0].ean_tributable, null);
+});
+
+test("parseNfeXml — Caso B: cEAN inválido (SEM GTIN), cEANTrib válido -> ean=cEANTrib (comportamento atual), ean_tributable=null (não duplica)", () => {
+  const parsed = parseNfeXml(itemXml({ cEAN: "SEM GTIN", cEANTrib: "7891234567890" }));
+  assert.equal(parsed.items[0].ean, "7891234567890");
+  assert.equal(parsed.items[0].ean_tributable, null);
+});
+
+test("parseNfeXml — Caso C: cEAN e cEANTrib válidos e IGUAIS após normalizar -> tratado como um único identificador (ean_tributable=null)", () => {
+  const parsed = parseNfeXml(itemXml({ cEAN: "7891234567890", cEANTrib: "789-1234-567890" }));
+  assert.equal(parsed.items[0].ean, "7891234567890");
+  assert.equal(parsed.items[0].ean_tributable, null);
+});
+
+test("parseNfeXml — Caso D/preparação: cEAN e cEANTrib válidos e DIFERENTES -> os dois sobrevivem ao parsing (ean=cEAN, ean_tributable=cEANTrib) pro matcher decidir", () => {
+  const parsed = parseNfeXml(itemXml({ cEAN: "7891234567890", cEANTrib: "1112223334445" }));
+  assert.equal(parsed.items[0].ean, "7891234567890");
+  assert.equal(parsed.items[0].ean_tributable, "1112223334445");
+});
+
+test("parseNfeXml preserva zeros à esquerda também em ean_tributable", () => {
+  const parsed = parseNfeXml(itemXml({ cEAN: "9999999999999", cEANTrib: "00123456789012" }));
+  assert.equal(parsed.items[0].ean_tributable, "00123456789012");
 });
 
 test("parseNfeXml normaliza item único (fast-xml-parser retorna objeto, não array, com só 1 <det>) e aceita XML sem wrapper nfeProc", () => {

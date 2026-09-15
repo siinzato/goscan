@@ -11,6 +11,8 @@ export type LinkSource = "sku" | "ean" | "cprod_ean" | "alias" | null;
 export interface InvoiceItemKey {
   invoice_product_code: string;
   ean: string | null;
+  /** FASE 2 — EAN tributável (cEANTrib), só usado como fallback quando `ean` (cEAN) é válido mas não encontra nenhum produto — nunca compete com um cEAN que já resolveu ou que é ambíguo. */
+  ean_tributable?: string | null;
 }
 
 export interface NormalVariantCandidate {
@@ -64,6 +66,7 @@ export function normalizeKey(value: string | null | undefined): string {
 export function resolveInvoiceItem(item: InvoiceItemKey, candidates: NormalVariantCandidate[], aliases?: AliasMaps): ResolvedLink {
   const code = normalizeKey(item.invoice_product_code);
   const ean = normalizeEan(item.ean);
+  const ean_tributable = normalizeEan(item.ean_tributable ?? null) || null;
 
   if (code) {
     const bySku = candidates.find((c) => normalizeKey(c.sku_code) === code);
@@ -79,6 +82,24 @@ export function resolveInvoiceItem(item: InvoiceItemKey, candidates: NormalVaria
     // "não encontrado" (ver mensagem diferenciada na UI).
     const byEan = candidates.filter((c) => c.gtin_normalized === ean);
     if (byEan.length === 1) return { variant_id: byEan[0].variant_id, link_source: "ean" };
+
+    // FASE 2 — CORREÇÃO cEANTrib (Causa 2, confirmada com dados reais: 4
+    // casos históricos onde cEAN válido não batia em NADA no catálogo, mas
+    // cEANTrib válido batia com exatamente 1 variante). Só tenta quando o
+    // cEAN não achou NENHUM candidato (byEan.length === 0) — nunca quando é
+    // ambíguo (2+, permanece pendente igual sempre) nem quando já resolveu
+    // sozinho acima. Se cEAN e cEANTrib apontarem pra produtos DIFERENTES
+    // (os dois acham algo), não decide arbitrariamente — cai pra pendência
+    // como qualquer conflito. link_source continua "ean" (mesmo contrato já
+    // existente, sem mudança de schema) — a distinção cEAN/cEANTrib é só
+    // diagnóstico interno (DEV), nunca persistida.
+    if (byEan.length === 0) {
+      const trib = ean_tributable && isValidEanFormat(ean_tributable) && ean_tributable !== ean ? ean_tributable : null;
+      if (trib) {
+        const byTrib = candidates.filter((c) => c.gtin_normalized === trib);
+        if (byTrib.length === 1) return { variant_id: byTrib[0].variant_id, link_source: "ean" };
+      }
+    }
   }
 
   // CORREÇÃO — vários fornecedores (confirmado com dados reais: importadoras
