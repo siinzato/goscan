@@ -1,4 +1,4 @@
-import { escapeHtml, debounce, renderErrorWithRetry, describeError, parseConferirHash, type ConferirHashInfo } from "../../utils.ts";
+import { escapeHtml, debounce, renderErrorWithRetry, describeError, formatDateTime, formatOperationDuration, parseConferirHash, type ConferirHashInfo } from "../../utils.ts";
 import { matchItems, matchItem, type MatchResult } from "../../matching.ts";
 import { parseImagesLocally } from "../../ocr.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
@@ -13,6 +13,7 @@ import {
   type Session,
   type SessionItem,
 } from "../../conferenceSession.ts";
+import { getConferenceFinalSummary, type ConferenceFinalSummary } from "../../conferencesApi.ts";
 import { exportItemsToXlsx } from "../../exporter.ts";
 import { stopCollabSession } from "../../realtimeCollab.ts";
 import { Icon } from "../icons.ts";
@@ -232,8 +233,11 @@ export async function renderConference(root: HTMLElement): Promise<void> {
       showToast(outcome.reason || "Não foi possível finalizar.", "error");
       return;
     }
-    showToast(`Conferência finalizada: ${outcome.totals?.total_skus} SKUs, ${outcome.totals?.total_units} unidades.`, "success");
-    window.location.hash = "/historico";
+    // FASE 4 — Resumo Final Padronizado: não redireciona mais direto pro
+    // Histórico — busca o registro OFICIAL (recém-consolidado no servidor,
+    // nunca o estado local/otimista) e mostra o resumo dentro da própria tela.
+    showToast("Conferência finalizada.", "success");
+    await showOutletFinalSummary(root, current.conference.id);
   });
 
   let currentSession: Session | null = session;
@@ -245,6 +249,86 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   function sessionSnapshot(): Session | null {
     return currentSession;
   }
+}
+
+/**
+ * FASE 4 — Resumo Final Padronizado (Outlet). Busca o registro OFICIAL
+ * (getConferenceFinalSummary — inclui operator_name via join, ver
+ * conferencesApi.ts) em vez de confiar no estado local pós-finalize: os
+ * totais mostrados são sempre os consolidados no servidor. Se essa busca
+ * falhar, a finalização JÁ aconteceu — nunca dá a entender que falhou, só
+ * oferece tentar carregar o resumo de novo ou ir direto pro Histórico.
+ */
+async function showOutletFinalSummary(root: HTMLElement, conferenceId: string): Promise<void> {
+  const extraCards = root.querySelector<HTMLElement>("#outletExtraCards")!;
+  let summaryEl = root.querySelector<HTMLElement>("#outletFinalSummary");
+  if (!summaryEl) {
+    summaryEl = document.createElement("div");
+    summaryEl.id = "outletFinalSummary";
+    extraCards.insertAdjacentElement("beforebegin", summaryEl);
+  }
+  extraCards.hidden = true;
+  summaryEl.innerHTML = `<div class="skeleton skeleton-card"></div>`;
+
+  try {
+    const summary = await getConferenceFinalSummary(conferenceId);
+    renderOutletFinalSummary(root, summaryEl, summary);
+  } catch (err) {
+    summaryEl.innerHTML = `
+      <div class="card">
+        <h2>Conferência finalizada</h2>
+        <div class="warning-box">${Icon.info} Conferência finalizada, mas não foi possível carregar o resumo. (${escapeHtml(describeError(err))})</div>
+        <div class="review-actions">
+          <button class="btn-secondary" id="btnSummaryRetry">Tentar carregar resumo novamente</button>
+          <button class="btn-primary" id="btnSummaryHistory">${Icon.history}Ir para Histórico</button>
+        </div>
+      </div>`;
+    summaryEl.querySelector("#btnSummaryRetry")!.addEventListener("click", () => void showOutletFinalSummary(root, conferenceId));
+    summaryEl.querySelector("#btnSummaryHistory")!.addEventListener("click", () => {
+      window.location.hash = "/historico";
+    });
+  }
+}
+
+function renderOutletFinalSummary(root: HTMLElement, summaryEl: HTMLElement, summary: ConferenceFinalSummary): void {
+  const { conference, unresolvedCount } = summary;
+  const protocol = conference.id.slice(0, 8).toUpperCase();
+
+  summaryEl.innerHTML = `
+    <div class="card">
+      <h2>Conferência Finalizada</h2>
+      <p class="hint-text"><span class="sku-code">#${protocol}</span> <span class="status-badge success">${Icon.checkCircle}Concluída</span></p>
+      <div class="product-card-meta">
+        <span>Operador: ${escapeHtml(conference.operator_name || "-")}</span>
+        <span>Início: ${formatDateTime(conference.started_at)}</span>
+        <span>Finalização: ${formatDateTime(conference.finished_at)}</span>
+        <span>Duração: ${formatOperationDuration(conference.started_at, conference.finished_at)}</span>
+      </div>
+      <div class="active-conference-stats" style="flex-wrap:wrap">
+        <span class="active-conference-stat">${conference.total_skus}<span>SKUs</span></span>
+        <span class="active-conference-stat">${conference.total_units}<span>Unidades</span></span>
+        <span class="active-conference-stat">${unresolvedCount}<span>${unresolvedCount === 1 ? "item p/ revisão" : "sem SKU"}</span></span>
+      </div>
+      <p class="hint-text">Resultado: Conferência concluída${unresolvedCount > 0 ? ` — ${unresolvedCount} ${unresolvedCount === 1 ? "item" : "itens"} sem SKU para revisão` : ""}.</p>
+      <div class="review-actions">
+        <button class="btn-secondary" id="btnSummaryViewItems">Ver itens</button>
+        <button class="btn-secondary" id="btnSummaryExport">${Icon.fileSpreadsheet}Exportar Excel</button>
+        <button class="btn-primary" id="btnSummaryHistory">${Icon.history}Ir para Histórico</button>
+      </div>
+    </div>`;
+
+  summaryEl.querySelector("#btnSummaryViewItems")!.addEventListener("click", () => {
+    const extraCards = root.querySelector<HTMLElement>("#outletExtraCards")!;
+    extraCards.hidden = false;
+    extraCards.scrollIntoView({ behavior: "smooth" });
+  });
+  summaryEl.querySelector("#btnSummaryExport")!.addEventListener("click", () => {
+    exportItemsToXlsx(summary.items);
+    showToast("Planilha exportada.", "success");
+  });
+  summaryEl.querySelector("#btnSummaryHistory")!.addEventListener("click", () => {
+    window.location.hash = "/historico";
+  });
 }
 
 // EXPANSÃO GOSCAN — módulo da Conferência por Nota Fiscal, montado uma única

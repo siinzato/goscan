@@ -42,6 +42,7 @@ import {
 } from "../../adminApi.ts";
 import { INTEGRATION_PROVIDER_META, INTEGRATION_STATUS_META, type ProviderInfo } from "./profileIntegrations.ts";
 import { testTinyConnection } from "../../tinyIntegrationApi.ts";
+import { renderCentralAudit } from "./adminAudit.ts";
 
 const ROLE_LABELS: Record<Role, string> = {
   super_admin: "Super Administrador",
@@ -172,7 +173,11 @@ export async function renderAdminPanel(root: HTMLElement, initialTab?: AdminTab)
       await renderIntegrationsTab(content);
       break;
     case "audit":
-      await renderAuditTab(content);
+      // FASE 6 — a antiga renderAuditTab (só audit_logs) foi substituída pela
+      // Central de Auditoria (adminAudit.ts), que já cobre e amplia o que ela
+      // mostrava. Mantida abaixo intacta/não chamada (ver rule 48: não
+      // remover listAuditLogs/adminApi só "pra limpar código" nesta fase).
+      await renderCentralAudit(content);
       break;
   }
 }

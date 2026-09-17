@@ -5,7 +5,7 @@
 // ser vinculado a um SKU Outlet, mesmo que o texto pareça bater.
 import { getSupabase } from "./supabaseClient.ts";
 import { getAuthState } from "./auth.ts";
-import { normalizeEan, isValidEanFormat } from "./utils.ts";
+import { normalizeEan, isValidEanFormat, escapeOrFilterValue } from "./utils.ts";
 import type { NfeParsed } from "./nfeParser.ts";
 import {
   resolveInvoiceItem,
@@ -875,6 +875,233 @@ export async function confirmInvoiceReceiptTinyLaunch(input: ConfirmInvoiceTinyL
   return data as { receipt_id: string; confirmed_quantities: unknown };
 }
 
+export interface InProgressReceiptSummary {
+  receipt: InvoiceReceipt;
+  totalItems: number;
+  countedItems: number;
+}
+
+/**
+ * HOME OPERACIONAL 2.0 — card "Em andamento" (Nota Fiscal). Não existe
+ * conceito de "NF ativa" no banco (nem deve existir só pra Home — ver
+ * pedido); usa a NF `in_progress` trabalhada mais recentemente (started_at)
+ * como destaque real entre as que existirem. Progresso conta itens com
+ * status além de pending/unlinked — mesmos status já usados no resto do app.
+ */
+export async function getMostRecentInProgressReceipt(): Promise<InProgressReceiptSummary | null> {
+  const supabase = getSupabase();
+  const { data: receipt, error: rErr } = await supabase
+    .from("invoice_receipts")
+    .select("*")
+    .eq("status", "in_progress")
+    .order("started_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (rErr) throw rErr;
+  if (!receipt) return null;
+
+  const { data: items, error: iErr } = await supabase
+    .from("invoice_receipt_items")
+    .select("status")
+    .eq("receipt_id", (receipt as InvoiceReceipt).id);
+  if (iErr) throw iErr;
+
+  const rows = (items as { status: ItemStatus }[]) || [];
+  const countedItems = rows.filter((r) => r.status !== "pending" && r.status !== "unlinked").length;
+  return { receipt: receipt as InvoiceReceipt, totalItems: rows.length, countedItems };
+}
+
+export interface ReceiptAttentionCounts {
+  notStarted: number;
+  awaitingFinalization: number;
+  withDivergences: number;
+}
+
+/**
+ * HOME OPERACIONAL 2.0 — bloco "Atenção". Só reaproveita os status já
+ * existentes de invoice_receipts (nenhum status novo).
+ *
+ * FASE 3 (Central de Pendências) — REUTILIZADA sem alterar a definição: os
+ * mesmos três números (`notStarted`/`awaitingFinalization`/`withDivergences`)
+ * alimentam tanto o bloco "Atenção" da Home quanto os indicadores
+ * correspondentes da Central, pra nunca existir duas contagens divergentes
+ * pro mesmo conceito. `notStarted` é campo NOVO e aditivo — a Home ignora
+ * (não lê), então nada muda visualmente lá.
+ */
+export async function getReceiptAttentionCounts(): Promise<ReceiptAttentionCounts> {
+  const supabase = getSupabase();
+  const [
+    { count: notStarted, error: nErr },
+    { count: awaitingFinalization, error: aErr },
+    { count: withDivergences, error: dErr },
+  ] = await Promise.all([
+    supabase.from("invoice_receipts").select("id", { count: "exact", head: true }).eq("status", "not_started"),
+    supabase.from("invoice_receipts").select("id", { count: "exact", head: true }).eq("status", "in_progress"),
+    supabase.from("invoice_receipts").select("id", { count: "exact", head: true }).eq("status", "with_divergences"),
+  ]);
+  if (nErr) throw nErr;
+  if (aErr) throw aErr;
+  if (dErr) throw dErr;
+  return { notStarted: notStarted ?? 0, awaitingFinalization: awaitingFinalization ?? 0, withDivergences: withDivergences ?? 0 };
+}
+
+// ---------------------------------------------------------------------------
+// FASE 3 — Central de Pendências Operacionais (aba "Pendências" do
+// Histórico). Uma NF "exige atenção" quando não está completed
+// (not_started/in_progress/with_divergences) e/ou tem item(ns) unlinked —
+// consolidado numa linha só por NF, nunca duplicada (ver migration 0058
+// search_receipt_attention pra motivo/regra de inclusão completos).
+// ---------------------------------------------------------------------------
+export type ReceiptAttentionCategory = "all" | "not_started" | "in_progress" | "with_divergences" | "unlinked";
+
+export interface ReceiptAttentionRow {
+  id: string;
+  invoice_number: string | null;
+  supplier_name: string | null;
+  supplier_cnpj: string | null;
+  status: ReceiptStatus;
+  created_by: string;
+  operator_name: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  unlinked_count: number;
+}
+
+export interface ReceiptAttentionFilters {
+  search?: string;
+  /** Ids de operador cujo nome bateu com `search` (mesmo padrão da Fase 2 — resolvidos pelo chamador a partir de listVisibleOperators, sem consulta extra aqui). */
+  searchOperatorIds?: string[];
+  category?: ReceiptAttentionCategory;
+  operatorId?: string | "all";
+  /** [início, fim) em ISO — ver parseLocalDateRangeIso em utils.ts (mesmo helper da Fase 2, sem duplicar regra de fuso). */
+  dateFrom?: string | null;
+  dateTo?: string | null;
+  limit: number;
+  offset: number;
+}
+
+export interface ReceiptAttentionPage {
+  items: ReceiptAttentionRow[];
+  total: number;
+  hasMore: boolean;
+}
+
+/**
+ * Delega toda a lógica de inclusão/filtro/ordenação/paginação/contagem pra
+ * search_receipt_attention (RPC, migration 0058) — motivo de existir uma RPC
+ * aqui (em vez do padrão PostgREST direto da Fase 2) documentado lá. CNPJ
+ * normalizado do mesmo jeito que searchReceiptHistory (dígitos do termo
+ * digitado, já que supplier_cnpj é gravado só em dígitos).
+ */
+export async function searchReceiptAttention(filters: ReceiptAttentionFilters): Promise<ReceiptAttentionPage> {
+  const supabase = getSupabase();
+  const term = filters.search?.trim();
+  const cnpjDigits = term ? term.replace(/\D/g, "") : "";
+
+  const { data, error } = await supabase.rpc("search_receipt_attention", {
+    p_category: filters.category && filters.category !== "all" ? filters.category : null,
+    p_search_ilike: term ? `%${term}%` : null,
+    p_search_operator_ids: filters.searchOperatorIds && filters.searchOperatorIds.length > 0 ? filters.searchOperatorIds : null,
+    p_cnpj_ilike: cnpjDigits ? `%${cnpjDigits}%` : null,
+    p_operator_id: filters.operatorId && filters.operatorId !== "all" ? filters.operatorId : null,
+    p_date_from: filters.dateFrom ?? null,
+    p_date_to: filters.dateTo ?? null,
+    p_limit: filters.limit,
+    p_offset: filters.offset,
+  });
+  if (error) throw error;
+
+  const rows = (data as (ReceiptAttentionRow & { total_count: number })[]) || [];
+  const total = rows[0]?.total_count ?? 0;
+  const items: ReceiptAttentionRow[] = rows.map((row) => ({
+    id: row.id,
+    invoice_number: row.invoice_number,
+    supplier_name: row.supplier_name,
+    supplier_cnpj: row.supplier_cnpj,
+    status: row.status,
+    created_by: row.created_by,
+    operator_name: row.operator_name,
+    created_at: row.created_at,
+    started_at: row.started_at,
+    finished_at: row.finished_at,
+    unlinked_count: row.unlinked_count,
+  }));
+  return { items, total, hasMore: filters.offset + items.length < total };
+}
+
+function mapReceiptHistoryRow({ profiles, invoice_receipt_items, ...receipt }: HistoryRow): ReceiptWithCounts {
+  const operator = Array.isArray(profiles) ? profiles[0] : profiles;
+  const itemCount = invoice_receipt_items?.[0]?.count ?? 0;
+  return { ...receipt, operator_name: operator?.full_name ?? null, item_count: itemCount };
+}
+
+export interface ReceiptHistoryFilters {
+  search?: string;
+  /** Ids de operador cujo nome bateu com `search` (resolvidos pelo chamador a partir de listVisibleOperators — mesma lista já usada no seletor de operador, sem consulta extra). */
+  searchOperatorIds?: string[];
+  status?: ReceiptStatus | "all";
+  operatorId?: string | "all";
+  /** [início, fim) em ISO — ver parseLocalDateRangeIso em utils.ts. */
+  dateFrom?: string | null;
+  dateTo?: string | null;
+  limit: number;
+  offset: number;
+}
+
+export interface ReceiptHistoryPage {
+  items: ReceiptWithCounts[];
+  total: number;
+  hasMore: boolean;
+}
+
+/**
+ * HISTÓRICO — FASE 2. Mesmo princípio de searchConferenceHistory
+ * (conferencesApi.ts): count exato + página numa única requisição, filtro e
+ * pesquisa resolvidos no banco. CNPJ é armazenado só em dígitos (vem direto
+ * do XML da NF-e, tag <CNPJ>, que a Receita já exige sem pontuação — ver
+ * nfeParser.ts) — por isso a pesquisa por CNPJ remove pontuação do termo
+ * digitado (usuário pode digitar com ou sem ".", "/", "-") em vez de tentar
+ * reformatar o dado já salvo.
+ */
+export async function searchReceiptHistory(filters: ReceiptHistoryFilters): Promise<ReceiptHistoryPage> {
+  const supabase = getSupabase();
+  let query = supabase
+    .from("invoice_receipts")
+    .select("*, profiles!invoice_receipts_created_by_fkey(full_name), invoice_receipt_items(count)", { count: "exact" })
+    .order("created_at", { ascending: false });
+
+  if (filters.status && filters.status !== "all") {
+    query = query.eq("status", filters.status);
+  }
+  if (filters.operatorId && filters.operatorId !== "all") {
+    query = query.eq("created_by", filters.operatorId);
+  }
+  if (filters.dateFrom) query = query.gte("created_at", filters.dateFrom);
+  if (filters.dateTo) query = query.lt("created_at", filters.dateTo);
+
+  const term = filters.search?.trim();
+  if (term) {
+    const pattern = `%${term}%`;
+    const orParts = [`invoice_number.ilike.${escapeOrFilterValue(pattern)}`, `supplier_name.ilike.${escapeOrFilterValue(pattern)}`];
+    const cnpjDigits = term.replace(/\D/g, "");
+    if (cnpjDigits) {
+      orParts.push(`supplier_cnpj.ilike.${escapeOrFilterValue(`%${cnpjDigits}%`)}`);
+    }
+    if (filters.searchOperatorIds && filters.searchOperatorIds.length > 0) {
+      orParts.push(`created_by.in.(${filters.searchOperatorIds.join(",")})`);
+    }
+    query = query.or(orParts.join(","));
+  }
+
+  const { data, error, count } = await query.range(filters.offset, filters.offset + filters.limit - 1);
+  if (error) throw error;
+
+  const items = ((data as unknown as HistoryRow[]) || []).map(mapReceiptHistoryRow);
+  const total = count ?? items.length;
+  return { items, total, hasMore: filters.offset + items.length < total };
+}
+
 export async function listReceiptHistory(limit = 20): Promise<ReceiptWithCounts[]> {
   const supabase = getSupabase();
   // Mesmo ajuste de FK explícita que findReceiptByInvoiceKey (ver comentário lá).
@@ -885,9 +1112,5 @@ export async function listReceiptHistory(limit = 20): Promise<ReceiptWithCounts[
     .limit(limit);
   if (error) throw error;
 
-  return ((data as unknown as HistoryRow[]) || []).map(({ profiles, invoice_receipt_items, ...receipt }) => {
-    const operator = Array.isArray(profiles) ? profiles[0] : profiles;
-    const itemCount = invoice_receipt_items?.[0]?.count ?? 0;
-    return { ...receipt, operator_name: operator?.full_name ?? null, item_count: itemCount };
-  });
+  return ((data as unknown as HistoryRow[]) || []).map(mapReceiptHistoryRow);
 }

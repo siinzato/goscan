@@ -3,9 +3,9 @@
 // fluxo totalmente separado do reconhecimento visual/matching Outlet — não
 // reaproveita conferences/conference_items, tem suas próprias tabelas
 // (invoice_receipts/invoice_receipt_items/receipt_counts).
-import { escapeHtml, debounce, formatDateTime, describeError, initials, normalizeEan, isValidEanFormat, renderErrorWithRetry } from "../../utils.ts";
+import { escapeHtml, debounce, formatDateTime, formatOperationDuration, formatSignedNumber, describeError, initials, normalizeEan, isValidEanFormat, renderErrorWithRetry } from "../../utils.ts";
 import { parseNfeXml, diagnoseNfeXml, type NfeXmlDiagnostics } from "../../nfeParser.ts";
-import { normalizeKey, suggestBestMatch } from "../../nfeMatching.ts";
+import { normalizeKey, suggestBestMatch, summarizeReceipt } from "../../nfeMatching.ts";
 import { getAuthState, isAdmin, isManagerOrAdmin } from "../../auth.ts";
 import {
   findReceiptByInvoiceKey,
@@ -1963,27 +1963,27 @@ function filteredResultItems(): InvoiceReceiptItem[] {
 function renderResultView(root: HTMLElement): void {
   const receipt = currentReceipt!;
 
-  const ok = currentItems.filter((i) => i.status === "ok").length;
-  const missing = currentItems.filter((i) => i.status === "missing").length;
-  const surplus = currentItems.filter((i) => i.status === "surplus").length;
-  const notCounted = currentItems.filter((i) => i.status === "pending" || i.status === "unlinked").length;
+  // FASE 4 — reaproveita summarizeReceipt (nfeMatching.ts) em vez de recalcular
+  // ok/missing/surplus/conformidade aqui: mesma fórmula usada em qualquer outro
+  // lugar do app que resume uma NF, nunca duas regras divergentes pro mesmo
+  // conceito. pending já cobre 'unlinked' (physical_quantity sempre nulo nesses
+  // itens, mesmo resultado da checagem antiga por status).
+  const summary = summarizeReceipt(currentItems);
+  const { ok, missing, surplus, pending: notCounted, totalExpectedQuantity: totalExpected, totalPhysicalQuantity: totalPhysical, netDifference, conformityRate } = summary;
   const counted = ok + missing + surplus;
-  const conformityRate = counted > 0 ? ok / counted : 0;
-  const totalExpected = currentItems.reduce((acc, i) => acc + i.expected_quantity, 0);
-  const totalPhysical = currentItems.reduce((acc, i) => acc + (i.physical_quantity ?? 0), 0);
   const filtered = filteredResultItems();
 
   root.innerHTML = `
     <div class="card">
       <button class="btn-secondary" id="btnBackToUpload2">${Icon.chevronLeft}Outra nota</button>
       <h2>${receipt.status === "completed" ? "Conferência Finalizada" : "Conferência Finalizada — Com Divergências"}</h2>
-      <p class="hint-text">NF ${escapeHtml(receipt.invoice_number || "-")} · ${currentItems.length} SKUs conferidos</p>
+      <p class="hint-text">NF ${escapeHtml(receipt.invoice_number || "-")} · ${currentItems.length} SKUs da NF · ${counted} conferido(s)</p>
       <div class="active-conference-stats" style="flex-wrap:wrap">
         <span class="active-conference-stat">${ok}<span>✓ OK</span></span>
         <span class="active-conference-stat">${missing}<span>⚠ Com falta</span></span>
         <span class="active-conference-stat">${surplus}<span>⚠ Com sobra</span></span>
       </div>
-      <p class="hint-text">Conformidade: <strong>${formatConformity(conformityRate)}%</strong></p>
+      <p class="hint-text">Conformidade dos itens conferidos: <strong>${formatConformity(conformityRate)}%</strong></p>
       <div class="review-actions">
         <button class="btn-secondary" id="btnScrollReport">Ver relatório completo</button>
         <button class="btn-secondary" id="btnScrollDivergences">Ver divergências</button>
@@ -2002,9 +2002,11 @@ function renderResultView(root: HTMLElement): void {
         <span>Fornecedor: ${escapeHtml(receipt.supplier_name || "-")}</span>
         <span>CNPJ: ${escapeHtml(formatCnpj(receipt.supplier_cnpj))}</span>
         <span>Emissão: ${formatDateTime(receipt.issued_at)}</span>
+        <span>Importada/criada por: ${escapeHtml(receipt.created_by_name || "-")}</span>
         <span>Início da conferência: ${formatDateTime(receipt.started_at)}</span>
         <span>Finalização: ${formatDateTime(receipt.finished_at)}</span>
         <span>Finalizada por: ${escapeHtml(receipt.finished_by_name || "-")}</span>
+        <span>Duração: ${formatOperationDuration(receipt.started_at, receipt.finished_at)}</span>
       </div>
       <div class="active-conference-stats" style="flex-wrap:wrap">
         <span class="active-conference-stat">${currentItems.length}<span>SKUs da NF</span></span>
@@ -2014,7 +2016,7 @@ function renderResultView(root: HTMLElement): void {
         <span class="active-conference-stat">${surplus}<span>Com sobra</span></span>
         <span class="active-conference-stat">${notCounted}<span>Não conferidos</span></span>
       </div>
-      <p class="hint-text">Quantidade total NF: ${totalExpected} · Quantidade física: ${totalPhysical}</p>
+      <p class="hint-text">Quantidade total NF: ${totalExpected} · Quantidade física: ${totalPhysical} · Diferença total: <strong>${formatSignedNumber(netDifference)}</strong></p>
     </div>
 
     ${renderTinyLaunchCard(receipt, currentItems)}

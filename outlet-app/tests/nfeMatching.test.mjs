@@ -221,6 +221,37 @@ test("summarizeReceipt calcula taxa de conformidade só sobre itens já conferid
   assert.equal(summary.conformityRate, 1);
 });
 
+// ---------------------------------------------------------------------------
+// FASE 4 — Resumo Final Padronizado: totalExpectedQuantity/totalPhysicalQuantity/
+// netDifference (diferença total exibida com sinal — ver formatSignedNumber em
+// utils.ts) precisam refletir exatamente a soma real, com sinal correto.
+// ---------------------------------------------------------------------------
+test("summarizeReceipt: diferença total positiva (sobra líquida)", () => {
+  const summary = summarizeReceipt([
+    { expected_quantity: 10, physical_quantity: 15 },
+    { expected_quantity: 5, physical_quantity: 5 },
+  ]);
+  assert.equal(summary.totalExpectedQuantity, 15);
+  assert.equal(summary.totalPhysicalQuantity, 20);
+  assert.equal(summary.netDifference, 5);
+});
+
+test("summarizeReceipt: diferença total negativa (falta líquida)", () => {
+  const summary = summarizeReceipt([
+    { expected_quantity: 10, physical_quantity: 7 },
+    { expected_quantity: 5, physical_quantity: 5 },
+  ]);
+  assert.equal(summary.totalExpectedQuantity, 15);
+  assert.equal(summary.totalPhysicalQuantity, 12);
+  assert.equal(summary.netDifference, -3);
+});
+
+test("summarizeReceipt: itens pending contam physical_quantity como 0 na soma (nunca null vaza pra soma)", () => {
+  const summary = summarizeReceipt([{ expected_quantity: 10, physical_quantity: null }]);
+  assert.equal(summary.totalPhysicalQuantity, 0);
+  assert.equal(summary.netDifference, -10);
+});
+
 // Exemplo REAL reportado: a NF-e descreve "BOLSA TERMICA MIX BB BRUTA MARROM"
 // (maiúsculas, com marca/cor extra) e o produto cadastrado no GoScan é só
 // "Bolsa Térmica Mix" (com acento, sem marca/cor) — precisa achar mesmo assim.

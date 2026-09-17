@@ -166,6 +166,159 @@ export function parseConferirHash(hash: string): ConferirHashInfo {
   return { mode: "imagens", nfeReceiptId: null };
 }
 
+/**
+ * FASE 3 — Central de Pendências: rota `#/historico/pendencias` dentro do
+ * módulo "Histórico" (mesmo princípio de parseConferirHash acima — shell.ts
+ * só olha o primeiro segmento pra escolher a aba do bottom nav; history.ts
+ * lê o segundo pra decidir a sub-aba). Só sinaliza "pendencias" quando o hash
+ * diz isso explicitamente; qualquer outra coisa (incluindo `#/historico` puro)
+ * devolve null — history.ts então preserva a aba que já estava selecionada
+ * na sessão, em vez de forçar de volta pra "outlet".
+ */
+export function parseHistoricoHash(hash: string): "pendencias" | "indicadores" | null {
+  const raw = (hash || "").replace(/^#\/?/, "");
+  const segments = raw.split("/").filter(Boolean);
+  if (segments[0] !== "historico") return null;
+  if (segments[1] === "pendencias") return "pendencias";
+  if (segments[1] === "indicadores") return "indicadores";
+  return null;
+}
+
+/**
+ * Intervalo [início, fim) do dia local do operador, em ISO — o servidor nunca
+ * decide sozinho o que é "hoje" (evita depender do fuso da instância do
+ * Postgres); usado pela RPC get_home_operational_summary (ver migration
+ * 0057), que exige explicitamente os dois limites do período.
+ */
+export function todayLocalRangeIso(): { start: string; end: string } {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+/**
+ * INDICADORES OPERACIONAIS — FASE 5. Intervalo [início, fim) cobrindo "hoje +
+ * (days - 1) dias anteriores" no fuso local do operador, mesmo princípio de
+ * todayLocalRangeIso (nunca decide o dia a partir do fuso do servidor). Usado
+ * pelos atalhos "7 dias"/"30 dias" (days=7/30); "Hoje" reaproveita
+ * todayLocalRangeIso diretamente.
+ */
+export function lastNDaysLocalRangeIso(days: number): { start: string; end: string } {
+  const { end } = todayLocalRangeIso();
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (days - 1));
+  return { start: start.toISOString(), end };
+}
+
+/**
+ * INDICADORES OPERACIONAIS — FASE 5. Fuso IANA do dispositivo, usado pela RPC
+ * get_operational_indicators (ver migration 0059) para bucketizar a série
+ * diária no dia local correto perto da meia-noite. Nunca hardcoded
+ * ("America/Sao_Paulo" seria incorreto para operações fora do Brasil) — só
+ * cai no fallback documentado 'UTC' se o ambiente não expuser Intl
+ * corretamente (nunca lança erro pro chamador).
+ */
+export function getLocalTimeZone(): string {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return tz || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+/**
+ * HISTÓRICO — FASE 2 (filtro por período). Converte os valores de
+ * `<input type="date">` (sempre "YYYY-MM-DD", sem hora/fuso) em [início, fim)
+ * local do operador, em ISO — mesmo princípio de todayLocalRangeIso.
+ * `new Date("YYYY-MM-DD")` cairia em meia-noite UTC (erra o dia em qualquer
+ * fuso negativo, como o do Brasil); por isso os componentes são montados
+ * manualmente como data LOCAL. `dateTo` vira o INÍCIO do dia seguinte
+ * (exclusivo) — "até o final daquele dia" inclui o dia inteiro. Extremo
+ * ausente/vazio fica `null` (filtro aberto daquele lado).
+ */
+export function parseLocalDateRangeIso(dateFrom: string | null | undefined, dateTo: string | null | undefined): { start: string | null; end: string | null } {
+  function localMidnight(value: string): Date {
+    const [y, m, d] = value.split("-").map(Number);
+    return new Date(y, (m || 1) - 1, d || 1, 0, 0, 0, 0);
+  }
+  const start = dateFrom ? localMidnight(dateFrom).toISOString() : null;
+  let end: string | null = null;
+  if (dateTo) {
+    const endDate = localMidnight(dateTo);
+    endDate.setDate(endDate.getDate() + 1);
+    end = endDate.toISOString();
+  }
+  return { start, end };
+}
+
+/**
+ * HISTÓRICO — FASE 2. Escapa um valor pra uso dentro do combinador `or()` do
+ * PostgREST (usado pra montar "pesquisar por nome OU protocolo OU operador"
+ * numa única consulta) — sem isso, um termo de busca com vírgula/parênteses
+ * quebraria o parser de filtros do PostgREST (que usa esses caracteres como
+ * delimitadores da própria sintaxe). Aspas duplas sempre funcionam (mesmo sem
+ * caractere especial no valor), então aplicadas incondicionalmente.
+ */
+export function escapeOrFilterValue(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/** HISTÓRICO — FASE 2. Formato comum dos filtros de Outlet e NF-e (cada aba usa seu próprio status, mas a mesma forma) — usado só pra decidir se "Limpar filtros" deve ficar habilitado e se um resultado vazio é "sem dados" ou "sem correspondência". */
+export interface HistoryFilterState {
+  search: string;
+  status: string;
+  operatorId: string;
+  dateFrom: string;
+  dateTo: string;
+}
+
+export function hasActiveHistoryFilters(f: HistoryFilterState): boolean {
+  return f.search.trim() !== "" || f.status !== "all" || f.operatorId !== "all" || f.dateFrom !== "" || f.dateTo !== "";
+}
+
+/**
+ * HISTÓRICO — FASE 2 (pesquisa por operador dentro da caixa de texto livre).
+ * Resolve o termo digitado contra os NOMES de uma lista pequena já carregada
+ * (accent/case-insensitive via normalize(), mesma normalização usada em todo
+ * o app pra busca de produto) — nunca dispara uma consulta nova ao banco só
+ * pra isso.
+ */
+export function matchOperatorIdsByName<T extends { id: string; full_name: string | null }>(term: string, operators: T[]): string[] {
+  const q = normalize(term);
+  if (!q) return [];
+  return operators.filter((o) => o.full_name && normalize(o.full_name).includes(q)).map((o) => o.id);
+}
+
+/**
+ * FASE 4 — Resumo Final Padronizado. Duração de uma operação (Outlet ou
+ * NF-e) a partir dos timestamps OFICIAIS do servidor — nunca do relógio
+ * local nem de um cronômetro em memória. Sem segundos na UI normal (18 min,
+ * 1h 12min, 2h 04min). Qualquer timestamp ausente, inválido, ou
+ * finished_at < started_at nunca vira um número inventado — sempre "Não
+ * registrada".
+ */
+export function formatOperationDuration(startedAt: string | null | undefined, finishedAt: string | null | undefined): string {
+  if (!startedAt || !finishedAt) return "Não registrada";
+  const start = new Date(startedAt).getTime();
+  const end = new Date(finishedAt).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "Não registrada";
+
+  const totalMinutes = Math.round((end - start) / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours === 0) return `${minutes} min`;
+  return `${hours}h ${String(minutes).padStart(2, "0")}min`;
+}
+
+/** FASE 4 — diferença de unidades com sinal explícito ("+10"/"-3"/"0") — nunca confundir com quantidade de SKUs divergentes (são contagens diferentes). */
+export function formatSignedNumber(value: number): string {
+  return value > 0 ? `+${value}` : `${value}`;
+}
+
 let retryHandlerSeq = 0;
 
 /**

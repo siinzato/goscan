@@ -664,6 +664,40 @@ body.pwa-modal-open .gogroup-track { animation-play-state: paused; }
 .active-conference-card .btn-primary { background: var(--white); color: var(--go-blue-800); }
 .active-conference-card .btn-primary:hover { background: var(--go-lime-100); }
 
+/* HOME OPERACIONAL 2.0 — "Em andamento" (Outlet + Nota Fiscal lado a lado
+   quando houver espaço; empilhado no mobile). Reaproveita .active-conference-card
+   como está — só o container em volta muda de coluna pra linha no tablet+. */
+.in-progress-grid { display: flex; flex-direction: column; gap: 12px; }
+@media (min-width: 720px) {
+  .in-progress-grid { flex-direction: row; }
+  .in-progress-grid > .active-conference-card { flex: 1; margin-bottom: 0; }
+}
+
+/* HOME OPERACIONAL 2.0 — "Acesso rápido": mesmo grid 2x2/4x1 do admin-stat-grid,
+   com visual de botão (ícone + rótulo) em vez de indicador numérico. */
+.quick-access-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+@media (min-width: 720px) {
+  .quick-access-grid { grid-template-columns: repeat(4, 1fr); }
+}
+.quick-access-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 14px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  text-decoration: none;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.quick-access-btn svg { width: 22px; height: 22px; color: var(--go-blue-700); stroke: currentColor; }
+
 .recent-list { list-style: none; margin: 0; padding: 0; }
 .recent-list li {
   display: flex;
