@@ -16,12 +16,60 @@ import {
 import { getConferenceFinalSummary, type ConferenceFinalSummary } from "../../conferencesApi.ts";
 import { exportItemsToXlsx } from "../../exporter.ts";
 import { stopCollabSession } from "../../realtimeCollab.ts";
+import { getAuthState } from "../../auth.ts";
 import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
 import { confirmAction } from "../confirmModal.ts";
 
+// ---------------------------------------------------------------------------
+// CORREÇÃO URGENTE — autosave local do rascunho de "Colar texto". Protege
+// contra perda de texto em F5/fechamento inesperado (sem depender de
+// beforeunload/timer/chamada assíncrona — o próprio evento `input` já
+// persiste). Só localStorage, nunca Supabase; separado por usuário+conferência
+// pra nunca vazar rascunho entre contas/operações. NUNCA deve derrubar a tela
+// de Conferir se localStorage estiver indisponível (Safari privado, quota
+// cheia, etc.) — por isso os três helpers abaixo nunca lançam.
+// ---------------------------------------------------------------------------
+function textDraftKey(userId: string, conferenceId: string): string {
+  return `goscan:outlet:text-draft:${userId}:${conferenceId}`;
+}
+
+function loadTextDraft(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function saveTextDraft(key: string, value: string): void {
+  try {
+    if (value) {
+      localStorage.setItem(key, value);
+    } else {
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // localStorage indisponível (ex.: modo privado sem suporte) — a
+    // conferência continua funcionando normalmente, só sem autosave.
+  }
+}
+
+function clearTextDraft(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    // idem — nunca quebra o fluxo por causa disso.
+  }
+}
+
 let pendingImages: { data: string; media_type: string; name: string }[] = [];
 let candidates: MatchResult[] = [];
+// Identifica se o lote ATUAL de candidates veio de "Gerar itens do texto" —
+// só nesse caso o #btnConfirmAll pode apagar o rascunho de #textInput. Gerar
+// via imagem sobrescreve candidates e derruba essa flag; linha manual não
+// mexe nela (não é uma nova origem, só um ajuste no lote já existente).
+let candidatesFromText = false;
 // idx dos candidatos com SKU de origem "manual" (digitado/escolhido pelo operador) —
 // esses nunca são sobrescritos automaticamente quando Produto/Cor mudam (ver
 // wireCandidateModeloEditing). Reconstruído a cada render a partir de MatchResult
@@ -162,8 +210,8 @@ export async function renderConference(root: HTMLElement): Promise<void> {
 
   wireInputModeSwitch(root, parseConferirHash(window.location.hash));
   wireImageInput(root);
-  wireTextInput(root);
-  wireCandidateActions(root);
+  wireTextInput(root, session);
+  wireCandidateActions(root, session);
 
   document.getElementById("btnReprocessEmpty")!.addEventListener("click", async () => {
     const current = sessionSnapshot();
@@ -510,6 +558,7 @@ function wireImageInput(root: HTMLElement): void {
         return;
       }
       candidates = await matchItems(items);
+      candidatesFromText = false;
       renderCandidates(root);
     } catch (err) {
       showToast("Erro ao ler prints: " + (err instanceof Error ? err.message : String(err)), "error");
@@ -520,7 +569,21 @@ function wireImageInput(root: HTMLElement): void {
   });
 }
 
-function wireTextInput(root: HTMLElement): void {
+function wireTextInput(root: HTMLElement, session: Session): void {
+  const textarea = root.querySelector("#textInput") as HTMLTextAreaElement;
+  const userId = getAuthState().session?.user.id;
+  if (userId) {
+    const draftKey = textDraftKey(userId, session.conference.id);
+    const draft = loadTextDraft(draftKey);
+    if (draft) textarea.value = draft;
+    // Sem debounce: o próprio evento `input` já é a persistência — o texto
+    // digitado imediatamente antes de um fechamento inesperado precisa estar
+    // salvo, e um timer/beforeunload não é confiável pra isso.
+    textarea.addEventListener("input", () => {
+      saveTextDraft(draftKey, textarea.value);
+    });
+  }
+
   root.querySelector("#btnParseText")!.addEventListener("click", async () => {
     const raw = (root.querySelector("#textInput") as HTMLTextAreaElement).value;
     const lines = raw
@@ -547,6 +610,7 @@ function wireTextInput(root: HTMLElement): void {
       return { modelo, cor, quantidade };
     });
     candidates = await matchItems(items);
+    candidatesFromText = true;
     renderCandidates(root);
   });
 }
@@ -773,7 +837,7 @@ function wireSkuPickers(wrap: Element): void {
   });
 }
 
-function wireCandidateActions(root: HTMLElement): void {
+function wireCandidateActions(root: HTMLElement, session: Session): void {
   root.querySelector("#btnAddManualRow")!.addEventListener("click", () => {
     candidates.push({
       modelo_bruto: "",
@@ -791,33 +855,51 @@ function wireCandidateActions(root: HTMLElement): void {
 
   root.querySelector("#btnConfirmAll")!.addEventListener("click", async () => {
     const toAdd = candidates.map((c, idx) => ({ c, isManual: manualOverrides.has(idx) }));
+    const wasFromText = candidatesFromText;
     candidates = [];
+    candidatesFromText = false;
     manualOverrides.clear();
     renderCandidates(root);
     const previewList = root.querySelector("#imagePreviewList")!;
     previewList.innerHTML = "";
     pendingImages = [];
 
-    for (const { c, isManual } of toAdd) {
-      const matchStatus = isManual
-        ? "manual"
-        : c.status === "matched"
-          ? "matched"
-          : c.status === "matched_parcial"
-            ? "partial"
-            : "unresolved";
-      await addItem({
-        product_variant_id: c.variant_id,
-        raw_model: c.modelo_bruto,
-        raw_color: c.cor_bruta,
-        quantity: c.qtd,
-        match_status: matchStatus,
-        source: "text",
-        sku_code: c.sku_code,
-        produto: c.product_name,
-      });
+    try {
+      for (const { c, isManual } of toAdd) {
+        const matchStatus = isManual
+          ? "manual"
+          : c.status === "matched"
+            ? "matched"
+            : c.status === "matched_parcial"
+              ? "partial"
+              : "unresolved";
+        await addItem({
+          product_variant_id: c.variant_id,
+          raw_model: c.modelo_bruto,
+          raw_color: c.cor_bruta,
+          quantity: c.qtd,
+          match_status: matchStatus,
+          source: "text",
+          sku_code: c.sku_code,
+          produto: c.product_name,
+        });
+      }
+      showToast(`${toAdd.length} item(ns) adicionado(s) à conferência.`, "success");
+      // Só agora, com TODOS os candidatos entregues ao fluxo de addItem sem
+      // exceção, o rascunho de texto deixa de ter valor de recuperação — ver
+      // regra explícita: nunca no finally, só no caminho de sucesso. E só
+      // quando o lote confirmado realmente veio de "Gerar itens do texto"
+      // (wasFromText) — confirmar um lote de imagem/linha manual NUNCA pode
+      // apagar um rascunho de texto que o operador ainda não processou.
+      if (wasFromText) {
+        const userId = getAuthState().session?.user.id;
+        if (userId) clearTextDraft(textDraftKey(userId, session.conference.id));
+        const textarea = root.querySelector("#textInput") as HTMLTextAreaElement | null;
+        if (textarea && textarea.value) textarea.value = "";
+      }
+    } catch (err) {
+      showToast("Erro ao adicionar itens: " + describeError(err), "error");
     }
-    showToast(`${toAdd.length} item(ns) adicionado(s) à conferência.`, "success");
   });
 }
 
