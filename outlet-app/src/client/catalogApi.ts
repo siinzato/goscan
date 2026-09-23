@@ -226,8 +226,13 @@ export async function searchCatalog(
   }
 
   const result: CatalogPage = { rows, total: count ?? rows.length, page, pageSize };
-  searchCache.set(key, result);
-  if (searchCache.size > SEARCH_CACHE_MAX) searchCache.clear();
+  // CORREÇÃO — mesmo motivo do pickerRpcCache logo abaixo: nunca cacheia
+  // página vazia, pra nunca esconder um produto recém-criado em outra
+  // aba/tela por trás de um "não encontrado" que nunca expira sozinho.
+  if (rows.length > 0) {
+    searchCache.set(key, result);
+    if (searchCache.size > SEARCH_CACHE_MAX) searchCache.clear();
+  }
   return result;
 }
 
@@ -343,8 +348,17 @@ async function searchSkuForPickerRpc(query: string, limit: number, productType: 
     match_type: r.match_type,
   }));
 
-  pickerRpcCache.set(key, rows);
-  if (pickerRpcCache.size > PICKER_RPC_CACHE_MAX) pickerRpcCache.clear();
+  // CORREÇÃO — nunca cacheia um resultado VAZIO: é exatamente o cenário em
+  // que o operador está prestes a cadastrar o produto que faltava (ex.:
+  // "Resolver pendências" da NF-e) e precisa que a PRÓXIMA busca pelo mesmo
+  // termo veja o produto novo — mesmo que invalidateSearchCache() não tenha
+  // rodado nesta aba (ex.: produto criado em outra aba/tela). Um resultado
+  // com itens continua cacheado normalmente (custo de staleness ali é baixo:
+  // edição/exclusão desses mesmos itens já invalida via invalidateSearchCache()).
+  if (rows.length > 0) {
+    pickerRpcCache.set(key, rows);
+    if (pickerRpcCache.size > PICKER_RPC_CACHE_MAX) pickerRpcCache.clear();
+  }
   return rows;
 }
 

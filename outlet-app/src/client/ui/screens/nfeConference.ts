@@ -1209,6 +1209,7 @@ function renderCountingView(root: HTMLElement): void {
 
   root.innerHTML = `
     <div class="card">
+      <button class="btn-secondary" id="btnBackToUploadCounting">${Icon.chevronLeft}Outra nota</button>
       <h2>Contagem Física</h2>
       <div class="product-card-meta">
         <span>NF-e: ${escapeHtml(receipt.invoice_number || "-")}</span>
@@ -1249,6 +1250,15 @@ function renderCountingView(root: HTMLElement): void {
     </div>`;
 
   root.addEventListener("click", unlockConferenceSounds, { once: true });
+
+  // Sair pra escolher outra NF nunca perde nada: a contagem já está salva no
+  // servidor a cada bipagem (mesmo padrão de "Outra nota" já usado em
+  // renderPrepView/renderResultView) — só troca a tela, não apaga/finaliza.
+  root.querySelector("#btnBackToUploadCounting")!.addEventListener("click", () => {
+    currentReceipt = null;
+    currentItems = [];
+    goTo(root, "upload");
+  });
 
   renderCountingList(root);
   renderParticipantsBanner(root);
