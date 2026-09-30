@@ -1,6 +1,7 @@
-import { searchCatalog, type CatalogRow } from "../../catalogApi.ts";
+import { searchCatalog, getCatalogOverviewStats, type CatalogRow, type CatalogOverviewStats, type ProductType } from "../../catalogApi.ts";
 import { importCatalog, importNormalProducts } from "../../importer.ts";
 import { createManualProduct, updateProductName, updateVariantFields, deleteVariant, setVariantActive } from "../../catalogManageApi.ts";
+import { getSignedImageUrls } from "../../catalogImagesApi.ts";
 import { getAuthState, isManagerOrAdmin } from "../../auth.ts";
 import { escapeHtml, debounce, renderErrorWithRetry, describeError } from "../../utils.ts";
 import { Icon } from "../icons.ts";
@@ -15,44 +16,38 @@ declare const XLSX: {
 };
 
 const PAGE_SIZE = 30;
-// Estado do sub-catálogo Outlet (comportamento 100% preservado).
-let page = 0;
-let query = "";
-// EXPANSÃO GOSCAN — Produtos Normais: estado próprio e separado, pra trocar
-// de sub-aba não perder filtro/página de nenhum dos dois lados (mesmo
-// princípio já aplicado ao bug de reset desta sessão).
-let normalPage = 0;
-let normalQuery = "";
-let skuSubTab: "outlet" | "normal" = "outlet";
 let catalogTab: "skus" | "visual" | "scan" = "skus";
 
 // ---------------------------------------------------------------------------
-// EXPANSÃO GOSCAN — Gestão direta do catálogo (criar/editar/excluir sem
-// planilha). Estado do formulário é separado por sub-aba, igual a page/query.
+// EVOLUÇÃO CATÁLOGO — antes, Outlet e Normal eram duas sub-abas com estado
+// (busca/página/formulário) e código quase idênticos totalmente separados.
+// Unificados aqui numa lista só com filtro de Tipo (Todos/Normais/Outlet),
+// reaproveitando a MESMA searchCatalog de sempre (productType já era
+// opcional — "Todos" nunca foi uma capacidade nova no backend, só uma opção
+// nova na UI). Filtro/busca/paginação continuam batendo 1:1 com o que já
+// existia por tipo — só passaram a viver num único estado.
 // ---------------------------------------------------------------------------
+type ProductTypeFilter = "all" | ProductType;
+type EanFilter = "all" | "with" | "without";
 type ProductFormMode = "closed" | "create" | "edit";
-let outletFormMode: ProductFormMode = "closed";
-let outletEditingRow: CatalogRow | null = null;
-let outletRows: CatalogRow[] = [];
-let normalFormMode: ProductFormMode = "closed";
-let normalEditingRow: CatalogRow | null = null;
-let normalRows: CatalogRow[] = [];
 
-// CORREÇÃO — cancelamento de buscas antigas: cada chamada de carregamento
-// aborta a anterior sozinha (nunca uma resposta lenta e desatualizada
-// sobrescreve uma mais recente) — um controller por sub-aba, guardado aqui
-// em vez de passado por parâmetro, pra TODO caminho que recarrega a lista
-// (busca, paginação, retry, ou recarregar depois de criar/editar/excluir)
-// se beneficiar automaticamente, sem precisar lembrar de criar um novo toda vez.
-let outletSearchController: AbortController | null = null;
-let normalSearchController: AbortController | null = null;
+let prodPage = 0;
+let prodQuery = "";
+let prodTypeFilter: ProductTypeFilter = "all";
+let prodEanFilter: EanFilter = "all";
+let prodFiltersOpen = false;
+let prodFormMode: ProductFormMode = "closed";
+let prodEditingRow: CatalogRow | null = null;
+let prodRows: CatalogRow[] = [];
+let prodSearchController: AbortController | null = null;
+
+const TYPE_LABEL: Record<ProductType, string> = { normal: "Normal", outlet: "Outlet" };
 
 export async function renderCatalog(root: HTMLElement): Promise<void> {
-  // page/query/catalogTab são preservados de propósito entre chamadas — o
-  // usuário pode sair da rota "catalogo" (ou só voltar de segundo plano) e
-  // reentrar sem perder busca/página/aba. Resetar aqui incondicionalmente
-  // era exatamente o "reset" reportado: filtro e paginação voltavam ao
-  // padrão mesmo sem nenhuma ação do usuário.
+  // catalogTab/prodQuery/prodPage/prodTypeFilter são preservados de propósito
+  // entre chamadas — sair da rota "catalogo" (ou só voltar de segundo plano)
+  // e reentrar não deve perder busca/página/filtro sem nenhuma ação do
+  // usuário (mesmo princípio já valia antes desta evolução).
   const { profile } = getAuthState();
   const canImport = isManagerOrAdmin(profile);
 
@@ -82,54 +77,86 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
     void renderVisualScanSection(content);
     return;
   }
+  await renderProductsTab(content, canImport);
+}
 
-  // EXPANSÃO GOSCAN — dentro da aba "SKUs", separa Produtos Outlet (o que já
-  // existia, comportamento preservado) de Produtos Normais (novo). Sub-abas
-  // seguem o mesmo padrão de catalogTab acima — nenhuma rota nova no shell.
-  content.innerHTML = `
-    <div class="input-mode-switch">
-      <button class="mode-btn ${skuSubTab === "outlet" ? "active" : ""}" data-sku-subtab="outlet">${Icon.package}Produtos Outlet</button>
-      <button class="mode-btn ${skuSubTab === "normal" ? "active" : ""}" data-sku-subtab="normal">${Icon.receipt}Produtos Normais</button>
-    </div>
-    <div id="skuSubTabContent"></div>`;
+// ---------------------------------------------------------------------------
+// Visão geral — contagens reais (getCatalogOverviewStats), nunca inventadas.
+// ---------------------------------------------------------------------------
+function renderOverviewSkeleton(): string {
+  return `<div class="card"><h2>Visão geral</h2><div class="admin-stat-grid" id="prodOverviewGrid"><p class="hint-text">Carregando…</p></div></div>`;
+}
 
-  content.querySelectorAll<HTMLButtonElement>("[data-sku-subtab]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      skuSubTab = btn.dataset.skuSubtab as "outlet" | "normal";
-      void renderCatalog(root);
+function overviewTile(icon: string, value: number, label: string): string {
+  return `<div class="admin-stat-tile">${icon}<strong>${value}</strong><span>${escapeHtml(label)}</span></div>`;
+}
+
+async function loadOverview(root: HTMLElement): Promise<void> {
+  const grid = root.querySelector<HTMLElement>("#prodOverviewGrid");
+  if (!grid) return;
+  try {
+    const stats: CatalogOverviewStats = await getCatalogOverviewStats();
+    grid.innerHTML = [
+      overviewTile(Icon.package, stats.totalSkus, "Total de SKUs"),
+      overviewTile(Icon.receipt, stats.normalCount, "Produtos Normais"),
+      overviewTile(Icon.package, stats.outletCount, "Produtos Outlet"),
+      overviewTile(Icon.barcode, stats.withEan, "Com EAN"),
+      overviewTile(Icon.searchX, stats.withoutEan, "Sem EAN"),
+    ].join("");
+  } catch (err) {
+    if (import.meta.env.DEV) {
+      console.warn("[GoScan] falha ao carregar visão geral do catálogo:", err);
+    }
+    grid.innerHTML = `<p class="hint-text">Não foi possível carregar a visão geral agora (${escapeHtml(describeError(err))}).</p>`;
+  }
+}
+
+async function updateTypeTabCounts(root: HTMLElement): Promise<void> {
+  try {
+    const stats = await getCatalogOverviewStats();
+    const counts: Record<ProductTypeFilter, number> = { all: stats.normalCount + stats.outletCount, normal: stats.normalCount, outlet: stats.outletCount };
+    root.querySelectorAll<HTMLButtonElement>("[data-prod-type]").forEach((btn) => {
+      const value = btn.dataset.prodType as ProductTypeFilter;
+      if (btn.querySelector(".chip-count")) return;
+      btn.insertAdjacentHTML("beforeend", ` <span class="chip-count">${counts[value]}</span>`);
     });
-  });
-
-  const subContent = content.querySelector<HTMLElement>("#skuSubTabContent")!;
-  if (skuSubTab === "normal") {
-    await renderNormalProductsTab(subContent, canImport);
-  } else {
-    await renderOutletSkusTab(subContent, canImport);
+  } catch {
+    // Sem contagem nas abas não impede o uso — a lista de produtos (loadProductsPage) já mostra o total real na paginação.
   }
 }
 
 // ---------------------------------------------------------------------------
-// Formulário de criar/editar produto — compartilhado entre as duas sub-abas.
-// "Excluir planilha em massa" continua existindo do lado; isto é só o
-// caminho pra um produto avulso (seção final do pedido de correção de EAN).
+// Formulário de criar/editar produto — único, compartilhado por Todos os
+// tipos. Ao CRIAR, o operador escolhe o Tipo (Normal/Outlet) explicitamente;
+// ao EDITAR, o Tipo é só exibido (mudar o tipo de um produto já cadastrado
+// não é uma operação suportada pelas funções existentes — fora de escopo
+// desta evolução, que só reorganiza a apresentação).
 // ---------------------------------------------------------------------------
-function renderProductForm(mode: ProductFormMode, editingRow: CatalogRow | null, showColor: boolean): string {
+function renderProductForm(mode: ProductFormMode, editingRow: CatalogRow | null): string {
   if (mode === "closed") return "";
   const isEdit = mode === "edit" && editingRow;
+  const defaultType: ProductType = prodTypeFilter === "all" ? "outlet" : prodTypeFilter;
   return `
     <div class="card" id="productFormCard">
       <h2>${isEdit ? "Editar produto" : "Novo produto"}</h2>
+      ${
+        isEdit
+          ? `<div id="pfThumbWrap" class="product-detail-thumb"></div>
+             <p class="hint-text">Tipo: <strong>${TYPE_LABEL[editingRow!.product_type]}</strong></p>`
+          : `<label for="pfTipo">Tipo</label>
+             <select id="pfTipo">
+               <option value="outlet" ${defaultType === "outlet" ? "selected" : ""}>Outlet</option>
+               <option value="normal" ${defaultType === "normal" ? "selected" : ""}>Normal</option>
+             </select>`
+      }
       <label for="pfNome">Nome do produto</label>
       <input type="text" id="pfNome" value="${escapeHtml(isEdit ? editingRow!.produto : "")}" />
       <label for="pfSku">SKU</label>
       <input type="text" id="pfSku" value="${escapeHtml(isEdit ? editingRow!.sku_code : "")}" />
       <label for="pfEan">EAN (opcional)</label>
       <input type="text" id="pfEan" value="${escapeHtml(isEdit ? editingRow!.gtin || "" : "")}" placeholder="8, 12, 13 ou 14 dígitos" />
-      ${
-        showColor
-          ? `<label for="pfCor">Cor (opcional)</label><input type="text" id="pfCor" value="${escapeHtml(isEdit ? editingRow!.cor || "" : "")}" />`
-          : ""
-      }
+      <label for="pfCor">Cor (opcional)</label>
+      <input type="text" id="pfCor" value="${escapeHtml(isEdit ? editingRow!.cor || "" : "")}" />
       <p class="error-box" id="productFormError" hidden></p>
       <div class="review-actions" style="margin-top:10px">
         <button type="button" class="btn-primary" id="btnSaveProductForm">Salvar</button>
@@ -138,29 +165,42 @@ function renderProductForm(mode: ProductFormMode, editingRow: CatalogRow | null,
     </div>`;
 }
 
-function readProductForm(root: HTMLElement): { nome: string; sku: string; ean: string; cor: string } {
+/** Miniatura no formulário de edição, quando o produto já tiver imagem (product-images) — mesma fonte usada no Catálogo Visual, nunca uma segunda consulta de imagem. */
+async function hydrateProductFormThumb(root: HTMLElement, row: CatalogRow): Promise<void> {
+  const wrap = root.querySelector<HTMLElement>("#pfThumbWrap");
+  if (!wrap) return;
+  if (!row.thumbnail_path) {
+    wrap.innerHTML = "";
+    return;
+  }
+  try {
+    const urls = await getSignedImageUrls([row.thumbnail_path]);
+    const url = urls.get(row.thumbnail_path);
+    wrap.innerHTML = url ? `<img src="${escapeHtml(url)}" alt="" class="thumb-img-lg" />` : "";
+  } catch {
+    wrap.innerHTML = "";
+  }
+}
+
+function readProductForm(root: HTMLElement): { nome: string; sku: string; ean: string; cor: string; tipo: ProductType | null } {
+  const tipoInput = root.querySelector<HTMLSelectElement>("#pfTipo");
   return {
     nome: (root.querySelector<HTMLInputElement>("#pfNome")?.value || "").trim(),
     sku: (root.querySelector<HTMLInputElement>("#pfSku")?.value || "").trim(),
     ean: (root.querySelector<HTMLInputElement>("#pfEan")?.value || "").trim(),
     cor: (root.querySelector<HTMLInputElement>("#pfCor")?.value || "").trim(),
+    tipo: tipoInput ? (tipoInput.value as ProductType) : null,
   };
 }
 
-async function saveProductForm(
-  root: HTMLElement,
-  mode: ProductFormMode,
-  editingRow: CatalogRow | null,
-  productType: "outlet" | "normal",
-  onDone: () => Promise<void>
-): Promise<void> {
-  const { nome, sku, ean, cor } = readProductForm(root);
+async function saveProductForm(root: HTMLElement, mode: ProductFormMode, editingRow: CatalogRow | null, onDone: () => Promise<void>): Promise<void> {
+  const { nome, sku, ean, cor, tipo } = readProductForm(root);
   const errorBox = root.querySelector<HTMLElement>("#productFormError")!;
   errorBox.hidden = true;
 
   try {
     if (mode === "create") {
-      await createManualProduct({ produto: nome, sku_code: sku, gtin: ean, cor, product_type: productType });
+      await createManualProduct({ produto: nome, sku_code: sku, gtin: ean, cor, product_type: tipo ?? "outlet" });
       showToast("Produto criado.", "success");
     } else if (editingRow) {
       const tasks: Promise<void>[] = [];
@@ -185,6 +225,21 @@ async function saveProductForm(
     errorBox.textContent = describeError(err);
     errorBox.hidden = false;
   }
+}
+
+function wireProductForm(root: HTMLElement, mode: ProductFormMode, editingRow: CatalogRow | null, closeForm: () => void, rerender: () => Promise<void>): void {
+  if (mode === "closed") return;
+  if (mode === "edit" && editingRow) void hydrateProductFormThumb(root, editingRow);
+  root.querySelector("#btnCancelProductForm")?.addEventListener("click", () => {
+    closeForm();
+    void rerender();
+  });
+  root.querySelector("#btnSaveProductForm")?.addEventListener("click", () => {
+    void saveProductForm(root, mode, editingRow, async () => {
+      closeForm();
+      await rerender();
+    });
+  });
 }
 
 async function handleDeleteProduct(row: CatalogRow, reload: () => Promise<void>): Promise<void> {
@@ -234,294 +289,284 @@ function wireProductActions(scope: Element, rows: CatalogRow[], onEdit: (row: Ca
   });
 }
 
-async function renderOutletSkusTab(root: HTMLElement, canImport: boolean): Promise<void> {
+// ---------------------------------------------------------------------------
+// Importação — mesma lógica/regra de sempre (importCatalog/importNormalProducts,
+// intocadas). Só a experiência visual ganhou uma etapa de "Conferir" antes de
+// efetivamente importar: a planilha é lida localmente (como já era) e as
+// primeiras linhas são mostradas num resumo, com Cancelar/Confirmar — nunca
+// importa nada sem essa confirmação explícita.
+// ---------------------------------------------------------------------------
+interface PendingImport {
+  fileName: string;
+  rows: Record<string, unknown>[];
+}
+let pendingImport: PendingImport | null = null;
+
+function importPreviewHtml(pending: PendingImport): string {
+  const cols = Array.from(new Set(pending.rows.slice(0, 5).flatMap((r) => Object.keys(r))));
+  const previewRows = pending.rows.slice(0, 5);
+  return `
+    <div class="card">
+      <h2>Conferir importação</h2>
+      <p class="hint-text">${pending.fileName} · ${pending.rows.length} linha(s) encontrada(s). Mostrando as ${Math.min(5, pending.rows.length)} primeiras.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>
+          <tbody>${previewRows.map((r) => `<tr>${cols.map((c) => `<td>${escapeHtml(String(r[c] ?? ""))}</td>`).join("")}</tr>`).join("")}</tbody>
+        </table>
+      </div>
+      <div class="review-actions" style="margin-top:10px">
+        <button type="button" class="btn-primary" id="btnConfirmImport">Importar</button>
+        <button type="button" class="btn-secondary" id="btnCancelImport">Cancelar</button>
+      </div>
+      <div id="catalogImportStatus" role="status" aria-live="polite"></div>
+    </div>`;
+}
+
+function wireImportFlow(root: HTMLElement, type: ProductType, onImported: () => Promise<void>): void {
+  const fileInput = root.querySelector<HTMLInputElement>("#catalogFileInput");
+  const previewWrap = root.querySelector<HTMLElement>("#importPreviewWrap");
+  if (!fileInput || !previewWrap) return;
+
+  const renderPreview = (): void => {
+    if (!pendingImport) {
+      previewWrap.innerHTML = "";
+      return;
+    }
+    previewWrap.innerHTML = importPreviewHtml(pendingImport);
+    previewWrap.querySelector("#btnCancelImport")!.addEventListener("click", () => {
+      pendingImport = null;
+      renderPreview();
+    });
+    previewWrap.querySelector("#btnConfirmImport")!.addEventListener("click", async () => {
+      const pending = pendingImport!;
+      const statusEl = previewWrap.querySelector("#catalogImportStatus")!;
+      statusEl.textContent = "Importando…";
+      try {
+        const summary = type === "outlet" ? await importCatalog(pending.fileName, pending.rows) : await importNormalProducts(pending.fileName, pending.rows);
+        statusEl.textContent = `${summary.inserted_rows} inseridos, ${summary.updated_rows} atualizados, ${summary.rejected_rows} rejeitados (de ${summary.total_rows} linhas).`;
+        showToast("Catálogo importado com sucesso.", "success");
+        pendingImport = null;
+        await onImported();
+      } catch (err) {
+        statusEl.textContent = `Erro na importação: ${describeError(err)}`;
+        showToast("Erro na importação do catálogo.", "error");
+      }
+    });
+  };
+
+  fileInput.addEventListener("change", async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+    try {
+      const buffer = await file.arrayBuffer();
+      const wb = XLSX.read(buffer);
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      pendingImport = { fileName: file.name, rows };
+      renderPreview();
+    } catch (err) {
+      showToast("Erro ao ler planilha: " + describeError(err), "error");
+    } finally {
+      fileInput.value = "";
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Lista de produtos (SKUs) — Todos/Normais/Outlet, busca, filtro de EAN.
+// ---------------------------------------------------------------------------
+async function renderProductsTab(root: HTMLElement, canImport: boolean): Promise<void> {
+  // PERFORMANCE — as contagens de Todos/Normais/Outlet vêm da MESMA consulta
+  // de rede que a "Visão geral" (getCatalogOverviewStats). Antes, a tela
+  // inteira (abas, busca, tudo) esperava essa resposta antes de desenhar
+  // qualquer coisa — se a rede/banco demorasse, o Catálogo inteiro parecia
+  // travado. Agora desenha tudo já, sem contagem nas abas, e preenche os
+  // números depois (updateTypeTabCounts), igual a Visão geral já fazia.
+  const typeTabs: { value: ProductTypeFilter; label: string; count: number | null }[] = [
+    { value: "all", label: "Todos", count: null },
+    { value: "normal", label: "Normais", count: null },
+    { value: "outlet", label: "Outlet", count: null },
+  ];
+
+  const importType: ProductType | null = prodTypeFilter === "all" ? null : prodTypeFilter;
+
   root.innerHTML = `
+    ${renderOverviewSkeleton()}
+
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <h2 style="margin:0">Produtos</h2>
+        ${canImport ? `<button type="button" class="btn-primary" id="btnNewProduct">${Icon.plus}Novo produto</button>` : ""}
+      </div>
+
+      <div class="input-mode-switch" style="margin-top:10px">
+        ${typeTabs
+          .map(
+            (t) =>
+              `<button class="mode-btn ${prodTypeFilter === t.value ? "active" : ""}" data-prod-type="${t.value}">${escapeHtml(t.label)}${
+                t.count !== null ? ` <span class="chip-count">${t.count}</span>` : ""
+              }</button>`
+          )
+          .join("")}
+      </div>
+
+      <div class="filters-inline" style="margin-top:10px">
+        <div class="search-row search-row-icon">
+          ${Icon.search}
+          <label for="prodSearch" class="sr-only">Buscar produto, SKU ou EAN</label>
+          <input type="text" id="prodSearch" placeholder="Buscar por produto, SKU ou EAN…" value="${escapeHtml(prodQuery)}" />
+        </div>
+        <button type="button" class="btn-secondary" id="btnToggleFilters" aria-expanded="${prodFiltersOpen}">${Icon.settings}Filtros</button>
+      </div>
+
       ${
-        canImport
-          ? `<div class="card">
-              <h2>Importar catálogo</h2>
-              <p class="hint-text">Planilha .xlsx/.csv com colunas Produto, SKU/Código, GTIN/EAN, Cor e/ou Modelo. Produtos ausentes da planilha NÃO são apagados.</p>
-              <label class="dropzone small">
-                <input type="file" id="catalogFileInput" accept=".xlsx,.xls,.csv" hidden />
-                <span class="dz-icon">${Icon.upload}</span>
-                <span>Toque para subir a planilha</span>
-              </label>
-              <div id="catalogImportStatus" role="status" aria-live="polite"></div>
+        prodFiltersOpen
+          ? `<div class="filters-inline" id="prodFiltersPanel">
+              <label for="prodEanFilter" class="sr-only">EAN</label>
+              <select id="prodEanFilter">
+                <option value="all" ${prodEanFilter === "all" ? "selected" : ""}>EAN: Todos</option>
+                <option value="with" ${prodEanFilter === "with" ? "selected" : ""}>Com EAN</option>
+                <option value="without" ${prodEanFilter === "without" ? "selected" : ""}>Sem EAN</option>
+              </select>
             </div>`
           : ""
       }
+    </div>
 
-      ${renderProductForm(outletFormMode, outletEditingRow, true)}
+    ${
+      canImport && importType
+        ? `<div class="card">
+            <h2>Importar ${TYPE_LABEL[importType]}</h2>
+            <p class="hint-text">${
+              importType === "outlet"
+                ? "Planilha .xlsx/.csv com colunas Produto, SKU/Código, GTIN/EAN, Cor e/ou Modelo. Produtos ausentes da planilha NÃO são apagados."
+                : "Planilha .xlsx/.csv com colunas Nome, SKU e EAN. Produtos normais não precisam de imagem, treinamento ou reconhecimento visual."
+            }</p>
+            <label class="dropzone small">
+              <input type="file" id="catalogFileInput" accept=".xlsx,.xls,.csv" hidden />
+              <span class="dz-icon">${Icon.upload}</span>
+              <span>Toque para subir a planilha</span>
+            </label>
+            <div id="importPreviewWrap"></div>
+          </div>`
+        : ""
+    }
 
-      <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
-          <h2 style="margin:0">Catálogo de SKUs (Outlet)</h2>
-          ${canImport ? `<button type="button" class="btn-secondary" id="btnNewOutletProduct">${Icon.plus}Novo produto</button>` : ""}
-        </div>
-        <div class="search-row">
-          <label for="catalogSearch" class="sr-only">Buscar produto, SKU ou EAN</label>
-          <input type="text" id="catalogSearch" placeholder="Buscar por produto, SKU ou EAN…" value="${escapeHtml(query)}" />
-        </div>
-        <div id="catalogResultsWrap"><p class="hint-text">Carregando…</p></div>
-        <div class="pagination">
-          <button class="icon-btn" id="btnPrevPage" disabled aria-label="Página anterior">${Icon.chevronLeft}</button>
-          <span id="pageInfo" class="hint-text"></span>
-          <button class="icon-btn" id="btnNextPage" disabled aria-label="Próxima página">${Icon.chevronRight}</button>
-        </div>
-      </div>`;
+    ${renderProductForm(prodFormMode, prodEditingRow)}
 
-  await loadOutletPage(root, canImport);
+    <div class="card">
+      <h2 style="margin:0 0 10px">Catálogo de SKUs</h2>
+      <div id="catalogResultsWrap"><p class="hint-text">Carregando…</p></div>
+      <div class="pagination">
+        <button class="icon-btn" id="btnPrevPage" disabled aria-label="Página anterior">${Icon.chevronLeft}</button>
+        <span id="pageInfo" class="hint-text"></span>
+        <button class="icon-btn" id="btnNextPage" disabled aria-label="Próxima página">${Icon.chevronRight}</button>
+      </div>
+    </div>`;
 
-  const searchInput = root.querySelector<HTMLInputElement>("#catalogSearch")!;
+  void loadOverview(root);
+  void updateTypeTabCounts(root);
+  await loadProductsPage(root, canImport);
+
+  root.querySelectorAll<HTMLButtonElement>("[data-prod-type]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const next = btn.dataset.prodType as ProductTypeFilter;
+      if (next === prodTypeFilter) return;
+      prodTypeFilter = next;
+      prodPage = 0;
+      pendingImport = null;
+      void renderProductsTab(root, canImport);
+    });
+  });
+
+  const searchInput = root.querySelector<HTMLInputElement>("#prodSearch")!;
   const debouncedSearch = debounce((value: string) => {
-    query = value;
-    page = 0;
-    void loadOutletPage(root, canImport);
+    prodQuery = value;
+    prodPage = 0;
+    void loadProductsPage(root, canImport);
   }, 350);
   searchInput.addEventListener("input", (e) => debouncedSearch((e.target as HTMLInputElement).value));
 
+  root.querySelector("#btnToggleFilters")!.addEventListener("click", () => {
+    prodFiltersOpen = !prodFiltersOpen;
+    void renderProductsTab(root, canImport);
+  });
+  root.querySelector("#prodEanFilter")?.addEventListener("change", (e) => {
+    prodEanFilter = (e.target as HTMLSelectElement).value as EanFilter;
+    prodPage = 0;
+    void loadProductsPage(root, canImport);
+  });
+
   root.querySelector("#btnPrevPage")!.addEventListener("click", () => {
-    if (page > 0) {
-      page--;
-      void loadOutletPage(root, canImport);
+    if (prodPage > 0) {
+      prodPage--;
+      void loadProductsPage(root, canImport);
     }
   });
   root.querySelector("#btnNextPage")!.addEventListener("click", () => {
-    page++;
-    void loadOutletPage(root, canImport);
+    prodPage++;
+    void loadProductsPage(root, canImport);
   });
 
-  if (canImport) {
-    const fileInput = root.querySelector<HTMLInputElement>("#catalogFileInput")!;
-    fileInput.addEventListener("change", async (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
-      if (!file) return;
-      const statusEl = root.querySelector("#catalogImportStatus")!;
-      statusEl.textContent = "Lendo planilha…";
-      try {
-        const buffer = await file.arrayBuffer();
-        const wb = XLSX.read(buffer);
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        statusEl.textContent = "Importando…";
-        const summary = await importCatalog(file.name, rows);
-        statusEl.textContent = `${summary.inserted_rows} inseridos, ${summary.updated_rows} atualizados, ${summary.rejected_rows} rejeitados (de ${summary.total_rows} linhas).`;
-        showToast("Catálogo importado com sucesso.", "success");
-        page = 0;
-        query = "";
-        (root.querySelector("#catalogSearch") as HTMLInputElement).value = "";
-        await loadOutletPage(root, canImport);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        statusEl.textContent = `Erro na importação: ${message}`;
-        showToast("Erro na importação do catálogo.", "error");
-      } finally {
-        fileInput.value = "";
-      }
+  if (canImport && importType) {
+    wireImportFlow(root, importType, async () => {
+      prodPage = 0;
+      prodQuery = "";
+      await renderProductsTab(root, canImport);
     });
   }
 
   if (canImport) {
-    root.querySelector("#btnNewOutletProduct")?.addEventListener("click", () => {
-      outletFormMode = "create";
-      outletEditingRow = null;
-      void renderOutletSkusTab(root, canImport).then(() => document.getElementById("productFormCard")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    root.querySelector("#btnNewProduct")?.addEventListener("click", () => {
+      prodFormMode = "create";
+      prodEditingRow = null;
+      void renderProductsTab(root, canImport).then(() => document.getElementById("productFormCard")?.scrollIntoView({ behavior: "smooth", block: "start" }));
     });
-    wireProductForm(root, outletFormMode, outletEditingRow, "outlet", () => {
-      outletFormMode = "closed";
-      outletEditingRow = null;
-    }, () => renderOutletSkusTab(root, canImport));
+    wireProductForm(
+      root,
+      prodFormMode,
+      prodEditingRow,
+      () => {
+        prodFormMode = "closed";
+        prodEditingRow = null;
+      },
+      () => renderProductsTab(root, canImport)
+    );
   }
 }
 
-/** Liga Salvar/Cancelar do formulário de produto (create ou edit) quando ele está aberto. */
-function wireProductForm(
-  root: HTMLElement,
-  mode: ProductFormMode,
-  editingRow: CatalogRow | null,
-  productType: "outlet" | "normal",
-  closeForm: () => void,
-  rerender: () => Promise<void>
-): void {
-  if (mode === "closed") return;
-  root.querySelector("#btnCancelProductForm")?.addEventListener("click", () => {
-    closeForm();
-    void rerender();
-  });
-  root.querySelector("#btnSaveProductForm")?.addEventListener("click", () => {
-    void saveProductForm(root, mode, editingRow, productType, async () => {
-      closeForm();
-      await rerender();
-    });
-  });
-}
-
-async function loadOutletPage(root: HTMLElement, canImport: boolean): Promise<void> {
-  outletSearchController?.abort();
+async function loadProductsPage(root: HTMLElement, canImport: boolean): Promise<void> {
+  prodSearchController?.abort();
   const controller = new AbortController();
-  outletSearchController = controller;
+  prodSearchController = controller;
 
   const wrap = root.querySelector("#catalogResultsWrap")!;
   try {
-    const result = await searchCatalog(query, page, PAGE_SIZE, "outlet", controller.signal);
+    const typeArg = prodTypeFilter === "all" ? undefined : prodTypeFilter;
+    const eanArg = prodEanFilter === "all" ? undefined : prodEanFilter;
+    const result = await searchCatalog(prodQuery, prodPage, PAGE_SIZE, typeArg, controller.signal, true, eanArg);
     if (controller.signal.aborted) return;
-    outletRows = result.rows;
+    prodRows = result.rows;
     renderResults(wrap, result.rows, canImport);
     wireProductActions(
       wrap,
-      outletRows,
+      prodRows,
       (row) => {
-        outletFormMode = "edit";
-        outletEditingRow = row;
-        void renderOutletSkusTab(root, canImport).then(() => document.getElementById("productFormCard")?.scrollIntoView({ behavior: "smooth", block: "start" }));
+        prodFormMode = "edit";
+        prodEditingRow = row;
+        void renderProductsTab(root, canImport).then(() => document.getElementById("productFormCard")?.scrollIntoView({ behavior: "smooth", block: "start" }));
       },
-      (row) => handleDeleteProduct(row, () => loadOutletPage(root, canImport))
+      (row) => handleDeleteProduct(row, () => loadProductsPage(root, canImport))
     );
     const pageInfo = root.querySelector("#pageInfo")!;
     const totalPages = Math.max(1, Math.ceil(result.total / PAGE_SIZE));
-    pageInfo.textContent = `Página ${page + 1} de ${totalPages} (${result.total} SKUs)`;
-    (root.querySelector("#btnPrevPage") as HTMLButtonElement).disabled = page === 0;
-    (root.querySelector("#btnNextPage") as HTMLButtonElement).disabled = page + 1 >= totalPages;
+    pageInfo.textContent = `Página ${prodPage + 1} de ${totalPages} (${result.total} SKUs)`;
+    (root.querySelector("#btnPrevPage") as HTMLButtonElement).disabled = prodPage === 0;
+    (root.querySelector("#btnNextPage") as HTMLButtonElement).disabled = prodPage + 1 >= totalPages;
   } catch (err) {
     if (controller.signal.aborted) return;
-    renderErrorWithRetry(wrap, "Erro ao buscar catálogo: " + (err instanceof Error ? err.message : String(err)), () => void loadOutletPage(root, canImport));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// EXPANSÃO GOSCAN — Produtos Normais: mesmíssimo padrão de import+lista
-// acima, só que com product_type='normal' e planilha de 3 colunas
-// (Nome/SKU/EAN — sem cor/imagem/treinamento).
-// ---------------------------------------------------------------------------
-async function renderNormalProductsTab(root: HTMLElement, canImport: boolean): Promise<void> {
-  root.innerHTML = `
-      ${
-        canImport
-          ? `<div class="card">
-              <h2>Importar Produtos Normais</h2>
-              <p class="hint-text">Planilha .xlsx/.csv com colunas Nome, SKU e EAN. Produtos normais não precisam de imagem, treinamento ou reconhecimento visual.</p>
-              <label class="dropzone small">
-                <input type="file" id="normalFileInput" accept=".xlsx,.xls,.csv" hidden />
-                <span class="dz-icon">${Icon.upload}</span>
-                <span>Toque para subir a planilha</span>
-              </label>
-              <div id="normalImportStatus" role="status" aria-live="polite"></div>
-            </div>`
-          : ""
-      }
-
-      ${renderProductForm(normalFormMode, normalEditingRow, false)}
-
-      <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
-          <h2 style="margin:0">Catálogo de Produtos Normais</h2>
-          ${canImport ? `<button type="button" class="btn-secondary" id="btnNewNormalProduct">${Icon.plus}Novo produto</button>` : ""}
-        </div>
-        <div class="search-row">
-          <label for="normalSearch" class="sr-only">Buscar produto, SKU ou EAN</label>
-          <input type="text" id="normalSearch" placeholder="Buscar por produto, SKU ou EAN…" value="${escapeHtml(normalQuery)}" />
-        </div>
-        <div id="normalResultsWrap"><p class="hint-text">Carregando…</p></div>
-        <div class="pagination">
-          <button class="icon-btn" id="btnNormalPrevPage" disabled aria-label="Página anterior">${Icon.chevronLeft}</button>
-          <span id="normalPageInfo" class="hint-text"></span>
-          <button class="icon-btn" id="btnNormalNextPage" disabled aria-label="Próxima página">${Icon.chevronRight}</button>
-        </div>
-      </div>`;
-
-  await loadNormalPage(root, canImport);
-
-  const searchInput = root.querySelector<HTMLInputElement>("#normalSearch")!;
-  const debouncedSearch = debounce((value: string) => {
-    normalQuery = value;
-    normalPage = 0;
-    void loadNormalPage(root, canImport);
-  }, 350);
-  searchInput.addEventListener("input", (e) => debouncedSearch((e.target as HTMLInputElement).value));
-
-  root.querySelector("#btnNormalPrevPage")!.addEventListener("click", () => {
-    if (normalPage > 0) {
-      normalPage--;
-      void loadNormalPage(root, canImport);
-    }
-  });
-  root.querySelector("#btnNormalNextPage")!.addEventListener("click", () => {
-    normalPage++;
-    void loadNormalPage(root, canImport);
-  });
-
-  if (canImport) {
-    const fileInput = root.querySelector<HTMLInputElement>("#normalFileInput")!;
-    fileInput.addEventListener("change", async (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
-      if (!file) return;
-      const statusEl = root.querySelector("#normalImportStatus")!;
-      statusEl.textContent = "Lendo planilha…";
-      try {
-        const buffer = await file.arrayBuffer();
-        const wb = XLSX.read(buffer);
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        statusEl.textContent = "Importando…";
-        const summary = await importNormalProducts(file.name, rows);
-        statusEl.textContent = `${summary.inserted_rows} inseridos, ${summary.updated_rows} atualizados, ${summary.rejected_rows} rejeitados (de ${summary.total_rows} linhas).`;
-        showToast("Produtos normais importados com sucesso.", "success");
-        normalPage = 0;
-        normalQuery = "";
-        (root.querySelector("#normalSearch") as HTMLInputElement).value = "";
-        await loadNormalPage(root, canImport);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        statusEl.textContent = `Erro na importação: ${message}`;
-        showToast("Erro na importação de produtos normais.", "error");
-      } finally {
-        fileInput.value = "";
-      }
-    });
-  }
-
-  if (canImport) {
-    root.querySelector("#btnNewNormalProduct")?.addEventListener("click", () => {
-      normalFormMode = "create";
-      normalEditingRow = null;
-      void renderNormalProductsTab(root, canImport).then(() => document.getElementById("productFormCard")?.scrollIntoView({ behavior: "smooth", block: "start" }));
-    });
-    wireProductForm(root, normalFormMode, normalEditingRow, "normal", () => {
-      normalFormMode = "closed";
-      normalEditingRow = null;
-    }, () => renderNormalProductsTab(root, canImport));
-  }
-}
-
-async function loadNormalPage(root: HTMLElement, canImport: boolean): Promise<void> {
-  normalSearchController?.abort();
-  const controller = new AbortController();
-  normalSearchController = controller;
-
-  const wrap = root.querySelector("#normalResultsWrap")!;
-  try {
-    const result = await searchCatalog(normalQuery, normalPage, PAGE_SIZE, "normal", controller.signal);
-    if (controller.signal.aborted) return;
-    normalRows = result.rows;
-    renderResults(wrap, result.rows, canImport);
-    wireProductActions(
-      wrap,
-      normalRows,
-      (row) => {
-        normalFormMode = "edit";
-        normalEditingRow = row;
-        void renderNormalProductsTab(root, canImport).then(() => document.getElementById("productFormCard")?.scrollIntoView({ behavior: "smooth", block: "start" }));
-      },
-      (row) => handleDeleteProduct(row, () => loadNormalPage(root, canImport))
-    );
-    const pageInfo = root.querySelector("#normalPageInfo")!;
-    const totalPages = Math.max(1, Math.ceil(result.total / PAGE_SIZE));
-    pageInfo.textContent = `Página ${normalPage + 1} de ${totalPages} (${result.total} produtos)`;
-    (root.querySelector("#btnNormalPrevPage") as HTMLButtonElement).disabled = normalPage === 0;
-    (root.querySelector("#btnNormalNextPage") as HTMLButtonElement).disabled = normalPage + 1 >= totalPages;
-  } catch (err) {
-    if (controller.signal.aborted) return;
-    renderErrorWithRetry(wrap, "Erro ao buscar produtos normais: " + (err instanceof Error ? err.message : String(err)), () => void loadNormalPage(root, canImport));
+    renderErrorWithRetry(wrap, "Erro ao buscar catálogo: " + describeError(err), () => void loadProductsPage(root, canImport));
   }
 }
 
@@ -539,12 +584,15 @@ function renderResults(wrap: Element, rows: CatalogRow[], canManage: boolean): v
         </div>`
       : "";
 
+  const typeBadge = (r: CatalogRow) => `<span class="status-badge ${r.product_type === "outlet" ? "info" : "success"}">${TYPE_LABEL[r.product_type]}</span>`;
+
   const cards = rows
     .map(
       (r) => `
       <div class="product-card">
         <div class="product-card-top">
           <p class="product-card-name">${escapeHtml(r.produto)}</p>
+          ${typeBadge(r)}
         </div>
         <div class="product-card-meta">
           <span class="sku-code">${escapeHtml(r.sku_code)}</span>
@@ -559,9 +607,9 @@ function renderResults(wrap: Element, rows: CatalogRow[], canManage: boolean): v
   const rowsHtml = rows
     .map(
       (r) =>
-        `<tr><td>${escapeHtml(r.produto)}</td><td>${escapeHtml(r.cor || "")}</td><td class="sku-code">${escapeHtml(
-          r.sku_code
-        )}</td><td class="sku-code">${escapeHtml(r.gtin || "-")}</td>${canManage ? `<td>${actions(r)}</td>` : ""}</tr>`
+        `<tr><td>${escapeHtml(r.produto)}</td><td class="sku-code">${escapeHtml(r.sku_code)}</td><td class="sku-code">${escapeHtml(r.gtin || "-")}</td><td>${escapeHtml(
+          r.cor || ""
+        )}</td><td>${typeBadge(r)}</td>${canManage ? `<td>${actions(r)}</td>` : ""}</tr>`
     )
     .join("");
 
@@ -569,7 +617,7 @@ function renderResults(wrap: Element, rows: CatalogRow[], canManage: boolean): v
     <div class="product-card-list mobile-only">${cards}</div>
     <div class="table-wrap desktop-only">
       <table>
-        <thead><tr><th>Produto</th><th>Cor</th><th>SKU</th><th>GTIN/EAN</th>${canManage ? "<th>Ações</th>" : ""}</tr></thead>
+        <thead><tr><th>Produto</th><th>SKU</th><th>EAN</th><th>Cor</th><th>Tipo</th>${canManage ? "<th>Ações</th>" : ""}</tr></thead>
         <tbody>${rowsHtml}</tbody>
       </table>
     </div>`;

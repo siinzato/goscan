@@ -15,6 +15,7 @@ import { recordLearningSample, listLearningSamples, updateLearningSampleStatus, 
 import { recalculateRecognitionQuality, getRecognitionQualityForVariants, listRecognitionQuality } from "./recognitionQuality.ts";
 import { isRateLimited } from "./scanRateLimiter.ts";
 import { SCAN_CONFIG } from "./scanConfig.ts";
+import { extractPurchaseOrderItemsFromPdf } from "./purchaseOrderPdf.ts";
 
 interface Env extends AdminEnv {
   ANTHROPIC_API_KEY?: string;
@@ -109,6 +110,19 @@ export default {
         const body = (await request.json()) as { images?: { data: string; media_type: string }[] };
         const result = await callClaudeVision(env, body.images || []);
         return json(result);
+      }
+
+      if (path === "/api/parse-purchase-order-pdf" && request.method === "POST") {
+        const auth = await requireManagerOrAdmin(request, env);
+        if (!auth.ok) return json({ error: auth.error }, auth.status);
+        const body = (await request.json()) as { pdf_base64?: string };
+        if (!body.pdf_base64) return json({ error: "pdf_base64 é obrigatório." }, 400);
+        try {
+          const items = await extractPurchaseOrderItemsFromPdf(Buffer.from(body.pdf_base64, "base64"));
+          return json({ items });
+        } catch (err) {
+          return json({ error: `Não foi possível ler o PDF: ${errorMessage(err)}` }, 400);
+        }
       }
 
       if (path === "/api/catalog-images/process-batch" && request.method === "POST") {

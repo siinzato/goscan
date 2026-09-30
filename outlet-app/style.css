@@ -1195,6 +1195,9 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
   margin: 0 auto;
 }
 
+/* EVOLUÇÃO CATÁLOGO — espaçamento da miniatura no formulário de edição de produto (thumb-img-lg já traz toda a aparência visual). */
+.product-detail-thumb:not(:empty) { margin-bottom: 14px; }
+
 /* ---------------------------------------------------------------------- */
 /* Modo Scan — revisão de família/variante/capacidade                      */
 /* ---------------------------------------------------------------------- */

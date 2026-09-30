@@ -167,20 +167,27 @@ export async function upsertProductsAndVariants(rows: UpsertVariantRow[]): Promi
     for (const row of data as { sku_code: string }[]) existingSkus.add(row.sku_code);
   }
 
-  const variantRows = rows
-    .map((row) => {
-      const productId = productIdByCode.get(productKey(row.model_code, row.product_type || "outlet"));
-      if (!productId) return null;
-      return {
-        product_id: productId,
-        sku_code: row.sku_code,
-        gtin: row.gtin || null,
-        color: row.cor || null,
-        normalized_color: normalize(row.cor),
-        active: true,
-      };
-    })
-    .filter((r): r is NonNullable<typeof r> => r !== null);
+  // CORREÇÃO — planilhas de sistema (ex.: export de inventário) às vezes
+  // repetem o mesmo SKU em mais de uma linha (mesma peça em depósitos/lotes
+  // diferentes, por exemplo). Um upsert com duas linhas do MESMO sku_code no
+  // MESMO comando é rejeitado pelo Postgres ("ON CONFLICT DO UPDATE command
+  // cannot affect row a second time") — precisa deduplicar por sku_code
+  // ANTES de montar os lotes. Mantém a ÚLTIMA ocorrência (linha mais recente
+  // da planilha), nunca perde o SKU inteiro por causa da repetição.
+  const variantRowsBySku = new Map<string, { product_id: string; sku_code: string; gtin: string | null; color: string | null; normalized_color: string; active: boolean }>();
+  for (const row of rows) {
+    const productId = productIdByCode.get(productKey(row.model_code, row.product_type || "outlet"));
+    if (!productId) continue;
+    variantRowsBySku.set(row.sku_code, {
+      product_id: productId,
+      sku_code: row.sku_code,
+      gtin: row.gtin || null,
+      color: row.cor || null,
+      normalized_color: normalize(row.cor),
+      active: true,
+    });
+  }
+  const variantRows = Array.from(variantRowsBySku.values());
 
   const variantIdBySku = new Map<string, string>();
   for (const batch of chunk(variantRows, 500)) {

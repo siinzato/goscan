@@ -123,7 +123,10 @@
       "Bash(grep -iE \"^\\(share|more-vertical|square-plus|plus-square|smartphone|download|copy|monitor|apple|chrome|move-up|upload|circle-check|badge-check\\)\\\\.svg$\")",
       "Bash(curl -s -o /dev/null -w \"localhost:8787 -> %{http_code}\\\\n\" http://localhost:8787/)",
       "Bash(curl -s -o /dev/null -w \"ngrok tunnel -> %{http_code}\\\\n\" https://unbiased-uptake-handball.ngrok-free.dev/ -H \"ngrok-skip-browser-warning: 1\")",
-      "Bash(node -e \"console.log\\(require\\('./node_modules/@supabase/supabase-js/package.json'\\).version\\)\")"
+      "Bash(node -e \"console.log\\(require\\('./node_modules/@supabase/supabase-js/package.json'\\).version\\)\")",
+      "PowerShell(py --version)",
+      "PowerShell(python --version)",
+      "PowerShell(Get-Command python -ErrorAction SilentlyContinue)"
     ]
   }
 }

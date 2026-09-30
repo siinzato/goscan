@@ -54,6 +54,20 @@ import { Icon } from "../icons.ts";
 import { showToast } from "../toast.ts";
 import { confirmAction, chooseAction, promptText } from "../confirmModal.ts";
 import { getTinyWarehouses, launchInvoiceReceiptToTiny, TinyIntegrationError, type TinyWarehouse, type TinyLaunchOutcome } from "../../tinyIntegrationApi.ts";
+import {
+  uploadPurchaseOrder,
+  getPurchaseOrderConflicts,
+  hasPurchaseOrder,
+  listUnlinkedPurchaseOrders,
+  linkPurchaseOrderToReceipt,
+  parsePurchaseOrderPdf,
+  type PurchaseOrderConflict,
+} from "../../purchaseOrderApi.ts";
+
+declare const XLSX: {
+  read(data: ArrayBuffer): { SheetNames: string[]; Sheets: Record<string, unknown> };
+  utils: { sheet_to_json(ws: unknown, opts?: Record<string, unknown>): Record<string, unknown>[] };
+};
 
 type NfeView = "upload" | "prep" | "mode" | "counting" | "result" | "history";
 
@@ -161,12 +175,18 @@ function enterReceiptCollab(root: HTMLElement, receiptId: string): void {
           if (!currentReceipt || currentReceipt.id !== receiptId || !root.isConnected) return;
           const idx = currentItems.findIndex((i) => i.id === row.id);
           const previous = idx !== -1 ? currentItems[idx] : null;
-          // sku_code/produto só existem via join local (getReceipt) — o
-          // payload do Realtime traz só as colunas reais da tabela.
+          // sku_code/produto/catalog_ean só existem via join local (getReceipt) —
+          // o payload do Realtime traz só as colunas reais da tabela. BUG REAL
+          // corrigido: catalog_ean (EAN cadastrado no produto, usado como
+          // fallback de bipagem/busca quando a NF não traz EAN) não estava
+          // nesta lista — qualquer mudança na linha (inclusive a PRÓPRIA
+          // bipagem do operador, que o Realtime ecoa de volta) apagava o
+          // catalog_ean do item na tela, fazendo a bipagem seguinte do MESMO
+          // EAN "sumir" mesmo o produto continuando com EAN cadastrado.
           if (idx === -1) {
-            currentItems = [...currentItems, { ...row, sku_code: null, produto: null }];
+            currentItems = [...currentItems, { ...row, sku_code: null, produto: null, catalog_ean: null }];
           } else {
-            currentItems = currentItems.map((i) => (i.id === row.id ? { ...row, sku_code: i.sku_code, produto: i.produto } : i));
+            currentItems = currentItems.map((i) => (i.id === row.id ? { ...row, sku_code: i.sku_code, produto: i.produto, catalog_ean: i.catalog_ean } : i));
           }
           // Item completado por OUTRO usuário: a mesma detecção de "primeira
           // conclusão" que o servidor calcula pra quem bipou, só que aqui é
@@ -585,6 +605,17 @@ function renderUploadView(root: HTMLElement): void {
       <div id="nfeKeySearchStatus" role="status" aria-live="polite"></div>
     </div>
 
+    <details class="card">
+      <summary>Ordens de Compra avulsas</summary>
+      <p class="hint-text">A ordem de compra normalmente chega antes da carga/NF-e — anexe aqui assim que sair, e vincule à nota certa depois, na tela de preparação/contagem. Aceita PDF (lido por IA), XLSX, XLS ou CSV.</p>
+      <label class="dropzone small">
+        <input type="file" id="poStandaloneInput" accept=".xlsx,.xls,.csv,.pdf" hidden />
+        <span class="dz-icon">${Icon.upload}</span>
+        <span>Toque para subir uma ordem de compra</span>
+      </label>
+      <div id="poStandaloneList"></div>
+    </details>
+
     <div class="card">
       <button class="btn-secondary btn-block" id="btnOpenHistory">${Icon.history}Histórico de Notas</button>
     </div>`;
@@ -613,8 +644,60 @@ function renderUploadView(root: HTMLElement): void {
   });
 
   wireKeySearchCard(root);
+  wireStandalonePurchaseOrderUpload(root);
 
   root.querySelector("#btnOpenHistory")!.addEventListener("click", () => goTo(root, "history"));
+}
+
+/** Lê planilha (XLSX/CSV) OU PDF (via IA) — a maioria das ordens de compra reais chega em PDF, não planilha. */
+async function readPurchaseOrderFileRows(file: File): Promise<Record<string, unknown>[]> {
+  if (file.name.toLowerCase().endsWith(".pdf")) {
+    return parsePurchaseOrderPdf(file);
+  }
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer);
+  return XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { defval: "" });
+}
+
+function wireStandalonePurchaseOrderUpload(root: HTMLElement): void {
+  const input = root.querySelector<HTMLInputElement>("#poStandaloneInput");
+  const list = root.querySelector<HTMLElement>("#poStandaloneList");
+  if (!input || !list) return;
+
+  const refresh = () =>
+    listUnlinkedPurchaseOrders()
+      .then((orders) => {
+        list.innerHTML =
+          orders.length === 0
+            ? `<p class="hint-text">Nenhuma ordem de compra avulsa (ainda sem nota vinculada) no momento.</p>`
+            : `<p class="hint-text">Aguardando vínculo com uma NF-e:</p><ul>${orders
+                .map((o) => `<li>${escapeHtml(o.file_name)} — ${o.item_count} item(ns), enviada em ${formatDateTime(o.created_at)}</li>`)
+                .join("")}</ul>`;
+      })
+      .catch(() => {
+        list.innerHTML = `<p class="hint-text">Não foi possível carregar as ordens avulsas agora.</p>`;
+      });
+
+  void refresh();
+
+  input.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    list.innerHTML = `<p class="hint-text">Lendo ${file.name.toLowerCase().endsWith(".pdf") ? "PDF (com IA)" : "planilha"}…</p>`;
+    try {
+      const rows = await readPurchaseOrderFileRows(file);
+      const result = await uploadPurchaseOrder(file.name, rows);
+      showToast(
+        `Ordem de compra recebida — ${result.inserted} linha(s) lida(s)${result.rejected > 0 ? `, ${result.rejected} rejeitada(s)` : ""}. Vincule à NF quando ela chegar.`,
+        "success"
+      );
+      void refresh();
+    } catch (err) {
+      showToast("Erro ao enviar ordem de compra: " + describeError(err), "error");
+      void refresh();
+    }
+  });
 }
 
 /** Mesma apresentação para os dois caminhos que podem encontrar uma NF já existente a partir da chave (checagem local e sinal ALREADY_IMPORTED da Edge Function). */
@@ -879,6 +962,11 @@ async function renderPrepView(root: HTMLElement): Promise<void> {
       </div>
     </div>
 
+    <div class="card">
+      <h2>Ordem de Compra</h2>
+      ${purchaseOrderSectionHtml()}
+    </div>
+
     ${
       pending.length > 0
         ? `<div class="card">
@@ -903,6 +991,7 @@ async function renderPrepView(root: HTMLElement): Promise<void> {
   });
 
   wirePendingItemPickers(root);
+  wirePurchaseOrderSection(root, receipt.id);
 
   if (pending.length > 0) {
     void renderPendingSuggestions(root, pending);
@@ -912,6 +1001,123 @@ async function renderPrepView(root: HTMLElement): Promise<void> {
   root.querySelector("#btnStartCounting")!.addEventListener("click", () => {
     goTo(root, "mode");
   });
+}
+
+/**
+ * Só o MIOLO do card (sem o wrapper `<div class="card">`/`<details>`, pra
+ * caber tanto na Preparação quanto na Contagem) — upload de uma ordem nova
+ * (fica avulsa, sem nota, se `receiptId` ainda não existir aqui) e/ou vínculo
+ * de uma ordem já enviada antes (o caso mais comum na prática: a ordem de
+ * compra normalmente chega ANTES da carga/NF).
+ */
+function purchaseOrderSectionHtml(): string {
+  return `
+    <p class="hint-text">Anexe a ordem de compra (PDF, lido por IA, ou planilha XLSX/CSV com GTIN, SKU e quantidade) pra conferir automaticamente se algum vínculo desta NF ficou errado — nunca aplica nada sozinho, só avisa.</p>
+    <label class="dropzone small">
+      <input type="file" id="poFileInput" accept=".xlsx,.xls,.csv,.pdf" hidden />
+      <span class="dz-icon">${Icon.upload}</span>
+      <span>Toque para subir uma ordem de compra nova</span>
+    </label>
+    <div class="filters-inline" style="margin-top:8px">
+      <label for="poLinkSelect" class="sr-only">Ordem de compra já enviada</label>
+      <select id="poLinkSelect"><option value="">Carregando ordens já enviadas…</option></select>
+      <button type="button" class="btn-secondary" id="poLinkBtn" disabled>Vincular</button>
+    </div>
+    <div id="poResultsWrap"></div>`;
+}
+
+function wirePurchaseOrderSection(root: HTMLElement, receiptId: string): void {
+  const input = root.querySelector<HTMLInputElement>("#poFileInput");
+  input?.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    const wrap = root.querySelector<HTMLElement>("#poResultsWrap");
+    if (wrap) wrap.innerHTML = `<p class="hint-text">Lendo ${file.name.toLowerCase().endsWith(".pdf") ? "PDF (com IA)" : "planilha"}…</p>`;
+    try {
+      const rows = await readPurchaseOrderFileRows(file);
+      const result = await uploadPurchaseOrder(file.name, rows, receiptId);
+      showToast(
+        `Ordem de compra anexada — ${result.inserted} linha(s) lida(s)${result.rejected > 0 ? `, ${result.rejected} rejeitada(s)` : ""}.`,
+        "success"
+      );
+      await loadPurchaseOrderConflicts(root, receiptId);
+    } catch (err) {
+      if (wrap) wrap.innerHTML = "";
+      showToast("Erro ao anexar ordem de compra: " + describeError(err), "error");
+    }
+  });
+
+  const select = root.querySelector<HTMLSelectElement>("#poLinkSelect");
+  const linkBtn = root.querySelector<HTMLButtonElement>("#poLinkBtn");
+  if (select && linkBtn) {
+    void listUnlinkedPurchaseOrders()
+      .then((orders) => {
+        if (!root.isConnected) return;
+        if (orders.length === 0) {
+          select.innerHTML = `<option value="">Nenhuma ordem avulsa enviada ainda</option>`;
+          return;
+        }
+        select.innerHTML =
+          `<option value="">Selecione uma ordem já enviada…</option>` +
+          orders.map((o) => `<option value="${o.id}">${escapeHtml(o.file_name)} (${o.item_count} itens, ${formatDateTime(o.created_at)})</option>`).join("");
+        linkBtn.disabled = false;
+      })
+      .catch(() => {
+        select.innerHTML = `<option value="">Não foi possível carregar</option>`;
+      });
+
+    linkBtn.addEventListener("click", async () => {
+      const poId = select.value;
+      if (!poId) return;
+      linkBtn.disabled = true;
+      try {
+        await linkPurchaseOrderToReceipt(poId, receiptId);
+        showToast("Ordem de compra vinculada a esta nota.", "success");
+        await loadPurchaseOrderConflicts(root, receiptId);
+      } catch (err) {
+        showToast("Erro ao vincular ordem de compra: " + describeError(err), "error");
+      } finally {
+        linkBtn.disabled = false;
+      }
+    });
+  }
+
+  void hasPurchaseOrder(receiptId).then((has) => {
+    if (has) void loadPurchaseOrderConflicts(root, receiptId);
+  });
+}
+
+async function loadPurchaseOrderConflicts(root: HTMLElement, receiptId: string): Promise<void> {
+  const wrap = root.querySelector<HTMLElement>("#poResultsWrap");
+  if (!wrap) return;
+  wrap.innerHTML = `<p class="hint-text">Conferindo vínculos contra a ordem de compra…</p>`;
+  try {
+    const conflicts = await getPurchaseOrderConflicts(receiptId);
+    if (conflicts.length === 0) {
+      wrap.innerHTML = `<p class="hint-text">Nenhuma divergência encontrada entre a nota e a ordem de compra anexada.</p>`;
+      return;
+    }
+    wrap.innerHTML = `<div class="product-card-list">${conflicts.map(renderPurchaseOrderConflictCard).join("")}</div>`;
+  } catch (err) {
+    wrap.innerHTML = `<p class="hint-text">Não foi possível conferir a ordem de compra agora (${escapeHtml(describeError(err))}).</p>`;
+  }
+}
+
+function renderPurchaseOrderConflictCard(c: PurchaseOrderConflict): string {
+  const title = escapeHtml(c.description || c.invoice_product_code || "-");
+  if (c.kind === "conflict") {
+    return `<div class="product-card">
+      <strong>Vínculo diverge da ordem de compra</strong>
+      <p>${title}</p>
+      <p class="hint-text">GTIN ${escapeHtml(c.gtin_normalized)} — vinculado a <strong>${escapeHtml(c.linked_sku_code || "-")}</strong>, mas a ordem de compra diz <strong>${escapeHtml(c.po_sku_code)}</strong>${c.po_description ? ` (${escapeHtml(c.po_description)})` : ""}.</p>
+    </div>`;
+  }
+  return `<div class="product-card">
+    <strong>Sugestão da ordem de compra</strong>
+    <p>${title}</p>
+    <p class="hint-text">GTIN ${escapeHtml(c.gtin_normalized)} — a ordem de compra sugere <strong>${escapeHtml(c.po_sku_code)}</strong>${c.po_description ? ` (${escapeHtml(c.po_description)})` : ""}.</p>
+  </div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,6 +1447,11 @@ function renderCountingView(root: HTMLElement): void {
       }
     </div>
 
+    <details class="card">
+      <summary>Ordem de Compra</summary>
+      ${purchaseOrderSectionHtml()}
+    </details>
+
     <div class="card">
       <div id="nfeCountingList"></div>
     </div>
@@ -1263,6 +1474,7 @@ function renderCountingView(root: HTMLElement): void {
   renderCountingList(root);
   renderParticipantsBanner(root);
   renderVolumeSelector(root);
+  wirePurchaseOrderSection(root, receipt.id);
 
   const eanInput = root.querySelector<HTMLInputElement>("#nfeEanInput")!;
   eanInput.addEventListener("keydown", async (e) => {
@@ -1273,7 +1485,25 @@ function renderCountingView(root: HTMLElement): void {
     const code = normalizeEan(eanInput.value);
     eanInput.value = "";
     if (!code) return;
-    const match = currentItems.find((i) => i.ean && normalizeEan(i.ean) === code);
+    // CORREÇÃO — algumas notas (ex.: fornecedor Ringke) não preenchem o EAN
+    // no XML, mesmo o produto tendo EAN cadastrado (item.catalog_ean, ver
+    // getReceipt() e a preservação em enterReceiptCollab acima). Usa o EAN
+    // da NF primeiro (sempre inequívoco); só cai pro EAN do catálogo quando
+    // ele aponta pra EXATAMENTE UM item desta nota — se duas linhas
+    // compartilham o mesmo EAN cadastrado (dois vínculos diferentes pro
+    // mesmo SKU), não adivinha qual delas o operador quis bipar.
+    let match = currentItems.find((i) => i.ean && normalizeEan(i.ean) === code);
+    if (!match) {
+      const byCatalogEan = currentItems.filter((i) => i.catalog_ean && normalizeEan(i.catalog_ean) === code);
+      if (byCatalogEan.length === 1) {
+        match = byCatalogEan[0];
+      } else if (byCatalogEan.length > 1) {
+        playSound("product_out_of_invoice");
+        vibrate("error");
+        showToast("Esse EAN está cadastrado em mais de um item desta nota — resolva manualmente qual linha contar.", "error");
+        return;
+      }
+    }
     if (!match) {
       playSound("product_out_of_invoice");
       vibrate("error");
@@ -1556,8 +1786,11 @@ function filteredCountingItems(): InvoiceReceiptItem[] {
     if (countingFilter === "pending" && it.status !== "pending" && it.status !== "unlinked") return false;
     if (countingFilter === "counted" && it.status !== "counted") return false;
     if (!q) return true;
-    if (qEan && it.ean && normalizeEan(it.ean) === qEan) return true;
-    const haystack = normalizeKey(`${it.produto || ""} ${it.description || ""} ${it.sku_code || ""} ${it.invoice_product_code || ""} ${it.ean || ""}`);
+    // CORREÇÃO — busca também pelo EAN cadastrado no produto (item.catalog_ean),
+    // não só o EAN que veio na própria NF-e. Sem risco de ambiguidade aqui —
+    // a busca só EXIBE, nunca conta nada sozinha.
+    if (qEan && ((it.ean && normalizeEan(it.ean) === qEan) || (it.catalog_ean && normalizeEan(it.catalog_ean) === qEan))) return true;
+    const haystack = normalizeKey(`${it.produto || ""} ${it.description || ""} ${it.sku_code || ""} ${it.invoice_product_code || ""} ${it.ean || ""} ${it.catalog_ean || ""}`);
     return haystack.includes(q);
   });
 }

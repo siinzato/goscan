@@ -65,14 +65,68 @@ function productJoin(row: VariantJoinRow): ProductJoin {
 // ---------------------------------------------------------------------------
 const searchCache = new Map<string, CatalogPage>();
 const SEARCH_CACHE_MAX = 200;
+let overviewStatsCache: CatalogOverviewStats | null = null;
 
 export function invalidateSearchCache(): void {
   searchCache.clear();
   pickerRpcCache.clear();
+  overviewStatsCache = null;
 }
 
 function cacheKey(query: string, page: number, pageSize: number, productType?: ProductType, includeThumbnails = true): string {
   return `${productType ?? "*"}::${page}::${pageSize}::${includeThumbnails ? "thumb" : "nothumb"}::${query.trim().toLowerCase()}`;
+}
+
+export interface CatalogOverviewStats {
+  totalSkus: number;
+  normalCount: number;
+  outletCount: number;
+  withEan: number;
+  withoutEan: number;
+}
+
+/**
+ * EVOLUÇÃO CATÁLOGO — "Visão geral" da tela de gestão. Só contagens
+ * (`head: true`, nunca baixa linha nenhuma) sobre os MESMOS critérios já
+ * usados em searchCatalog (variantes ativas) — nunca um número aproximado
+ * ou inventado. Cacheado em memória (mesma vida útil de searchCache) porque
+ * é consultado toda vez que a tela de Catálogo abre.
+ */
+export async function getCatalogOverviewStats(): Promise<CatalogOverviewStats> {
+  if (overviewStatsCache) return overviewStatsCache;
+
+  // CORREÇÃO — causa raiz do timeout ("canceling statement due to statement
+  // timeout") na Visão geral: count:"exact" obriga o Postgres a varrer E
+  // aplicar a checagem de RLS linha por linha na tabela INTEIRA antes de
+  // poder contar (RLS aqui tem 2 políticas — operador ativo OU manager/admin
+  // — cada uma chama uma função por linha; nada disso é gratuito em milhares
+  // de linhas). count:"estimated" usa a estatística que o próprio Postgres já
+  // mantém (rápido, sem varredura) quando a tabela é grande o bastante pra
+  // isso importar — não é dado inventado, é uma contagem real do banco, só
+  // aproximada em vez de exata.
+  const supabase = getSupabase();
+  const [total, normal, outlet, withEan] = await Promise.all([
+    supabase.from("product_variants").select("id", { count: "estimated", head: true }).eq("active", true),
+    supabase.from("product_variants").select("id, products!inner(product_type)", { count: "estimated", head: true }).eq("active", true).eq("products.product_type", "normal"),
+    supabase.from("product_variants").select("id, products!inner(product_type)", { count: "estimated", head: true }).eq("active", true).eq("products.product_type", "outlet"),
+    supabase.from("product_variants").select("id", { count: "estimated", head: true }).eq("active", true).not("gtin", "is", null).neq("gtin", ""),
+  ]);
+  if (total.error) throw total.error;
+  if (normal.error) throw normal.error;
+  if (outlet.error) throw outlet.error;
+  if (withEan.error) throw withEan.error;
+
+  const totalSkus = total.count ?? 0;
+  const withEanCount = withEan.count ?? 0;
+  const stats: CatalogOverviewStats = {
+    totalSkus,
+    normalCount: normal.count ?? 0,
+    outletCount: outlet.count ?? 0,
+    withEan: withEanCount,
+    withoutEan: Math.max(0, totalSkus - withEanCount),
+  };
+  overviewStatsCache = stats;
+  return stats;
 }
 
 /**
@@ -101,9 +155,13 @@ export async function searchCatalog(
   // a miniatura — mas pagavam a mesma 3ª ida-e-volta de rede (product_images)
   // do catálogo visual, que É quem precisa da miniatura. false pula essa
   // consulta inteira pra quem não vai exibir a imagem mesmo.
-  includeThumbnails = true
+  includeThumbnails = true,
+  // EVOLUÇÃO CATÁLOGO — filtro opcional "Com/Sem EAN" da tela de gestão.
+  // Aplicado no SERVIDOR (nunca filtra só a página já carregada, que
+  // mostraria contagem/paginação erradas).
+  eanPresence?: "with" | "without"
 ): Promise<CatalogPage> {
-  const key = cacheKey(query, page, pageSize, productType, includeThumbnails);
+  const key = cacheKey(query, page, pageSize, productType, includeThumbnails) + `::ean-${eanPresence ?? "*"}`;
   const cached = searchCache.get(key);
   if (cached) return cached;
 
@@ -121,15 +179,26 @@ export async function searchCatalog(
   const eanPrefix = !looksLikeFullEan && normalizedEanQuery.length >= 6 ? normalizedEanQuery : null;
   const upperSafeQ = safeQ.toUpperCase();
 
+  // CORREÇÃO — mesma causa raiz do timeout descrita em getCatalogOverviewStats:
+  // count:"exact" force a varredura completa (+ RLS por linha) da tabela
+  // inteira antes de poder paginar. "estimated" deixa o Postgres decidir:
+  // usa a contagem exata quando o resultado já filtrado é pequeno (busca/
+  // filtro de tipo), e a estatística (sem varredura) quando não é — nunca
+  // trava a tela por causa da paginação.
   let builder = supabase
     .from("product_variants")
-    .select("id, product_id, sku_code, color, gtin, gtin_normalized, products!inner(name, category, visual_family_key, capacity_ml, product_type)", { count: "exact" })
+    .select("id, product_id, sku_code, color, gtin, gtin_normalized, products!inner(name, category, visual_family_key, capacity_ml, product_type)", { count: "estimated" })
     .eq("active", true)
     .order("sku_code", { ascending: true })
     .range(from, to);
 
   if (productType) {
     builder = builder.eq("products.product_type", productType);
+  }
+  if (eanPresence === "with") {
+    builder = builder.not("gtin", "is", null).neq("gtin", "");
+  } else if (eanPresence === "without") {
+    builder = builder.or("gtin.is.null,gtin.eq.");
   }
   if (signal) {
     builder = builder.abortSignal(signal);
