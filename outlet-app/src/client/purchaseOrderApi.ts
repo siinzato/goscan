@@ -74,14 +74,22 @@ export interface PurchaseOrderValidation {
   errors: { row: number; reason: string }[];
 }
 
+export interface PurchaseOrderPdfMetadata {
+  orderNumber: string | null;
+  supplierName: string | null;
+  orderDate: string | null;
+  expectedDate: string | null;
+}
+
 /**
- * A maioria das ordens de compra reais é PDF, não planilha — usa a mesma IA
- * (Claude) já usada pro "Colar texto"/print de WhatsApp, só que lendo o PDF
- * direto (suporte nativo da API da Anthropic a documento, sem OCR à parte).
- * Devolve linhas já no formato de cabeçalho (GTIN/SKU/Descrição/Quantidade),
- * pra passar direto em mapPurchaseOrderRows — nunca duplica a validação.
+ * A maioria das ordens de compra reais é PDF, não planilha — lido no backend
+ * por EXTRAÇÃO DE TEXTO DETERMINÍSTICA (pdf-parse), nunca IA/OCR (ver
+ * src/server/purchaseOrderPdf.ts). Devolve os itens já no formato de
+ * cabeçalho (GTIN/SKU/Descrição/Quantidade), pra passar direto em
+ * mapPurchaseOrderRows, mais os metadados do cabeçalho (nº do pedido,
+ * fornecedor, datas) pra pré-preencher a OC — sempre editáveis depois.
  */
-export async function parsePurchaseOrderPdf(file: File): Promise<Record<string, unknown>[]> {
+export async function parsePurchaseOrderPdf(file: File): Promise<{ items: Record<string, unknown>[]; metadata: PurchaseOrderPdfMetadata }> {
   const buffer = await file.arrayBuffer();
   let binary = "";
   const bytes = new Uint8Array(buffer);
@@ -91,9 +99,33 @@ export async function parsePurchaseOrderPdf(file: File): Promise<Record<string, 
   }
   const base64 = btoa(binary);
 
-  const result = await authedPost<{ items?: Record<string, unknown>[]; error?: string }>("/api/parse-purchase-order-pdf", { pdf_base64: base64 });
+  const result = await authedPost<{ items?: Record<string, unknown>[]; metadata?: PurchaseOrderPdfMetadata; error?: string }>(
+    "/api/parse-purchase-order-pdf",
+    { pdf_base64: base64 }
+  );
   if (result.error) throw new Error(result.error);
-  return result.items || [];
+  return { items: result.items || [], metadata: result.metadata || { orderNumber: null, supplierName: null, orderDate: null, expectedDate: null } };
+}
+
+declare const XLSX: {
+  read(data: ArrayBuffer): { SheetNames: string[]; Sheets: Record<string, unknown> };
+  utils: { sheet_to_json(ws: unknown, opts?: Record<string, unknown>): Record<string, unknown>[] };
+};
+
+/**
+ * Lê planilha (XLSX/CSV) OU PDF (extração de texto determinística, sem IA) —
+ * a maioria das ordens de compra reais chega em PDF, não planilha. Único
+ * ponto que decide "PDF vs planilha" — reaproveitado tanto no upload dentro
+ * da Conferência por NF-e quanto na tela de gestão de Ordens de Compra.
+ */
+export async function readPurchaseOrderFile(file: File): Promise<{ rows: Record<string, unknown>[]; metadata?: PurchaseOrderPdfMetadata }> {
+  if (file.name.toLowerCase().endsWith(".pdf")) {
+    const { items, metadata } = await parsePurchaseOrderPdf(file);
+    return { rows: items, metadata };
+  }
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer);
+  return { rows: XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { defval: "" }) };
 }
 
 /** GTIN dentro do texto de "Item" (ex.: PDF de OC com "SKU: CCRKM1IP18PM-8" numa segunda linha) — quando a
@@ -140,8 +172,16 @@ export interface UploadPurchaseOrderResult {
  * comum é enviar sem nota nenhuma ainda (`receiptId` omitido, fica "avulsa")
  * e vincular depois com `linkPurchaseOrderToReceipt` quando a carga chegar.
  * Enviar já com `receiptId` continua funcionando (vínculo direto na hora).
+ * `metadata` (nº do pedido/fornecedor/datas, vindo do parser de PDF) só
+ * pré-preenche os campos de gestão — sempre editável depois via
+ * `updatePurchaseOrder`, nunca é a fonte definitiva.
  */
-export async function uploadPurchaseOrder(fileName: string, rawRows: Record<string, unknown>[], receiptId?: string): Promise<UploadPurchaseOrderResult> {
+export async function uploadPurchaseOrder(
+  fileName: string,
+  rawRows: Record<string, unknown>[],
+  receiptId?: string,
+  metadata?: PurchaseOrderPdfMetadata
+): Promise<UploadPurchaseOrderResult> {
   const mapped = mapPurchaseOrderRows(rawRows);
   const { valid, errors } = validatePurchaseOrderRows(mapped);
   if (valid.length === 0) {
@@ -155,7 +195,17 @@ export async function uploadPurchaseOrder(fileName: string, rawRows: Record<stri
 
   const { data: po, error: poError } = await supabase
     .from("invoice_purchase_orders")
-    .insert({ receipt_id: receiptId ?? null, file_name: fileName, uploaded_by: session?.user.id ?? null, company_id: profile.company_id })
+    .insert({
+      receipt_id: receiptId ?? null,
+      file_name: fileName,
+      title: fileName,
+      order_number: metadata?.orderNumber ?? null,
+      supplier_name: metadata?.supplierName ?? null,
+      order_date: metadata?.orderDate ?? null,
+      expected_date: metadata?.expectedDate ?? null,
+      uploaded_by: session?.user.id ?? null,
+      company_id: profile.company_id,
+    })
     .select()
     .single();
   if (poError) throw poError;
@@ -222,4 +272,79 @@ export async function hasPurchaseOrder(receiptId: string): Promise<boolean> {
   const { count, error } = await supabase.from("invoice_purchase_orders").select("id", { count: "estimated", head: true }).eq("receipt_id", receiptId);
   if (error) throw error;
   return (count ?? 0) > 0;
+}
+
+export type PurchaseOrderStatus = "avulsa" | "vinculada" | "conferida" | "cancelada";
+
+export interface PurchaseOrder {
+  id: string;
+  title: string | null;
+  order_number: string | null;
+  supplier_name: string | null;
+  order_date: string | null;
+  expected_date: string | null;
+  file_name: string;
+  item_count: number;
+  created_at: string;
+  cancelled: boolean;
+  receipt_id: string | null;
+  receipt_invoice_number: string | null;
+  status: PurchaseOrderStatus;
+}
+
+/** Tela de gestão — TODAS as OCs da empresa (vinculadas ou não), com status computado (ver migration 0063). */
+export async function listPurchaseOrders(): Promise<PurchaseOrder[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.rpc("list_purchase_orders");
+  if (error) throw error;
+  return (data as PurchaseOrder[]) || [];
+}
+
+export interface PurchaseOrderEditableFields {
+  title: string | null;
+  order_number: string | null;
+  supplier_name: string | null;
+  order_date: string | null;
+  expected_date: string | null;
+}
+
+/** Edita só os campos de gestão — nunca mexe em vínculo/itens (ver update_purchase_order na migration 0063). */
+export async function updatePurchaseOrder(id: string, fields: PurchaseOrderEditableFields): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.rpc("update_purchase_order", {
+    p_id: id,
+    p_title: fields.title,
+    p_order_number: fields.order_number,
+    p_supplier_name: fields.supplier_name,
+    p_order_date: fields.order_date,
+    p_expected_date: fields.expected_date,
+  });
+  if (error) throw error;
+}
+
+/** Sempre reversível — nunca um delete físico (ver set_purchase_order_cancelled na migration 0063). */
+export async function setPurchaseOrderCancelled(id: string, cancelled: boolean): Promise<void> {
+  const supabase = getSupabase();
+  const { error } = await supabase.rpc("set_purchase_order_cancelled", { p_id: id, p_cancelled: cancelled });
+  if (error) throw error;
+}
+
+export interface PurchaseOrderItemRow {
+  id: string;
+  gtin_normalized: string;
+  sku_code: string;
+  description: string | null;
+  quantity: number | null;
+}
+
+/** Itens de uma OC específica (GTIN/SKU/Descrição/Quantidade) — usado na tela de gestão pra mostrar "o que tem dentro". */
+export async function getPurchaseOrderItems(purchaseOrderId: string): Promise<PurchaseOrderItemRow[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("invoice_purchase_order_items")
+    .select("id, gtin_normalized, sku_code, description, quantity")
+    .eq("purchase_order_id", purchaseOrderId)
+    .order("description");
+  if (error) throw error;
+  return (data as PurchaseOrderItemRow[]) || [];
 }

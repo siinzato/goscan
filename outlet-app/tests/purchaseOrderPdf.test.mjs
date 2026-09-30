@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parsePurchaseOrderItemsFromText } from "../src/server/purchaseOrderPdf.ts";
+import { parsePurchaseOrderItemsFromText, parsePurchaseOrderMetadataFromText } from "../src/server/purchaseOrderPdf.ts";
 
 // Texto igual ao que o pdf-parse realmente devolve pra uma ordem de compra
 // real (cabeçalho da empresa, tabela quebrada em 3 linhas pelo extrator,
@@ -80,4 +80,19 @@ test("parsePurchaseOrderItemsFromText ignora tudo antes de 'Itens da compra' (ca
 test("parsePurchaseOrderItemsFromText devolve vazio pra texto sem a seção 'Itens da compra'", () => {
   const items = parsePurchaseOrderItemsFromText("Documento qualquer sem tabela nenhuma.");
   assert.deepEqual(items, []);
+});
+
+test("parsePurchaseOrderMetadataFromText extrai nº do pedido, fornecedor e datas do cabeçalho", () => {
+  const metadata = parsePurchaseOrderMetadataFromText(SAMPLE_TEXT);
+  assert.deepEqual(metadata, {
+    orderNumber: "480",
+    supplierName: "Rearth",
+    orderDate: "2026-09-10",
+    expectedDate: "2026-09-28",
+  });
+});
+
+test("parsePurchaseOrderMetadataFromText devolve tudo nulo pra texto sem cabeçalho reconhecido", () => {
+  const metadata = parsePurchaseOrderMetadataFromText("Documento qualquer sem cabeçalho nenhum.\nItens da compra\n");
+  assert.deepEqual(metadata, { orderNumber: null, supplierName: null, orderDate: null, expectedDate: null });
 });

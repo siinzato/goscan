@@ -151,7 +151,7 @@ export function isValidEanFormat(normalized: string): boolean {
 // window.location) — só pra ser testável sem DOM.
 // ---------------------------------------------------------------------------
 export interface ConferirHashInfo {
-  mode: "imagens" | "nfe";
+  mode: "imagens" | "nfe" | "ordens-compra";
   nfeReceiptId: string | null;
 }
 
@@ -162,6 +162,9 @@ export function parseConferirHash(hash: string): ConferirHashInfo {
   if (segments[1] === "nfe") {
     const id = segments[2]?.trim();
     return { mode: "nfe", nfeReceiptId: id ? id : null };
+  }
+  if (segments[1] === "ordens-compra") {
+    return { mode: "ordens-compra", nfeReceiptId: null };
   }
   return { mode: "imagens", nfeReceiptId: null };
 }

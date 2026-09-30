@@ -134,6 +134,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   // "já montado" tem que valer só pra ESTA instância do DOM.
   nfeConferenceMounted = false;
   devolucaoMounted = false;
+  purchaseOrdersMounted = false;
   root.innerHTML = `<div class="screen-loading">Carregando conferência…</div>`;
 
   let session: Session;
@@ -153,6 +154,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
           <button class="mode-btn" data-mode="texto">${Icon.type}Colar texto</button>
           <a class="mode-btn" data-mode="nfe" href="#/conferir/nfe">${Icon.receipt}Nota Fiscal</a>
           <button class="mode-btn" data-mode="devolucao">${Icon.undo2}Devolução</button>
+          <a class="mode-btn" data-mode="ordens-compra" href="#/conferir/ordens-compra">${Icon.fileUp}Ordens de Compra</a>
         </div>
 
         <div class="mode-panel active" id="mode-imagens">
@@ -180,6 +182,10 @@ export async function renderConference(root: HTMLElement): Promise<void> {
 
         <div class="mode-panel" id="mode-devolucao">
           <div id="devolucaoRoot"></div>
+        </div>
+
+        <div class="mode-panel" id="mode-ordens-compra">
+          <div id="purchaseOrdersRoot"></div>
         </div>
       </div>
 
@@ -392,6 +398,11 @@ let nfeConferenceMounted = false;
 let devolucaoModule: typeof import("./devolucao/index.ts") | null = null;
 let devolucaoMounted = false;
 
+// EXPANSÃO GOSCAN — módulo de gestão de Ordens de Compra, mesmo padrão de
+// singleton lazy-mount dos dois blocos acima.
+let purchaseOrdersModule: typeof import("./purchaseOrders.ts") | null = null;
+let purchaseOrdersMounted = false;
+
 /**
  * Chamado por shell.ts ao sair da rota "conferir" — encerra a sessão de
  * colaboração em tempo real ativa (ver realtimeCollab.ts), seja ela do modo
@@ -435,11 +446,13 @@ function wireInputModeSwitch(root: HTMLElement, hashInfo: ConferirHashInfo): voi
 
     const isNfe = mode === "nfe";
     const isDevolucao = mode === "devolucao";
+    const isOrdensCompra = mode === "ordens-compra";
     // Cards "2. Revise antes de adicionar" e "3. Itens da conferência" são
     // específicos do fluxo de correspondência por texto/print (Outlet) —
-    // não fazem sentido na Conferência por Nota Fiscal nem na Devolução,
-    // que têm seu próprio fluxo dentro do respectivo módulo.
-    extraCards.hidden = isNfe || isDevolucao;
+    // não fazem sentido na Conferência por Nota Fiscal, na Devolução nem na
+    // gestão de Ordens de Compra, que têm seu próprio fluxo dentro do
+    // respectivo módulo.
+    extraCards.hidden = isNfe || isDevolucao || isOrdensCompra;
 
     if (isNfe) {
       const container = root.querySelector<HTMLElement>("#nfeConferenceRoot")!;
@@ -484,6 +497,22 @@ function wireInputModeSwitch(root: HTMLElement, hashInfo: ConferirHashInfo): voi
         });
       }
     }
+
+    if (isOrdensCompra) {
+      const container = root.querySelector<HTMLElement>("#purchaseOrdersRoot")!;
+      if (!purchaseOrdersMounted) {
+        purchaseOrdersMounted = true;
+        void (purchaseOrdersModule ? Promise.resolve(purchaseOrdersModule) : import("./purchaseOrders.ts"))
+          .then((m) => {
+            purchaseOrdersModule = m;
+            return m.renderPurchaseOrders(container);
+          })
+          .catch((err) => {
+            purchaseOrdersMounted = false;
+            renderErrorWithRetry(container, "Erro ao carregar Ordens de Compra: " + describeError(err), () => selectMode("ordens-compra", btn));
+          });
+      }
+    }
   }
 
   root.querySelectorAll<HTMLElement>(".mode-btn").forEach((btn) => {
@@ -510,6 +539,10 @@ function wireInputModeSwitch(root: HTMLElement, hashInfo: ConferirHashInfo): voi
   if (hashInfo.mode === "nfe") {
     const nfeBtn = root.querySelector<HTMLElement>('[data-mode="nfe"]');
     if (nfeBtn) selectMode("nfe", nfeBtn);
+  }
+  if (hashInfo.mode === "ordens-compra") {
+    const poBtn = root.querySelector<HTMLElement>('[data-mode="ordens-compra"]');
+    if (poBtn) selectMode("ordens-compra", poBtn);
   }
 }
 

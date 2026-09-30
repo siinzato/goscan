@@ -15,7 +15,7 @@ import { recordLearningSample, listLearningSamples, updateLearningSampleStatus, 
 import { recalculateRecognitionQuality, getRecognitionQualityForVariants, listRecognitionQuality } from "./recognitionQuality.ts";
 import { isRateLimited } from "./scanRateLimiter.ts";
 import { SCAN_CONFIG } from "./scanConfig.ts";
-import { extractPurchaseOrderItemsFromPdf } from "./purchaseOrderPdf.ts";
+import { extractPurchaseOrderFromPdf } from "./purchaseOrderPdf.ts";
 
 interface Env extends AdminEnv {
   ANTHROPIC_API_KEY?: string;
@@ -118,8 +118,8 @@ export default {
         const body = (await request.json()) as { pdf_base64?: string };
         if (!body.pdf_base64) return json({ error: "pdf_base64 é obrigatório." }, 400);
         try {
-          const items = await extractPurchaseOrderItemsFromPdf(Buffer.from(body.pdf_base64, "base64"));
-          return json({ items });
+          const { items, metadata } = await extractPurchaseOrderFromPdf(Buffer.from(body.pdf_base64, "base64"));
+          return json({ items, metadata });
         } catch (err) {
           return json({ error: `Não foi possível ler o PDF: ${errorMessage(err)}` }, 400);
         }

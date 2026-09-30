@@ -60,14 +60,9 @@ import {
   hasPurchaseOrder,
   listUnlinkedPurchaseOrders,
   linkPurchaseOrderToReceipt,
-  parsePurchaseOrderPdf,
+  readPurchaseOrderFile,
   type PurchaseOrderConflict,
 } from "../../purchaseOrderApi.ts";
-
-declare const XLSX: {
-  read(data: ArrayBuffer): { SheetNames: string[]; Sheets: Record<string, unknown> };
-  utils: { sheet_to_json(ws: unknown, opts?: Record<string, unknown>): Record<string, unknown>[] };
-};
 
 type NfeView = "upload" | "prep" | "mode" | "counting" | "result" | "history";
 
@@ -607,7 +602,7 @@ function renderUploadView(root: HTMLElement): void {
 
     <details class="card">
       <summary>Ordens de Compra avulsas</summary>
-      <p class="hint-text">A ordem de compra normalmente chega antes da carga/NF-e — anexe aqui assim que sair, e vincule à nota certa depois, na tela de preparação/contagem. Aceita PDF (lido por IA), XLSX, XLS ou CSV.</p>
+      <p class="hint-text">A ordem de compra normalmente chega antes da carga/NF-e — anexe aqui assim que sair, e vincule à nota certa depois, na tela de preparação/contagem. Aceita PDF, XLSX, XLS ou CSV.</p>
       <label class="dropzone small">
         <input type="file" id="poStandaloneInput" accept=".xlsx,.xls,.csv,.pdf" hidden />
         <span class="dz-icon">${Icon.upload}</span>
@@ -649,16 +644,6 @@ function renderUploadView(root: HTMLElement): void {
   root.querySelector("#btnOpenHistory")!.addEventListener("click", () => goTo(root, "history"));
 }
 
-/** Lê planilha (XLSX/CSV) OU PDF (via IA) — a maioria das ordens de compra reais chega em PDF, não planilha. */
-async function readPurchaseOrderFileRows(file: File): Promise<Record<string, unknown>[]> {
-  if (file.name.toLowerCase().endsWith(".pdf")) {
-    return parsePurchaseOrderPdf(file);
-  }
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer);
-  return XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { defval: "" });
-}
-
 function wireStandalonePurchaseOrderUpload(root: HTMLElement): void {
   const input = root.querySelector<HTMLInputElement>("#poStandaloneInput");
   const list = root.querySelector<HTMLElement>("#poStandaloneList");
@@ -684,10 +669,10 @@ function wireStandalonePurchaseOrderUpload(root: HTMLElement): void {
     const file = input.files?.[0];
     input.value = "";
     if (!file) return;
-    list.innerHTML = `<p class="hint-text">Lendo ${file.name.toLowerCase().endsWith(".pdf") ? "PDF (com IA)" : "planilha"}…</p>`;
+    list.innerHTML = `<p class="hint-text">Lendo ${file.name.toLowerCase().endsWith(".pdf") ? "PDF" : "planilha"}…</p>`;
     try {
-      const rows = await readPurchaseOrderFileRows(file);
-      const result = await uploadPurchaseOrder(file.name, rows);
+      const { rows, metadata } = await readPurchaseOrderFile(file);
+      const result = await uploadPurchaseOrder(file.name, rows, undefined, metadata);
       showToast(
         `Ordem de compra recebida — ${result.inserted} linha(s) lida(s)${result.rejected > 0 ? `, ${result.rejected} rejeitada(s)` : ""}. Vincule à NF quando ela chegar.`,
         "success"
@@ -1012,7 +997,7 @@ async function renderPrepView(root: HTMLElement): Promise<void> {
  */
 function purchaseOrderSectionHtml(): string {
   return `
-    <p class="hint-text">Anexe a ordem de compra (PDF, lido por IA, ou planilha XLSX/CSV com GTIN, SKU e quantidade) pra conferir automaticamente se algum vínculo desta NF ficou errado — nunca aplica nada sozinho, só avisa.</p>
+    <p class="hint-text">Anexe a ordem de compra (PDF ou planilha XLSX/CSV com GTIN, SKU e quantidade) pra conferir automaticamente se algum vínculo desta NF ficou errado — nunca aplica nada sozinho, só avisa.</p>
     <label class="dropzone small">
       <input type="file" id="poFileInput" accept=".xlsx,.xls,.csv,.pdf" hidden />
       <span class="dz-icon">${Icon.upload}</span>
@@ -1033,10 +1018,10 @@ function wirePurchaseOrderSection(root: HTMLElement, receiptId: string): void {
     input.value = "";
     if (!file) return;
     const wrap = root.querySelector<HTMLElement>("#poResultsWrap");
-    if (wrap) wrap.innerHTML = `<p class="hint-text">Lendo ${file.name.toLowerCase().endsWith(".pdf") ? "PDF (com IA)" : "planilha"}…</p>`;
+    if (wrap) wrap.innerHTML = `<p class="hint-text">Lendo ${file.name.toLowerCase().endsWith(".pdf") ? "PDF" : "planilha"}…</p>`;
     try {
-      const rows = await readPurchaseOrderFileRows(file);
-      const result = await uploadPurchaseOrder(file.name, rows, receiptId);
+      const { rows, metadata } = await readPurchaseOrderFile(file);
+      const result = await uploadPurchaseOrder(file.name, rows, receiptId, metadata);
       showToast(
         `Ordem de compra anexada — ${result.inserted} linha(s) lida(s)${result.rejected > 0 ? `, ${result.rejected} rejeitada(s)` : ""}.`,
         "success"

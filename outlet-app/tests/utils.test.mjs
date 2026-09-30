@@ -125,6 +125,12 @@ test("parseConferirHash ignora outras rotas (nunca confunde com o módulo NF)", 
   assert.equal(parseConferirHash("#/conferir/devolucao").mode, "imagens");
 });
 
+test("parseConferirHash: #/conferir/ordens-compra seleciona o modo de gestão de Ordens de Compra", () => {
+  const result = parseConferirHash("#/conferir/ordens-compra");
+  assert.equal(result.mode, "ordens-compra");
+  assert.equal(result.nfeReceiptId, null);
+});
+
 // ---------------------------------------------------------------------------
 // FASE 3 — Central de Pendências: deep link #/historico/pendencias.
 // ---------------------------------------------------------------------------
