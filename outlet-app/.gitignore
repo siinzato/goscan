@@ -1,3 +1,5 @@
 node_modules
 dist
 .env
+scripts/tiny-po-sync/downloads
+scripts/tiny-po-sync/logs
