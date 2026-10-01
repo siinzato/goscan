@@ -11,7 +11,7 @@
 // colaboração em tempo real, comandos de voz, volumes ou reserva por
 // produto (work_mode fica 'free', o default já seguro pra contagem
 // individual) — pode ganhar paridade depois, se for pedido.
-import { escapeHtml, describeError, formatDateTime, normalize } from "../../utils.ts";
+import { escapeHtml, describeError, formatDateTime, normalize, runPickerSearch } from "../../utils.ts";
 import { createLoadingOrderReceipt, splitModeloECor } from "../../loadingOrderApi.ts";
 import { fetchAliasLists } from "../../matching.ts";
 import {
@@ -338,21 +338,34 @@ function wirePendingActions(root: HTMLElement): void {
     let activeController: AbortController | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
+    // LOADING VISUAL — antes o campo ficava "parado" sem nenhum feedback
+    // enquanto a busca rodava, e um erro de rede não mostrava nada (usuário
+    // sem saber se travou). runPickerSearch mostra "Buscando…" e, se falhar
+    // de verdade, erro com retry — nunca uma busca cancelada (troca de termo).
+    const runSearch = (): void => {
+      activeController?.abort();
+      if (!input.value.trim()) {
+        resultsBox.hidden = true;
+        return;
+      }
+      const controller = new AbortController();
+      activeController = controller;
+      void runPickerSearch(
+        resultsBox,
+        controller.signal,
+        async () => {
+          // Sempre restringe a Outlet — ver comentário em autoSuggestPending.
+          const rows = await searchSkuForPicker(input.value, 15, "outlet", controller.signal, false);
+          if (controller.signal.aborted) return;
+          renderPickerResults(resultsBox, rows, (row) => void linkPendingItem(root, itemId, row.variant_id));
+        },
+        runSearch
+      );
+    };
+
     input.addEventListener("input", () => {
       if (timer) clearTimeout(timer);
-      timer = setTimeout(async () => {
-        activeController?.abort();
-        if (!input.value.trim()) {
-          resultsBox.hidden = true;
-          return;
-        }
-        const controller = new AbortController();
-        activeController = controller;
-        // Sempre restringe a Outlet — ver comentário em autoSuggestPending.
-        const rows = await searchSkuForPicker(input.value, 15, "outlet", controller.signal, false);
-        if (controller.signal.aborted) return;
-        renderPickerResults(resultsBox, rows, (row) => void linkPendingItem(root, itemId, row.variant_id));
-      }, 300);
+      timer = setTimeout(runSearch, 300);
     });
   });
 

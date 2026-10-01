@@ -1057,6 +1057,14 @@ td input:hover, td select:hover, td input:focus, td select:focus { border-color:
 .sku-picker-item-info .sku-code { margin: 0; overflow-wrap: anywhere; }
 .sku-picker-empty { padding: 10px 12px; font-size: 12px; color: var(--text-secondary); }
 
+/* LOADING VISUAL — indicador discreto reaproveitado em qualquer lugar que já
+   usa Icon.loader junto de um texto curto ("Buscando…", etc.) — ver
+   runPickerSearch em utils.ts. Só anima onde esta classe é usada
+   explicitamente; não afeta nenhum uso existente de Icon.loader. */
+.icon-spin { display: inline-flex; vertical-align: middle; animation: gs-spin 0.8s linear infinite; }
+.icon-spin svg { width: 14px; height: 14px; stroke: currentColor; }
+@keyframes gs-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
 /* Correção de SKU de um item já adicionado ("Alterar produto") */
 .item-sku-fix { position: relative; margin: 6px 0; }
 

@@ -1,4 +1,4 @@
-import { escapeHtml, debounce, renderErrorWithRetry, describeError, formatDateTime, formatOperationDuration, parseConferirHash, type ConferirHashInfo } from "../../utils.ts";
+import { escapeHtml, debounce, renderErrorWithRetry, describeError, formatDateTime, formatOperationDuration, parseConferirHash, runPickerSearch, type ConferirHashInfo } from "../../utils.ts";
 import { matchItems, matchItem, type MatchResult } from "../../matching.ts";
 import { parseImagesLocally } from "../../ocr.ts";
 import { searchSkuForPicker, type CatalogRow } from "../../catalogApi.ts";
@@ -845,7 +845,10 @@ function wireSkuPickers(wrap: Element): void {
     // sobrescrevê-la (mesmo padrão já usado em nfeConference.ts).
     let activeController: AbortController | null = null;
 
-    const search = debounce(async (query: string) => {
+    // LOADING VISUAL — runPickerSearch mostra "Buscando…" enquanto a busca
+    // roda e erro+retry se falhar de verdade (nunca uma busca cancelada por
+    // troca de termo) — antes este picker não dava nenhum feedback.
+    const runSearch = (query: string): void => {
       activeController?.abort();
       if (!query.trim()) {
         resultsBox.hidden = true;
@@ -853,10 +856,18 @@ function wireSkuPickers(wrap: Element): void {
       }
       const controller = new AbortController();
       activeController = controller;
-      const rows = await searchSkuForPicker(query, 15, "outlet", controller.signal, false);
-      if (controller.signal.aborted) return;
-      renderResults(rows);
-    }, 300);
+      void runPickerSearch(
+        resultsBox,
+        controller.signal,
+        async () => {
+          const rows = await searchSkuForPicker(query, 15, "outlet", controller.signal, false);
+          if (controller.signal.aborted) return;
+          renderResults(rows);
+        },
+        () => runSearch(query)
+      );
+    };
+    const search = debounce(runSearch, 300);
 
     input.addEventListener("input", () => search(input.value));
     input.addEventListener("focus", () => {
@@ -1047,7 +1058,8 @@ function wireItemSkuFix(wrap: Element): void {
     // a mais recente.
     let activeController: AbortController | null = null;
 
-    const search = debounce(async (query: string) => {
+    // LOADING VISUAL — mesmo padrão de wireSkuPickers acima.
+    const runSearch = (query: string): void => {
       activeController?.abort();
       if (!query.trim()) {
         resultsBox.hidden = true;
@@ -1055,10 +1067,18 @@ function wireItemSkuFix(wrap: Element): void {
       }
       const controller = new AbortController();
       activeController = controller;
-      const rows = await searchSkuForPicker(query, 15, "outlet", controller.signal, false);
-      if (controller.signal.aborted) return;
-      renderResults(rows);
-    }, 300);
+      void runPickerSearch(
+        resultsBox,
+        controller.signal,
+        async () => {
+          const rows = await searchSkuForPicker(query, 15, "outlet", controller.signal, false);
+          if (controller.signal.aborted) return;
+          renderResults(rows);
+        },
+        () => runSearch(query)
+      );
+    };
+    const search = debounce(runSearch, 300);
 
     input.addEventListener("input", () => search(input.value));
 

@@ -116,15 +116,19 @@ export interface BulkCatalogData {
   variantsByProduct: Map<string, VariantRow[]>;
 }
 
-/** `productType` opcional restringe os PRODUTOS buscados (ex.: Carregamento nunca pode casar com um produto 'normal', só 'outlet') — omitido, traz os dois tipos (comportamento de sempre). */
+/** `productType` opcional restringe os PRODUTOS e VARIANTES buscados (ex.: Carregamento nunca pode casar com um produto 'normal', só 'outlet') — omitido, traz os dois tipos (comportamento de sempre). */
 export async function fetchBulkCatalogData(productType?: "outlet" | "normal"): Promise<BulkCatalogData> {
   const supabase = getSupabase();
   let productsQuery = supabase.from("products").select("id, name, normalized_name").eq("active", true);
   if (productType) productsQuery = productsQuery.eq("product_type", productType);
-  const [productsRes, variantsRes] = await Promise.all([
-    productsQuery,
-    supabase.from("product_variants").select("id, product_id, sku_code, color, normalized_color, gtin").eq("active", true),
-  ]);
+  // PERFORMANCE — com productType definido, as variantes de produtos do OUTRO
+  // tipo nunca eram usadas (variantsByProduct só é consultado pelos ids já
+  // filtrados em `products` acima) — só ocupavam rede/memória à toa. O join
+  // `products!inner(product_type)` filtra isso no próprio banco, igual ao
+  // mesmo padrão já usado em searchCatalog (catalogApi.ts).
+  let variantsQuery = supabase.from("product_variants").select("id, product_id, sku_code, color, normalized_color, gtin, products!inner(product_type)").eq("active", true);
+  if (productType) variantsQuery = variantsQuery.eq("products.product_type", productType);
+  const [productsRes, variantsRes] = await Promise.all([productsQuery, variantsQuery]);
   if (productsRes.error) throw productsRes.error;
   if (variantsRes.error) throw variantsRes.error;
 
@@ -250,8 +254,8 @@ interface ResolvedVariant {
   matchedOnColorField: boolean;
 }
 
-export async function matchItem(modelo: string, cor: string, qtd = 1, bulk?: BulkCatalogData): Promise<MatchResult> {
-  const { models, colors } = await fetchAliasLists();
+export async function matchItem(modelo: string, cor: string, qtd = 1, bulk?: BulkCatalogData, aliasLists?: AliasLists): Promise<MatchResult> {
+  const { models, colors } = aliasLists ?? (await fetchAliasLists());
   const normModelo = normalize(modelo);
   const normCor = normalize(cor);
 

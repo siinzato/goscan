@@ -342,3 +342,31 @@ export function renderErrorWithRetry(container: Element, message: string, onRetr
     </div>`;
   document.getElementById(id)?.addEventListener("click", onRetry);
 }
+
+// ---------------------------------------------------------------------------
+// LOADING VISUAL — vários pickers de SKU (vínculo manual de pendência,
+// correção de item na conferência) não davam NENHUM feedback enquanto a
+// busca rodava: o campo ficava "parado" até a resposta chegar, e se a busca
+// falhasse, nada era mostrado (usuário sem saber se travou ou terminou).
+// Padrão único, com o mesmo botão de retry já usado em renderErrorWithRetry
+// (classe link-btn já existe no picker da NF-e). Glifo de texto simples
+// (nunca um ícone de ../ui/icons.ts) DE PROPÓSITO: icons.ts importa SVG via
+// `?raw`, sintaxe só entendida pelo bundler Vite — utils.ts é importado por
+// quase todo teste unitário via `node --test` puro (sem Vite), e puxar
+// icons.ts pra cá quebraria TODOS eles (ERR_UNKNOWN_FILE_EXTENSION ".svg").
+// `search` já deve deixar o resultado pronto no DOM quando resolver (cada
+// picker sabe renderizar o seu próprio formato de resultado); erro de busca
+// CANCELADA (AbortError do próprio picker trocando de termo) nunca mostra
+// mensagem de erro — só uma falha real.
+// ---------------------------------------------------------------------------
+export async function runPickerSearch(resultsBox: HTMLElement, signal: AbortSignal, search: () => Promise<void>, onRetry: () => void): Promise<void> {
+  resultsBox.hidden = false;
+  resultsBox.innerHTML = `<div class="sku-picker-empty"><span class="icon-spin" aria-hidden="true">⟳</span> Buscando…</div>`;
+  try {
+    await search();
+  } catch {
+    if (signal.aborted) return;
+    resultsBox.innerHTML = `<div class="sku-picker-empty">Erro ao buscar. <button type="button" class="link-btn" data-picker-retry>Tentar novamente</button></div>`;
+    resultsBox.querySelector<HTMLButtonElement>("[data-picker-retry]")?.addEventListener("click", onRetry);
+  }
+}

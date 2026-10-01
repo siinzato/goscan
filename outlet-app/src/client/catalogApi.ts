@@ -1,6 +1,21 @@
 import { getSupabase } from "./supabaseClient.ts";
 import { normalize, normalizeEan, isValidEanFormat } from "./utils.ts";
 
+/**
+ * Monta o filtro `.or()` que resolve, numa ÚNICA request, os `product_id`
+ * que batem por nome (todas as palavras, AND) OU categoria OU família OU
+ * capacidade — antes eram 4 requests paralelas separadas pra isto (ver
+ * PERFORMANCE em searchCatalog). Função pura só pra poder travar a sintaxe
+ * exata esperada pelo PostgREST com teste unitário, sem precisar de rede.
+ */
+export function buildCatalogIdFilter(lowerQ: string, nameWords: string[], digitsOnly: string | undefined): string {
+  const nameCondition = nameWords.length > 0 ? `and(${nameWords.map((w) => `normalized_name.ilike.%${w}%`).join(",")})` : null;
+  const parts = [nameCondition, `category.ilike.%${lowerQ}%`, `visual_family_key.ilike.%${lowerQ}%`, digitsOnly ? `capacity_ml.eq.${digitsOnly}` : null].filter(
+    (p): p is string => !!p
+  );
+  return parts.join(",");
+}
+
 export type ProductType = "outlet" | "normal";
 
 export type CatalogMatchType = "exact_ean" | "exact_sku" | "text";
@@ -66,6 +81,13 @@ function productJoin(row: VariantJoinRow): ProductJoin {
 const searchCache = new Map<string, CatalogPage>();
 const SEARCH_CACHE_MAX = 200;
 let overviewStatsCache: CatalogOverviewStats | null = null;
+// PERFORMANCE — renderProductsTab() chama loadOverview() e
+// updateTypeTabCounts() em paralelo (void, nunca aguardados um pelo outro) —
+// com o cache frio, as duas batem aqui ao mesmo tempo e, sem isto, cada uma
+// dispara as MESMAS 4 consultas de contagem (8 no total) na abertura do
+// Catálogo. Compartilhar a Promise em voo faz a 2ª chamada esperar a 1ª em
+// vez de duplicar o trabalho.
+let overviewStatsInFlight: Promise<CatalogOverviewStats> | null = null;
 
 export function invalidateSearchCache(): void {
   searchCache.clear();
@@ -94,7 +116,15 @@ export interface CatalogOverviewStats {
  */
 export async function getCatalogOverviewStats(): Promise<CatalogOverviewStats> {
   if (overviewStatsCache) return overviewStatsCache;
+  if (overviewStatsInFlight) return overviewStatsInFlight;
 
+  overviewStatsInFlight = computeCatalogOverviewStats().finally(() => {
+    overviewStatsInFlight = null;
+  });
+  return overviewStatsInFlight;
+}
+
+async function computeCatalogOverviewStats(): Promise<CatalogOverviewStats> {
   // CORREÇÃO — causa raiz do timeout ("canceling statement due to statement
   // timeout") na Visão geral: count:"exact" obriga o Postgres a varrer E
   // aplicar a checagem de RLS linha por linha na tabela INTEIRA antes de
@@ -216,34 +246,28 @@ export async function searchCatalog(
 
     // Busca por nome é por PALAVRA-CHAVE, não frase exata: cada palavra
     // digitada precisa aparecer em algum lugar do nome (em qualquer ordem) —
-    // "termica bolsa" e "bolsa termica" encontram o mesmo produto. Cada
-    // .ilike() encadeado no mesmo builder vira AND no PostgREST.
+    // "termica bolsa" e "bolsa termica" encontram o mesmo produto.
     const nameWords = lowerQ.split(" ").filter(Boolean);
-    let byNameBuilder = supabase.from("products").select("id").limit(200);
-    for (const word of nameWords) byNameBuilder = byNameBuilder.ilike("normalized_name", `%${word}%`);
-    let byCategoryBuilder = supabase.from("products").select("id").ilike("category", `%${lowerQ}%`).limit(200);
-    let byFamilyBuilder = supabase.from("products").select("id").ilike("visual_family_key", `%${lowerQ}%`).limit(200);
-    let byCapacityBuilder = digitsOnly ? supabase.from("products").select("id").eq("capacity_ml", Number(digitsOnly)).limit(200) : null;
-    if (signal) {
-      byNameBuilder = byNameBuilder.abortSignal(signal);
-      byCategoryBuilder = byCategoryBuilder.abortSignal(signal);
-      byFamilyBuilder = byFamilyBuilder.abortSignal(signal);
-      byCapacityBuilder = byCapacityBuilder?.abortSignal(signal) ?? null;
-    }
 
-    const [byName, byCategory, byFamily, byCapacity] = await Promise.all([
-      nameWords.length > 0 ? byNameBuilder : Promise.resolve({ data: [] as { id: string }[] }),
-      byCategoryBuilder,
-      byFamilyBuilder,
-      byCapacityBuilder ?? Promise.resolve({ data: [] as { id: string }[] }),
-    ]);
-    const productIds = Array.from(
-      new Set(
-        [byName.data, byCategory.data, byFamily.data, byCapacity.data]
-          .filter((d): d is { id: string }[] => !!d)
-          .flatMap((d) => d.map((p) => p.id))
-      )
-    );
+    // PERFORMANCE — causa raiz medida do timeout (57014) no caminho real
+    // REST/RPC: nome/categoria/família/capacidade eram 4 requests PARALELAS
+    // (confirmado com EXPLAIN ANALYZE: cada uma roda em ~20-90ms no Postgres,
+    // mas o projeto só tem ~10 conexões no pool do PostgREST — 1 busca já
+    // consumia 4 delas, bastando 2-3 buscas simultâneas pra esgotar o pool
+    // pra todo mundo). Consolidado numa ÚNICA request usando `.or()` com
+    // `and(...)` aninhado — mesmo mecanismo que `orParts.join(",")` já usa
+    // mais abaixo nesta função, nenhuma sintaxe nova. Resultado idêntico ao
+    // de antes: união dos ids que batem em QUALQUER um dos 4 critérios.
+    // `limit(800)` (antes: até 200 de CADA uma das 4 = até 800 no total)
+    // preserva a mesma capacidade máxima de resultados que já existia.
+    let byIdsBuilder = supabase
+      .from("products")
+      .select("id")
+      .or(buildCatalogIdFilter(lowerQ, nameWords, digitsOnly))
+      .limit(800);
+    if (signal) byIdsBuilder = byIdsBuilder.abortSignal(signal);
+    const { data: idMatches } = await byIdsBuilder;
+    const productIds = Array.from(new Set((idMatches || []).map((p) => p.id)));
 
     const orParts: string[] = [`sku_code.ilike.%${safeQ}%`];
     if (productIds.length > 0) orParts.push(`product_id.in.(${productIds.join(",")})`);
@@ -322,6 +346,19 @@ async function fetchPrimaryThumbnails(supabase: ReturnType<typeof getSupabase>, 
     if (row.storage_path) map.set(row.product_variant_id, row.storage_path);
   }
   return map;
+}
+
+/**
+ * Miniatura principal de UMA variante só — usada pelo formulário de edição do
+ * Catálogo administrativo (hydrateProductFormThumb), que precisa da imagem só
+ * da linha sendo editada. Evita pedir thumbnail das outras ~30 linhas da
+ * página (searchCatalog com includeThumbnails=false ali) quando a lista nunca
+ * as exibe mesmo — mesma consulta de sempre, só que para 1 id.
+ */
+export async function getPrimaryThumbnailPath(variantId: string): Promise<string | null> {
+  const supabase = getSupabase();
+  const map = await fetchPrimaryThumbnails(supabase, [variantId]);
+  return map.get(variantId) ?? null;
 }
 
 // ---------------------------------------------------------------------------

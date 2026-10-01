@@ -1,4 +1,4 @@
-import { searchCatalog, getCatalogOverviewStats, type CatalogRow, type CatalogOverviewStats, type ProductType } from "../../catalogApi.ts";
+import { searchCatalog, getCatalogOverviewStats, getPrimaryThumbnailPath, type CatalogRow, type CatalogOverviewStats, type ProductType } from "../../catalogApi.ts";
 import { importCatalog, importNormalProducts } from "../../importer.ts";
 import { createManualProduct, updateProductName, updateVariantFields, deleteVariant, setVariantActive } from "../../catalogManageApi.ts";
 import { getSignedImageUrls } from "../../catalogImagesApi.ts";
@@ -165,17 +165,24 @@ function renderProductForm(mode: ProductFormMode, editingRow: CatalogRow | null)
     </div>`;
 }
 
-/** Miniatura no formulário de edição, quando o produto já tiver imagem (product-images) — mesma fonte usada no Catálogo Visual, nunca uma segunda consulta de imagem. */
+/**
+ * Miniatura no formulário de edição, quando o produto já tiver imagem
+ * (product-images) — mesma fonte usada no Catálogo Visual, nunca uma segunda
+ * consulta de imagem. A lista de produtos agora busca sem thumbnail
+ * (PERFORMANCE — ver loadProductsPage), então row.thumbnail_path nunca vem
+ * preenchido daqui; busca avulsa (1 variante) só na hora de editar.
+ */
 async function hydrateProductFormThumb(root: HTMLElement, row: CatalogRow): Promise<void> {
   const wrap = root.querySelector<HTMLElement>("#pfThumbWrap");
   if (!wrap) return;
-  if (!row.thumbnail_path) {
-    wrap.innerHTML = "";
-    return;
-  }
   try {
-    const urls = await getSignedImageUrls([row.thumbnail_path]);
-    const url = urls.get(row.thumbnail_path);
+    const thumbnailPath = row.thumbnail_path ?? (await getPrimaryThumbnailPath(row.variant_id));
+    if (!thumbnailPath) {
+      wrap.innerHTML = "";
+      return;
+    }
+    const urls = await getSignedImageUrls([thumbnailPath]);
+    const url = urls.get(thumbnailPath);
     wrap.innerHTML = url ? `<img src="${escapeHtml(url)}" alt="" class="thumb-img-lg" />` : "";
   } catch {
     wrap.innerHTML = "";
@@ -377,12 +384,15 @@ function wireImportFlow(root: HTMLElement, type: ProductType, onImported: () => 
 // Lista de produtos (SKUs) — Todos/Normais/Outlet, busca, filtro de EAN.
 // ---------------------------------------------------------------------------
 async function renderProductsTab(root: HTMLElement, canImport: boolean): Promise<void> {
-  // PERFORMANCE — as contagens de Todos/Normais/Outlet vêm da MESMA consulta
-  // de rede que a "Visão geral" (getCatalogOverviewStats). Antes, a tela
-  // inteira (abas, busca, tudo) esperava essa resposta antes de desenhar
-  // qualquer coisa — se a rede/banco demorasse, o Catálogo inteiro parecia
-  // travado. Agora desenha tudo já, sem contagem nas abas, e preenche os
-  // números depois (updateTypeTabCounts), igual a Visão geral já fazia.
+  // PERFORMANCE — causa raiz real do "Catálogo trava até terminar de
+  // carregar": o HTML já desenhava tudo de imediato, mas os listeners (abas,
+  // busca, paginação, filtros, formulário) só eram conectados DEPOIS de um
+  // `await loadProductsPage(...)` — se a rede/banco demorasse ou desse
+  // timeout, a tela aparecia mas ficava inteiramente inerte até essa resposta
+  // chegar (exatamente o sintoma relatado: "aparece, mas fica inutilizável").
+  // Corrigido abaixo: loadProductsPage() roda em paralelo (void), nunca
+  // bloqueia a conexão dos eventos — a lista de produtos preenche assim que
+  // chegar, mas o resto da tela já responde na hora.
   const typeTabs: { value: ProductTypeFilter; label: string; count: number | null }[] = [
     { value: "all", label: "Todos", count: null },
     { value: "normal", label: "Normais", count: null },
@@ -416,6 +426,7 @@ async function renderProductsTab(root: HTMLElement, canImport: boolean): Promise
           ${Icon.search}
           <label for="prodSearch" class="sr-only">Buscar produto, SKU ou EAN</label>
           <input type="text" id="prodSearch" placeholder="Buscar por produto, SKU ou EAN…" value="${escapeHtml(prodQuery)}" />
+          <span class="icon-spin" id="prodSearchSpinner" hidden>${Icon.loader}</span>
         </div>
         <button type="button" class="btn-secondary" id="btnToggleFilters" aria-expanded="${prodFiltersOpen}">${Icon.settings}Filtros</button>
       </div>
@@ -467,7 +478,7 @@ async function renderProductsTab(root: HTMLElement, canImport: boolean): Promise
 
   void loadOverview(root);
   void updateTypeTabCounts(root);
-  await loadProductsPage(root, canImport);
+  void loadProductsPage(root, canImport);
 
   root.querySelectorAll<HTMLButtonElement>("[data-prod-type]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -542,10 +553,24 @@ async function loadProductsPage(root: HTMLElement, canImport: boolean): Promise<
   prodSearchController = controller;
 
   const wrap = root.querySelector("#catalogResultsWrap")!;
+  const spinner = root.querySelector<HTMLElement>("#prodSearchSpinner");
+  // LOADING VISUAL — só mostra o spinner se a busca realmente demorar mais
+  // que um instante (threshold de 200ms) — nunca pisca em respostas rápidas
+  // (ex.: vindas do cache de searchCatalog). A lista anterior continua
+  // visível embaixo enquanto isso (só troca quando o resultado novo chega).
+  const spinnerTimer = setTimeout(() => {
+    if (!controller.signal.aborted && spinner) spinner.hidden = false;
+  }, 200);
+
   try {
     const typeArg = prodTypeFilter === "all" ? undefined : prodTypeFilter;
     const eanArg = prodEanFilter === "all" ? undefined : prodEanFilter;
-    const result = await searchCatalog(prodQuery, prodPage, PAGE_SIZE, typeArg, controller.signal, true, eanArg);
+    // PERFORMANCE — renderResults() (abaixo) nunca exibe miniatura (só
+    // Produto/SKU/EAN/Cor/Tipo/ações) — includeThumbnails=false pula a
+    // consulta extra a product_images que essa tela nunca aproveitava.
+    // Outros consumidores de searchCatalog (Catálogo Visual) continuam
+    // pedindo imagem normalmente — este argumento é só desta chamada.
+    const result = await searchCatalog(prodQuery, prodPage, PAGE_SIZE, typeArg, controller.signal, false, eanArg);
     if (controller.signal.aborted) return;
     prodRows = result.rows;
     renderResults(wrap, result.rows, canImport);
@@ -567,6 +592,12 @@ async function loadProductsPage(root: HTMLElement, canImport: boolean): Promise<
   } catch (err) {
     if (controller.signal.aborted) return;
     renderErrorWithRetry(wrap, "Erro ao buscar catálogo: " + describeError(err), () => void loadProductsPage(root, canImport));
+  } finally {
+    clearTimeout(spinnerTimer);
+    // Só esta chamada apaga o spinner se ela não foi cancelada — uma busca
+    // cancelada (superada por uma mais nova) nunca mexe no spinner da busca
+    // que a substituiu.
+    if (!controller.signal.aborted && spinner) spinner.hidden = true;
   }
 }
 
