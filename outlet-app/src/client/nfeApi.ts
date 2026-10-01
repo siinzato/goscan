@@ -32,6 +32,10 @@ export type TinyLaunchStatus = "nao_lancado" | "parcial" | "lancado";
 export interface InvoiceReceipt {
   id: string;
   invoice_key: string;
+  // EXPANSÃO GOSCAN — Conferência por Ordem de Carregamento (ver migration
+  // 0064 e loadingOrderApi.ts): 'nfe' é o valor default de toda NF já
+  // existente, nunca muda o comportamento do fluxo de NF-e.
+  source_type: "nfe" | "carregamento";
   invoice_number: string | null;
   series: string | null;
   supplier_name: string | null;

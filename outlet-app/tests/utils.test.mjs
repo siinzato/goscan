@@ -131,6 +131,12 @@ test("parseConferirHash: #/conferir/ordens-compra seleciona o modo de gestão de
   assert.equal(result.nfeReceiptId, null);
 });
 
+test("parseConferirHash: #/conferir/carregamento seleciona o modo de Conferência por Ordem de Carregamento", () => {
+  const result = parseConferirHash("#/conferir/carregamento");
+  assert.equal(result.mode, "carregamento");
+  assert.equal(result.nfeReceiptId, null);
+});
+
 // ---------------------------------------------------------------------------
 // FASE 3 — Central de Pendências: deep link #/historico/pendencias.
 // ---------------------------------------------------------------------------

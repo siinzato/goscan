@@ -135,6 +135,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
   nfeConferenceMounted = false;
   devolucaoMounted = false;
   purchaseOrdersMounted = false;
+  loadingOrderMounted = false;
   root.innerHTML = `<div class="screen-loading">Carregando conferência…</div>`;
 
   let session: Session;
@@ -155,6 +156,7 @@ export async function renderConference(root: HTMLElement): Promise<void> {
           <a class="mode-btn" data-mode="nfe" href="#/conferir/nfe">${Icon.receipt}Nota Fiscal</a>
           <button class="mode-btn" data-mode="devolucao">${Icon.undo2}Devolução</button>
           <a class="mode-btn" data-mode="ordens-compra" href="#/conferir/ordens-compra">${Icon.fileUp}Ordens de Compra</a>
+          <a class="mode-btn" data-mode="carregamento" href="#/conferir/carregamento">${Icon.package}Carregamento (Outlet)</a>
         </div>
 
         <div class="mode-panel active" id="mode-imagens">
@@ -186,6 +188,10 @@ export async function renderConference(root: HTMLElement): Promise<void> {
 
         <div class="mode-panel" id="mode-ordens-compra">
           <div id="purchaseOrdersRoot"></div>
+        </div>
+
+        <div class="mode-panel" id="mode-carregamento">
+          <div id="loadingOrderRoot"></div>
         </div>
       </div>
 
@@ -403,6 +409,11 @@ let devolucaoMounted = false;
 let purchaseOrdersModule: typeof import("./purchaseOrders.ts") | null = null;
 let purchaseOrdersMounted = false;
 
+// EXPANSÃO GOSCAN — módulo de Conferência por Ordem de Carregamento (Outlet),
+// mesmo padrão de singleton lazy-mount dos blocos acima.
+let loadingOrderModule: typeof import("./loadingOrderConference.ts") | null = null;
+let loadingOrderMounted = false;
+
 /**
  * Chamado por shell.ts ao sair da rota "conferir" — encerra a sessão de
  * colaboração em tempo real ativa (ver realtimeCollab.ts), seja ela do modo
@@ -447,12 +458,13 @@ function wireInputModeSwitch(root: HTMLElement, hashInfo: ConferirHashInfo): voi
     const isNfe = mode === "nfe";
     const isDevolucao = mode === "devolucao";
     const isOrdensCompra = mode === "ordens-compra";
+    const isCarregamento = mode === "carregamento";
     // Cards "2. Revise antes de adicionar" e "3. Itens da conferência" são
     // específicos do fluxo de correspondência por texto/print (Outlet) —
-    // não fazem sentido na Conferência por Nota Fiscal, na Devolução nem na
-    // gestão de Ordens de Compra, que têm seu próprio fluxo dentro do
-    // respectivo módulo.
-    extraCards.hidden = isNfe || isDevolucao || isOrdensCompra;
+    // não fazem sentido na Conferência por Nota Fiscal, na Devolução, na
+    // gestão de Ordens de Compra nem na Conferência por Ordem de
+    // Carregamento, que têm seu próprio fluxo dentro do respectivo módulo.
+    extraCards.hidden = isNfe || isDevolucao || isOrdensCompra || isCarregamento;
 
     if (isNfe) {
       const container = root.querySelector<HTMLElement>("#nfeConferenceRoot")!;
@@ -513,6 +525,22 @@ function wireInputModeSwitch(root: HTMLElement, hashInfo: ConferirHashInfo): voi
           });
       }
     }
+
+    if (isCarregamento) {
+      const container = root.querySelector<HTMLElement>("#loadingOrderRoot")!;
+      if (!loadingOrderMounted) {
+        loadingOrderMounted = true;
+        void (loadingOrderModule ? Promise.resolve(loadingOrderModule) : import("./loadingOrderConference.ts"))
+          .then((m) => {
+            loadingOrderModule = m;
+            return m.renderLoadingOrderConference(container);
+          })
+          .catch((err) => {
+            loadingOrderMounted = false;
+            renderErrorWithRetry(container, "Erro ao carregar Conferência por Carregamento: " + describeError(err), () => selectMode("carregamento", btn));
+          });
+      }
+    }
   }
 
   root.querySelectorAll<HTMLElement>(".mode-btn").forEach((btn) => {
@@ -543,6 +571,10 @@ function wireInputModeSwitch(root: HTMLElement, hashInfo: ConferirHashInfo): voi
   if (hashInfo.mode === "ordens-compra") {
     const poBtn = root.querySelector<HTMLElement>('[data-mode="ordens-compra"]');
     if (poBtn) selectMode("ordens-compra", poBtn);
+  }
+  if (hashInfo.mode === "carregamento") {
+    const loBtn = root.querySelector<HTMLElement>('[data-mode="carregamento"]');
+    if (loBtn) selectMode("carregamento", loBtn);
   }
 }
 

@@ -100,6 +100,57 @@ export async function fetchAliasLists(): Promise<AliasLists> {
   return cache;
 }
 
+// PERFORMANCE — Conferência por Ordem de Carregamento (loadingOrderApi.ts):
+// chamar matchItem() centenas de vezes (1 por linha da planilha) significa
+// centenas de idas e vindas ao banco em série/concorrente — achado real
+// testando com uma planilha de 208 linhas, chegando a estourar "statement
+// timeout" e disputar conexão com outras telas abertas ao mesmo tempo.
+// fetchBulkCatalogData() traz o catálogo INTEIRO de uma vez (poucas
+// consultas) pra quem precisa casar MUITOS itens de uma vez só — matchItem()
+// aceita esse pacote como 4º parâmetro opcional e, quando presente, nunca
+// consulta o banco de novo por item (só memória). Chamadores existentes
+// (Outlet "Colar texto"/prints) não passam esse parâmetro — comportamento
+// deles fica exatamente igual a antes.
+export interface BulkCatalogData {
+  products: CandidateProduct[];
+  variantsByProduct: Map<string, VariantRow[]>;
+}
+
+/** `productType` opcional restringe os PRODUTOS buscados (ex.: Carregamento nunca pode casar com um produto 'normal', só 'outlet') — omitido, traz os dois tipos (comportamento de sempre). */
+export async function fetchBulkCatalogData(productType?: "outlet" | "normal"): Promise<BulkCatalogData> {
+  const supabase = getSupabase();
+  let productsQuery = supabase.from("products").select("id, name, normalized_name").eq("active", true);
+  if (productType) productsQuery = productsQuery.eq("product_type", productType);
+  const [productsRes, variantsRes] = await Promise.all([
+    productsQuery,
+    supabase.from("product_variants").select("id, product_id, sku_code, color, normalized_color, gtin").eq("active", true),
+  ]);
+  if (productsRes.error) throw productsRes.error;
+  if (variantsRes.error) throw variantsRes.error;
+
+  const variantsByProduct = new Map<string, VariantRow[]>();
+  for (const row of (variantsRes.data as (VariantRow & { product_id: string })[]) || []) {
+    const list = variantsByProduct.get(row.product_id) || [];
+    list.push(row);
+    variantsByProduct.set(row.product_id, list);
+  }
+  return { products: (productsRes.data as CandidateProduct[]) || [], variantsByProduct };
+}
+
+/** Mesma regra de findProductIdsByNameTokens (todos os tokens, AND), só que filtrando em memória em vez de consultar o banco. */
+function findProductIdsByNameTokensInMemory(normModelo: string, products: CandidateProduct[]): CandidateProduct[] {
+  const tokens = normModelo.split(" ").filter(Boolean);
+  if (tokens.length === 0) return [];
+  const matches: CandidateProduct[] = [];
+  for (const p of products) {
+    if (tokens.every((t) => p.normalized_name.includes(t))) {
+      matches.push(p);
+      if (matches.length >= 20) break; // mesmo limite de sempre (findProductIdsByNameTokens usa .limit(20))
+    }
+  }
+  return matches;
+}
+
 function findProductIdByAlias(normalized: string, models: ModelAliasRow[]): string | null {
   for (const m of models) {
     if (normalized.includes(m.normalized_alias)) return m.product_id;
@@ -199,7 +250,7 @@ interface ResolvedVariant {
   matchedOnColorField: boolean;
 }
 
-export async function matchItem(modelo: string, cor: string, qtd = 1): Promise<MatchResult> {
+export async function matchItem(modelo: string, cor: string, qtd = 1, bulk?: BulkCatalogData): Promise<MatchResult> {
   const { models, colors } = await fetchAliasLists();
   const normModelo = normalize(modelo);
   const normCor = normalize(cor);
@@ -220,10 +271,17 @@ export async function matchItem(modelo: string, cor: string, qtd = 1): Promise<M
   const aliasedProductId = findProductIdByAlias(normModelo, models);
   let candidateProducts: CandidateProduct[];
   if (aliasedProductId) {
-    const supabase = getSupabase();
-    const { data: product, error } = await supabase.from("products").select("id, name, normalized_name").eq("id", aliasedProductId).maybeSingle();
-    if (error) throw error;
-    candidateProducts = product ? [product as CandidateProduct] : [];
+    if (bulk) {
+      const product = bulk.products.find((p) => p.id === aliasedProductId) || null;
+      candidateProducts = product ? [product] : [];
+    } else {
+      const supabase = getSupabase();
+      const { data: product, error } = await supabase.from("products").select("id, name, normalized_name").eq("id", aliasedProductId).maybeSingle();
+      if (error) throw error;
+      candidateProducts = product ? [product as CandidateProduct] : [];
+    }
+  } else if (bulk) {
+    candidateProducts = findProductIdsByNameTokensInMemory(normModelo, bulk.products);
   } else {
     // 2) Sem alias: busca direta no catálogo real por todos os tokens do modelo.
     candidateProducts = await findProductIdsByNameTokens(normModelo);
@@ -233,7 +291,7 @@ export async function matchItem(modelo: string, cor: string, qtd = 1): Promise<M
     return { ...base, product_id: null, product_name: null, color_matched: colorMatched, variant_id: null, sku_code: null, status: "modelo_nao_encontrado" };
   }
 
-  const variantsByProduct = await fetchVariantsForProducts(candidateProducts.map((p) => p.id));
+  const variantsByProduct = bulk ? bulk.variantsByProduct : await fetchVariantsForProducts(candidateProducts.map((p) => p.id));
   const anyVariants = candidateProducts.some((p) => (variantsByProduct.get(p.id) || []).length > 0);
   if (!anyVariants) {
     const only = candidateProducts[0];
