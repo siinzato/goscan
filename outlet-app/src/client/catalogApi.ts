@@ -16,6 +16,25 @@ export function buildCatalogIdFilter(lowerQ: string, nameWords: string[], digits
   return parts.join(",");
 }
 
+/**
+ * PERFORMANCE — decide se o termo digitado PODE ser um identificador exato
+ * (EAN/GTIN ou SKU), reaproveitando a mesma normalização que searchCatalog já
+ * usa (normalizeEan/isValidEanFormat; SKU = maiúsculas, que é como todo
+ * sku_code está gravado). Função pura, testável sem rede.
+ *   - EAN: só se o termo for composto APENAS por dígitos/separadores
+ *     (normalizeEan descarta letras, então "ABC12345678" nunca vira "EAN").
+ *   - SKU: sem espaços, com pelo menos 1 dígito (nome/modelo/cor tipo
+ *     "garrafa" ou "moove" nunca gera consulta extra).
+ */
+export function classifyExactLookupTerm(raw: string): { ean: string | null; sku: string | null } {
+  const safe = raw.trim().replace(/[,()%]/g, "");
+  const normalizedEan = normalizeEan(safe);
+  const ean = /^[\d\s.-]+$/.test(safe) && isValidEanFormat(normalizedEan) ? normalizedEan : null;
+  const upper = safe.toUpperCase();
+  const sku = /^[A-Z0-9][A-Z0-9._/-]{2,63}$/.test(upper) && /\d/.test(upper) ? upper : null;
+  return { ean, sku };
+}
+
 export type ProductType = "outlet" | "normal";
 
 export type CatalogMatchType = "exact_ean" | "exact_sku" | "text";
@@ -68,6 +87,64 @@ function productJoin(row: VariantJoinRow): ProductJoin {
   const empty: ProductJoin = { name: "", category: null, visual_family_key: null, capacity_ml: null, product_type: "outlet" };
   if (!p) return empty;
   return Array.isArray(p) ? p[0] ?? empty : p;
+}
+
+/**
+ * PERFORMANCE — atalho EXATO por SKU/EAN, antes de qualquer busca difusa.
+ * `sku_code = X` / `gtin_normalized = X` usam os índices (único e parcial) e
+ * custam ~7 ms mesmo com RLS; a busca difusa (ilike em nome/categoria/família
+ * + OR) varria ~4,6 mil linhas pagando a RLS em cada uma (~6-10 s). Se
+ * achou, devolve na hora e a busca difusa NÃO roda; se não achou (ou o termo
+ * nem parece um identificador), devolve [] e o chamador segue o fluxo antigo,
+ * inalterado. Qualquer erro aqui (exceto cancelamento do operador) também cai
+ * pro fluxo antigo — o atalho nunca pode ser a causa de uma busca quebrar.
+ * EAN é tentado antes de SKU (mesma prioridade exact_ean > exact_sku).
+ */
+async function findExactSkuOrEan(
+  supabase: ReturnType<typeof getSupabase>,
+  query: string,
+  productType: ProductType | undefined,
+  signal: AbortSignal | undefined
+): Promise<CatalogRow[]> {
+  const { ean, sku } = classifyExactLookupTerm(query);
+  const attempts: { column: "gtin_normalized" | "sku_code"; value: string; matchType: CatalogMatchType }[] = [];
+  if (ean) attempts.push({ column: "gtin_normalized", value: ean, matchType: "exact_ean" });
+  if (sku) attempts.push({ column: "sku_code", value: sku, matchType: "exact_sku" });
+
+  for (const attempt of attempts) {
+    let builder = supabase
+      .from("product_variants")
+      .select("id, product_id, sku_code, color, gtin, gtin_normalized, products!inner(name, category, visual_family_key, capacity_ml, product_type)")
+      .eq("active", true)
+      .eq(attempt.column, attempt.value)
+      .limit(20);
+    if (productType) builder = builder.eq("products.product_type", productType);
+    if (signal) builder = builder.abortSignal(signal);
+
+    const { data, error } = await builder;
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    if (error || !data || data.length === 0) continue;
+
+    return (data as unknown as VariantJoinRow[]).map((r) => {
+      const product = productJoin(r);
+      return {
+        variant_id: r.id,
+        product_id: r.product_id,
+        produto: product.name,
+        base: product.name,
+        cor: r.color,
+        sku_code: r.sku_code,
+        gtin: r.gtin,
+        category: product.category,
+        visual_family_key: product.visual_family_key,
+        capacity_ml: product.capacity_ml,
+        thumbnail_path: null,
+        product_type: product.product_type,
+        match_type: attempt.matchType,
+      };
+    });
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +277,26 @@ export async function searchCatalog(
   const to = from + pageSize - 1;
 
   const q = query.trim();
+
+  // PERFORMANCE — SKU/EAN exato resolve por índice, sem a busca difusa (ver
+  // findExactSkuOrEan). Só na 1ª página e sem o filtro Com/Sem EAN, que
+  // dependem da listagem completa; não achou → segue o fluxo de sempre.
+  if (q && page === 0 && !eanPresence) {
+    const exact = await findExactSkuOrEan(supabase, q, productType, signal);
+    if (exact.length > 0) {
+      const thumbs = includeThumbnails ? await fetchPrimaryThumbnails(supabase, exact.map((r) => r.variant_id), signal) : new Map<string, string>();
+      const exactPage: CatalogPage = {
+        rows: exact.slice(0, pageSize).map((r) => ({ ...r, thumbnail_path: thumbs.get(r.variant_id) ?? null })),
+        total: Math.min(exact.length, pageSize),
+        page,
+        pageSize,
+      };
+      searchCache.set(key, exactPage);
+      if (searchCache.size > SEARCH_CACHE_MAX) searchCache.clear();
+      return exactPage;
+    }
+  }
+
   const safeQ = q.replace(/[,()%]/g, "");
   const normalizedEanQuery = normalizeEan(safeQ);
   const looksLikeFullEan = isValidEanFormat(normalizedEanQuery);
@@ -490,6 +587,11 @@ export async function searchSkuForPicker(
   includeThumbnails = true
 ): Promise<CatalogRow[]> {
   if (!includeThumbnails && query.trim()) {
+    // PERFORMANCE — SKU/EAN exato por índice antes da RPC difusa (ver
+    // findExactSkuOrEan). Com miniaturas (includeThumbnails) o atalho vive em
+    // searchCatalog, que já cuida da imagem.
+    const exact = await findExactSkuOrEan(getSupabase(), query, productType, signal);
+    if (exact.length > 0) return exact.slice(0, limit);
     try {
       return await searchSkuForPickerRpc(query, limit, productType, signal);
     } catch (err) {
