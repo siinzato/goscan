@@ -7,7 +7,7 @@
 App mobile-first para conferência de estoque/outlet a partir de prints de WhatsApp (lidos por IA ou OCR local), texto colado, planilha ou câmera (reconhecimento visual de produto). Resolve o problema de bater a contagem física contra o catálogo de SKUs manualmente — usado por operadores de estoque (conferência), managers/admins (catálogo, importação, NF-e, devoluções) da GoCase. Resultado: conferências registradas, divergências identificadas, exportação para planilha e histórico auditável.
 
 ## 3. Execução
-Não é uma automação agendada — é um **app web (SPA) acionado por uso humano direto**, mobile-first, instalável como PWA. Login por e-mail/senha (Supabase Auth), sem cadastro público (usuários criados manualmente no painel Supabase). Acessado hoje via Railway (`goscan-production-2f44.up.railway.app`), com deploy manual via `railway up` (auto-deploy por push no GitHub ainda não está funcional — webhook não instalado).
+Não é uma automação agendada — é um **app web (SPA) acionado por uso humano direto**, mobile-first, instalável como PWA. Login por e-mail/senha (Supabase Auth), sem cadastro público (usuários criados manualmente no painel Supabase). Acessado hoje via Railway (`goscan-production-2f44.up.railway.app`), com deploy automático a cada push na `master` do repo `siinzato/goscan` (Root Directory e Watch Path `outlet-app`). Deploy manual, se preciso: `railway up --ci --project 785311a5-4b0e-433c-8fbf-43f9937c0f36 --environment production --service goscan`, rodado da raiz do repositório.
 
 ## 4. Dependências
 - **Supabase** (Postgres + Auth + Storage + RLS) — banco principal, autenticação, arquivos de imagem. Chaves: `VITE_SUPABASE_URL`/`VITE_SUPABASE_ANON_KEY` (públicas, frontend) e `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` (privadas, só backend).
@@ -32,7 +32,7 @@ Não é uma automação agendada — é um **app web (SPA) acionado por uso huma
 - Para produção: variáveis de ambiente configuradas no host (hoje Railway), incluindo os *build args* `VITE_SUPABASE_URL`/`VITE_SUPABASE_ANON_KEY` (precisam existir **antes** do primeiro build, senão o bundle sobe sem config).
 
 ## 7. Atenção
-- **Deploy automático via GitHub quebrado**: push no `main` não redeploya sozinho hoje — precisa `railway up` manual. Causa: instalação do GitHub App/webhook exige fluxo OAuth interativo que só o dono da conta pode concluir pelo navegador.
+- **Deploy automático via GitHub**: gatilho reconectado em 02/10/2026 (`railway service source connect`). Pushes que não alteram nada dentro de `outlet-app/` não geram deploy (Watch Path).
 - **Backend não é portátil para qualquer hosting**: `sharp`/`@xenova/transformers` exigem ambiente Node completo — não migra para runtimes serverless tipo Cloudflare Workers sem reescrever essa parte.
 - **Sem cadastro público** (por design) — depende de alguém com acesso ao painel Supabase para criar usuários.
 - **Sem testes automatizados de RLS** em CI — permissões validadas manualmente.
