@@ -77,3 +77,43 @@ test("classifyExactLookupTerm: separadores do PostgREST são neutralizados e dí
   assert.equal(classifyExactLookupTerm("ABC1,2)3(").sku, "ABC123");
   assert.equal(classifyExactLookupTerm("12345").ean, null);
 });
+
+// ---------------------------------------------------------------------------
+// Painel de qualidade do catálogo (somente leitura) — análises puras.
+// ---------------------------------------------------------------------------
+import { findWithoutEan, findDuplicateEans, findOutletAsNormal, buildCatalogQualityReport } from "../src/client/catalogQualityApi.ts";
+const qv = (sku, ean, pid, name, type = "normal") => ({ variant_id: sku, sku_code: sku, ean, product_id: pid, product_name: name, product_type: type });
+
+test("qualidade: findWithoutEan lista só variantes sem EAN, ordenadas por SKU", () => {
+  const rows = [qv("B-2", null, "p1", "B"), qv("A-1", "7908918701572", "p2", "A"), qv("A-0", "", "p3", "C")];
+  assert.deepEqual(findWithoutEan(rows).map((r) => r.sku_code), ["A-0", "B-2"]);
+});
+
+test("qualidade: findDuplicateEans só considera EAN em produtos DIFERENTES", () => {
+  const rows = [
+    qv("S1", "111", "p1", "X"), qv("S2", "111", "p2", "Y"), // duplicado entre produtos → entra
+    qv("S3", "222", "p3", "Z"), qv("S4", "222", "p3", "Z"), // mesmo produto → não entra
+    qv("S5", "333", "p4", "W"), qv("S6", null, "p5", "V"),
+  ];
+  const groups = findDuplicateEans(rows);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].ean, "111");
+  assert.deepEqual(groups[0].variants.map((v) => v.sku_code), ["S1", "S2"]);
+});
+
+test("qualidade: findOutletAsNormal pega OUT- no SKU ou nome Outlet, só com tipo normal", () => {
+  const rows = [
+    qv("OUT-ABC-1", "1", "p1", "Garrafa", "normal"),
+    qv("XYZ-1", "2", "p2", "Outlet Gocase Copo", "normal"),
+    qv("OUT-OK-1", "3", "p3", "Garrafa", "outlet"),
+    qv("NORM-1", "4", "p4", "Copo outlet de verdade", "normal"), // "outlet" no meio do nome não conta
+  ];
+  assert.deepEqual(findOutletAsNormal(rows).map((r) => r.sku_code), ["OUT-ABC-1", "XYZ-1"]);
+});
+
+test("qualidade: buildCatalogQualityReport junta tudo e conta o total", () => {
+  const r = buildCatalogQualityReport([qv("A", null, "p1", "A"), qv("B", "9", "p2", "B")]);
+  assert.equal(r.total, 2);
+  assert.equal(r.withoutEan.length, 1);
+  assert.equal(r.duplicateEans.length, 0);
+});

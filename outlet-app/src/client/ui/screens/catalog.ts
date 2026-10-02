@@ -9,6 +9,7 @@ import { showToast } from "../toast.ts";
 import { confirmAction } from "../confirmModal.ts";
 import { renderCatalogVisualSection } from "./catalogVisual.ts";
 import { renderVisualScanSection } from "./visualScan.ts";
+import { renderCatalogQualitySection } from "./catalogQuality.ts";
 
 declare const XLSX: {
   read(data: ArrayBuffer): { SheetNames: string[]; Sheets: Record<string, unknown> };
@@ -16,7 +17,7 @@ declare const XLSX: {
 };
 
 const PAGE_SIZE = 30;
-let catalogTab: "skus" | "visual" | "scan" = "skus";
+let catalogTab: "skus" | "visual" | "scan" | "quality" = "skus";
 
 // ---------------------------------------------------------------------------
 // EVOLUÇÃO CATÁLOGO — antes, Outlet e Normal eram duas sub-abas com estado
@@ -57,13 +58,14 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
         <button class="mode-btn ${catalogTab === "skus" ? "active" : ""}" data-catalog-tab="skus">${Icon.package}SKUs</button>
         <button class="mode-btn ${catalogTab === "visual" ? "active" : ""}" data-catalog-tab="visual">${Icon.imagePlus}Catálogo Visual</button>
         ${canImport ? `<button class="mode-btn ${catalogTab === "scan" ? "active" : ""}" data-catalog-tab="scan">${Icon.scan}Modo Scan (prep)</button>` : ""}
+        ${canImport ? `<button class="mode-btn ${catalogTab === "quality" ? "active" : ""}" data-catalog-tab="quality">${Icon.checkCircle}Qualidade</button>` : ""}
       </div>
       <div id="catalogTabContent"></div>
     </section>`;
 
   root.querySelectorAll<HTMLButtonElement>("[data-catalog-tab]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      catalogTab = btn.dataset.catalogTab as "skus" | "visual" | "scan";
+      catalogTab = btn.dataset.catalogTab as "skus" | "visual" | "scan" | "quality";
       void renderCatalog(root);
     });
   });
@@ -75,6 +77,10 @@ export async function renderCatalog(root: HTMLElement): Promise<void> {
   }
   if (catalogTab === "scan" && canImport) {
     void renderVisualScanSection(content);
+    return;
+  }
+  if (catalogTab === "quality" && canImport) {
+    void renderCatalogQualitySection(content);
     return;
   }
   await renderProductsTab(content, canImport);
