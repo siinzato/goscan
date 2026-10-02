@@ -237,7 +237,7 @@ function renderPrepView(root: HTMLElement): void {
 
 function renderPendingCard(item: InvoiceReceiptItem): string {
   return `
-    <div class="product-card" data-lo-pending="${item.id}">
+    <div class="pending-item-card" data-lo-pending="${item.id}">
       <div class="product-card-top">
         <p class="product-card-name">${escapeHtml(item.invoice_product_code || "(sem nome)")}</p>
         <span>${item.expected_quantity} un.</span>
