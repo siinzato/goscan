@@ -370,3 +370,52 @@ export async function runPickerSearch(resultsBox: HTMLElement, signal: AbortSign
     resultsBox.querySelector<HTMLButtonElement>("[data-picker-retry]")?.addEventListener("click", onRetry);
   }
 }
+
+/**
+ * Nome do arquivo do XML original baixado do Histórico de Notas: a chave de
+ * acesso (44 dígitos) quando existe — `3526...-nfe.xml`, o mesmo padrão que o
+ * Tiny/portais da SEFAZ reconhecem — senão o número da NF. Só caracteres
+ * seguros pra nome de arquivo. Função pura (testável sem DOM).
+ */
+export function buildNfeXmlFileName(invoiceKey: string | null | undefined, invoiceNumber?: string | null): string {
+  const key = (invoiceKey || "").replace(/\D/g, "");
+  if (key.length === 44) return `${key}-nfe.xml`;
+  const number = (invoiceNumber || "").replace(/[^A-Za-z0-9_-]/g, "");
+  return number ? `NF-${number}-nfe.xml` : "nfe.xml";
+}
+
+/**
+ * Entrega um texto como arquivo ao usuário. Celular (ponteiro "grosso") com
+ * suporte a compartilhar arquivo → abre a folha nativa de compartilhamento/
+ * salvar; qualquer outro caso (desktop, ou compartilhamento indisponível/
+ * falhou) → download normal via <a download>. O conteúdo vai byte a byte como
+ * veio (sem BOM, sem reformatar). Cancelar a folha de compartilhamento não é
+ * erro. Devolve true quando entregou, false quando o usuário cancelou.
+ */
+export async function saveTextFile(fileName: string, content: string, mimeType = "application/xml"): Promise<boolean> {
+  const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+
+  const isTouch = typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
+  if (isTouch && typeof File !== "undefined" && typeof navigator !== "undefined" && typeof navigator.canShare === "function" && typeof navigator.share === "function") {
+    const file = new File([blob], fileName, { type: mimeType });
+    if (navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: fileName });
+        return true;
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return false;
+        // outra falha do compartilhamento → cai pro download normal abaixo
+      }
+    }
+  }
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return true;
+}

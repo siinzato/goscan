@@ -3,7 +3,7 @@
 // fluxo totalmente separado do reconhecimento visual/matching Outlet — não
 // reaproveita conferences/conference_items, tem suas próprias tabelas
 // (invoice_receipts/invoice_receipt_items/receipt_counts).
-import { escapeHtml, debounce, formatDateTime, formatOperationDuration, formatSignedNumber, describeError, initials, normalizeEan, isValidEanFormat, renderErrorWithRetry } from "../../utils.ts";
+import { escapeHtml, debounce, formatDateTime, formatOperationDuration, formatSignedNumber, describeError, initials, normalizeEan, isValidEanFormat, renderErrorWithRetry, buildNfeXmlFileName, saveTextFile } from "../../utils.ts";
 import { parseNfeXml, diagnoseNfeXml, type NfeXmlDiagnostics } from "../../nfeParser.ts";
 import { normalizeKey, suggestBestMatch, summarizeReceipt } from "../../nfeMatching.ts";
 import { getAuthState, isAdmin, isManagerOrAdmin } from "../../auth.ts";
@@ -24,6 +24,7 @@ import {
   getReceipt,
   finalizeReceipt,
   listReceiptHistory,
+  getReceiptXml,
   deleteReceipt,
   fetchAllNormalProducts,
   fetchNormalCandidates,
@@ -2658,6 +2659,7 @@ async function renderHistoryView(root: HTMLElement): Promise<void> {
               <span class="status-badge ${r.status === "completed" ? "success" : r.status === "with_divergences" ? "warning" : "info"}">${escapeHtml(RECEIPT_STATUS_LABEL[r.status])}</span>
               <span class="hint-text" style="margin:0">${r.item_count} item(ns)</span>
             </div>
+            ${r.source_type === "nfe" ? `<button type="button" class="icon-btn" data-download-xml="${r.id}" aria-label="Baixar XML da NF" title="Baixar XML original">${Icon.download}</button>` : ""}
             ${canDelete ? `<button type="button" class="icon-btn danger" data-delete-receipt="${r.id}" aria-label="Excluir NF">${Icon.trash}</button>` : ""}
           </div>
         </li>`;
@@ -2674,6 +2676,29 @@ async function renderHistoryView(root: HTMLElement): Promise<void> {
       if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button !== 0) return;
       e.preventDefault();
       void openReceiptFromRoute(root, a.dataset.openReceipt!);
+    });
+  });
+
+  // Baixar o XML ORIGINAL da NF (o mesmo que foi importado) — lido sob demanda
+  // da própria nota (RLS normal), nunca reconstruído. Nota sem XML → aviso claro.
+  wrap.querySelectorAll<HTMLButtonElement>("[data-download-xml]").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (btn.disabled) return;
+      btn.disabled = true;
+      try {
+        const { invoiceKey, invoiceNumber, xml } = await getReceiptXml(btn.dataset.downloadXml!);
+        if (!xml) {
+          showToast("Esta nota não possui XML disponível para download.", "error");
+          return;
+        }
+        const delivered = await saveTextFile(buildNfeXmlFileName(invoiceKey, invoiceNumber), xml);
+        if (delivered) showToast("XML da NF pronto.", "success");
+      } catch (err) {
+        showToast("Erro ao baixar XML: " + describeError(err), "error");
+      } finally {
+        btn.disabled = false;
+      }
     });
   });
 

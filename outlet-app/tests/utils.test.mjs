@@ -349,3 +349,15 @@ test("formatSignedNumber: positivo, negativo e zero", () => {
   assert.equal(formatSignedNumber(-3), "-3");
   assert.equal(formatSignedNumber(0), "0");
 });
+
+// Histórico de Notas → "Baixar XML": nome do arquivo baseado na chave de acesso.
+import { buildNfeXmlFileName } from "../src/client/utils.ts";
+test("buildNfeXmlFileName: chave de 44 dígitos vira <chave>-nfe.xml", () => {
+  assert.equal(buildNfeXmlFileName("31260936838707000119550050000124421000140047", "12442"), "31260936838707000119550050000124421000140047-nfe.xml");
+  assert.equal(buildNfeXmlFileName("NFe3126 0936838707000119550050000124421000140047"), "31260936838707000119550050000124421000140047-nfe.xml");
+});
+test("buildNfeXmlFileName: sem chave válida usa o número da NF, só com caracteres seguros", () => {
+  assert.equal(buildNfeXmlFileName("123", "7821022"), "NF-7821022-nfe.xml");
+  assert.equal(buildNfeXmlFileName(null, "12/44 2"), "NF-12442-nfe.xml");
+  assert.equal(buildNfeXmlFileName("", ""), "nfe.xml");
+});

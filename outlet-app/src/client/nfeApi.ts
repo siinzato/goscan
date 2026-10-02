@@ -844,6 +844,25 @@ interface HistoryRow extends InvoiceReceipt {
  * bate — por isso confere de verdade quantas linhas vieram de volta, senão o
  * botão "Excluir" pareceria funcionar sem ter apagado nada.
  */
+/**
+ * Histórico de Notas → "Baixar XML". O XML ORIGINAL importado já fica guardado
+ * na própria linha da nota (coluna `invoice_receipts.xml`, gravada por
+ * createReceiptFromParsed exatamente como veio no arquivo) — nada é
+ * reconstruído a partir dos dados processados. Não há Storage/URL assinada
+ * aqui: a leitura passa pela RLS normal de `invoice_receipts` (mesma empresa
+ * + usuário ativo), então só quem já enxerga a nota consegue baixar o XML.
+ * Busca sob demanda (1 linha, 1 coluna grande) em vez de carregar o XML de
+ * toda nota na listagem.
+ */
+export async function getReceiptXml(receiptId: string): Promise<{ invoiceKey: string; invoiceNumber: string | null; xml: string | null }> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.from("invoice_receipts").select("invoice_key, invoice_number, xml").eq("id", receiptId).maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error("Nota não encontrada ou sem permissão de acesso.");
+  const row = data as { invoice_key: string; invoice_number: string | null; xml: string | null };
+  return { invoiceKey: row.invoice_key, invoiceNumber: row.invoice_number, xml: row.xml && row.xml.trim() ? row.xml : null };
+}
+
 export async function deleteReceipt(receiptId: string): Promise<void> {
   const supabase = getSupabase();
   const { data, error } = await supabase.from("invoice_receipts").delete().eq("id", receiptId).select("id");
