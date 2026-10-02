@@ -268,3 +268,41 @@ test("matchLoadingOrderRow: PRIORIDADE 3 — sem SKU exato e sem descrição út
   assert.equal(source, "produto_text_match");
   assert.equal(match.variant_id, "v3");
 });
+
+// ---------------------------------------------------------------------------
+// VÍNCULOS LEMBRADOS da Ordem de Carregamento — lógica pura (chave + aplicação).
+// ---------------------------------------------------------------------------
+import { loadingOrderAliasKey, applyAliasMemory } from "../src/client/loadingOrderApi.ts";
+const mk = (status, variant_id = null) => ({ modelo_bruto: "x", cor_bruta: "", qtd: 1, product_id: null, product_name: null, color_matched: null, variant_id, sku_code: null, status });
+
+test("loadingOrderAliasKey: prefixo CARGA: + texto normalizado (sem acento/caixa/pontuação), vazio → null", () => {
+  assert.equal(loadingOrderAliasKey("Estojo BTS Azul Escuro"), "CARGA:estojo bts azul escuro");
+  assert.equal(loadingOrderAliasKey("  ESTÓJO   bts, Azul-Escuro "), "CARGA:estojo bts azul escuro");
+  assert.equal(loadingOrderAliasKey(""), null);
+  assert.equal(loadingOrderAliasKey(null), null);
+});
+
+test("applyAliasMemory: só preenche lacuna — sem vínculo/ambíguo + alias → vincula como alias_memory", () => {
+  const aliases = new Map([["CARGA:tote bag azul", "variant-A"]]);
+  for (const status of ["modelo_nao_encontrado", "ambiguous"]) {
+    const r = applyAliasMemory("Tote Bag Azul", mk(status), status === "ambiguous" ? "ambiguous" : "unlinked", aliases);
+    assert.equal(r.source, "alias_memory");
+    assert.equal(r.match.status, "matched");
+    assert.equal(r.match.variant_id, "variant-A");
+  }
+});
+
+test("applyAliasMemory: nunca sobrepõe linha já vinculada pelo motor (SKU/descrição/texto)", () => {
+  const aliases = new Map([["CARGA:tote bag azul", "variant-A"]]);
+  const linked = mk("matched", "variant-ENGINE");
+  const r = applyAliasMemory("Tote Bag Azul", linked, "sku_exact", aliases);
+  assert.equal(r.match.variant_id, "variant-ENGINE");
+  assert.equal(r.source, "sku_exact");
+});
+
+test("applyAliasMemory: sem alias memorizado para o texto, devolve exatamente o que o motor decidiu", () => {
+  const m = mk("modelo_nao_encontrado");
+  const r = applyAliasMemory("Produto sem alias", m, "unlinked", new Map([["CARGA:outro", "v"]]));
+  assert.equal(r.match, m);
+  assert.equal(r.source, "unlinked");
+});

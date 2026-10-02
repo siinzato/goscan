@@ -12,11 +12,12 @@
 // produto (work_mode fica 'free', o default já seguro pra contagem
 // individual) — pode ganhar paridade depois, se for pedido.
 import { escapeHtml, describeError, formatDateTime, normalize, runPickerSearch } from "../../utils.ts";
-import { createLoadingOrderReceipt, splitModeloECor } from "../../loadingOrderApi.ts";
+import { createLoadingOrderReceipt, splitModeloECor, loadingOrderAliasKey } from "../../loadingOrderApi.ts";
 import { fetchAliasLists } from "../../matching.ts";
 import {
   getReceipt,
   resolveItemManually,
+  memorizeAlias,
   startCounting,
   submitCount,
   submitCountDelta,
@@ -411,7 +412,11 @@ async function applyLink(itemId: string, variantId: string): Promise<void> {
 async function linkPendingItem(root: HTMLElement, itemId: string, variantId: string): Promise<void> {
   try {
     await applyLink(itemId, variantId);
-    showToast("Produto vinculado.", "success");
+    // Escolha do operador → lembra pro próximo carregamento (nunca derruba o vínculo já salvo).
+    const produto = currentItems.find((i) => i.id === itemId)?.invoice_product_code;
+    const key = loadingOrderAliasKey(produto);
+    const outcome = key ? await memorizeAlias({ invoiceProductCode: key, ean: null, variantId }).catch(() => "error" as const) : "skipped";
+    showToast(outcome === "created" ? "Produto vinculado e memorizado para as próximas cargas." : "Produto vinculado.", "success");
     renderPrepView(root);
   } catch (err) {
     showToast("Erro ao vincular produto: " + describeError(err), "error");

@@ -219,7 +219,64 @@ export function splitModeloECor(produto: string, colors: ColorAliasRow[]): { mod
 // (pendência manual). Confirmação (SKU e descrição apontam pro mesmo lugar,
 // ou só a descrição resolve sozinha) vincula automaticamente.
 // ---------------------------------------------------------------------------
-export type LoadingOrderMatchSource = "sku_exact" | "description_match" | "produto_text_match" | "ambiguous" | "unlinked";
+export type LoadingOrderMatchSource = "sku_exact" | "description_match" | "produto_text_match" | "ambiguous" | "unlinked" | "alias_memory";
+
+// ---------------------------------------------------------------------------
+// VÍNCULOS LEMBRADOS (Ordem de Carregamento) — quando o operador resolve um
+// item na mão, o texto do "Produto" fica memorizado em invoice_sku_aliases
+// (a MESMA tabela/regras de segurança da NF-e: só insere, nunca sobrescreve,
+// conflito é reportado). A chave leva o prefixo "CARGA:" pra nunca colidir
+// com código de fornecedor de NF-e. Numa próxima carga, só PREENCHE o que o
+// motor deixou sem vínculo/ambíguo — nunca sobrepõe SKU exato nem vínculo por
+// texto já resolvido. Alias de produto desativado ou que não é Outlet é
+// ignorado na leitura (mesmo cuidado de fetchAliasMaps na NF-e).
+// ---------------------------------------------------------------------------
+const LOADING_ORDER_ALIAS_PREFIX = "CARGA:";
+
+/** Chave do alias da Carga: "CARGA:" + texto do produto normalizado (sem acento/caixa/pontuação). null se não houver texto. */
+export function loadingOrderAliasKey(produto: string | null | undefined): string | null {
+  const text = normalize(produto || "");
+  return text ? `${LOADING_ORDER_ALIAS_PREFIX}${text}` : null;
+}
+
+/** Aliases da Carga vigentes (variante ativa e Outlet) → Map(chave → variant_id). Falha de rede/RLS nunca derruba a importação: devolve Map vazio. */
+export async function fetchLoadingOrderAliasMap(): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  try {
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from("invoice_sku_aliases")
+      .select("invoice_product_code, product_variant_id, product_variants!inner(active, products!inner(product_type))")
+      .like("invoice_product_code", `${LOADING_ORDER_ALIAS_PREFIX}%`)
+      .eq("product_variants.active", true)
+      .eq("product_variants.products.product_type", "outlet");
+    if (error) return map;
+    for (const row of (data as unknown as { invoice_product_code: string | null; product_variant_id: string }[]) || []) {
+      if (row.invoice_product_code) map.set(row.invoice_product_code, row.product_variant_id);
+    }
+  } catch {
+    // sem memória disponível → importação segue só com o motor de sempre.
+  }
+  return map;
+}
+
+/**
+ * Só preenche lacuna: linha já vinculada (SKU/descrição/texto) fica como está;
+ * sem vínculo ou ambígua + alias memorizado → vincula à variante memorizada.
+ * Função pura.
+ */
+export function applyAliasMemory(
+  produto: string,
+  match: MatchResult,
+  source: LoadingOrderMatchSource,
+  aliasMap: Map<string, string>
+): { match: MatchResult; source: LoadingOrderMatchSource } {
+  if (match.status === "matched" || match.status === "matched_parcial") return { match, source };
+  const key = loadingOrderAliasKey(produto);
+  const variantId = key ? aliasMap.get(key) : undefined;
+  if (!variantId) return { match, source };
+  return { match: { ...match, status: "matched", variant_id: variantId }, source: "alias_memory" };
+}
 
 interface SkuIndexEntry {
   variantId: string;
@@ -422,7 +479,7 @@ export async function createLoadingOrderReceipt(
   // parecido). Restringir aqui também elimina uma fonte real de falso
   // "ambíguo": vários produtos existem cadastrados nos dois tipos com o
   // mesmo nome/cor.
-  const [aliasLists, bulk] = await Promise.all([fetchAliasLists(), fetchBulkCatalogData("outlet")]);
+  const [aliasLists, bulk, aliasMap] = await Promise.all([fetchAliasLists(), fetchBulkCatalogData("outlet"), fetchLoadingOrderAliasMap()]);
 
   const { data: receiptRow, error: receiptError } = await supabase
     .from("invoice_receipts")
@@ -455,7 +512,8 @@ export async function createLoadingOrderReceipt(
   const allMatches = await Promise.all(
     valid.map(async (row) => {
       try {
-        const { match, source, extracted } = await matchLoadingOrderRow(row, bulk, aliasLists, skuIndex);
+        const { match: engineMatch, source: engineSource, extracted } = await matchLoadingOrderRow(row, bulk, aliasLists, skuIndex);
+        const { match, source } = applyAliasMemory(row.produto, engineMatch, engineSource, aliasMap);
         return { row, match, source, extracted };
       } catch {
         // Uma falha pontual nunca pode derrubar a importação inteira — cai
@@ -496,7 +554,7 @@ export async function createLoadingOrderReceipt(
         // pela descrição), 'text_match' pra vínculo só por texto (descrição
         // ou produto). Diagnóstico mais fino (de qual das 3 prioridades veio)
         // fica em `diagnostics`, sem precisar de coluna nova.
-        link_source: isLinked ? (source === "sku_exact" ? "sku" : "text_match") : null,
+        link_source: isLinked ? (source === "sku_exact" ? "sku" : source === "alias_memory" ? "alias" : "text_match") : null,
       };
     });
 
